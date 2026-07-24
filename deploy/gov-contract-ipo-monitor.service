@@ -1,0 +1,23 @@
+[Unit]
+Description=Government Contract and IPO Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=govmonitor
+Group=govmonitor
+WorkingDirectory=/opt/gov-contract-ipo-monitor
+EnvironmentFile=/opt/gov-contract-ipo-monitor/.env
+ExecStart=/opt/gov-contract-ipo-monitor/.venv/bin/gov-contract-ipo-monitor run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gov-contract-ipo-monitor/data
+
+[Install]
+WantedBy=multi-user.target
