@@ -1,0 +1,7 @@
+{
+  "image": "ghcr.io/edwin-hou/gov-contract-ipo-monitor:latest",
+  "source_sha": "d84d9e274a362566b41ea00280dc347901424292",
+  "published_at": "2026-07-24T19:00:55.181627+00:00",
+  "platform": "linux/amd64",
+  "registry": "ghcr.io"
+}
