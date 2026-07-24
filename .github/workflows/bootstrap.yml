@@ -3,6 +3,8 @@ name: Bootstrap implementation
 on:
   push:
     branches: [agent/implement-monitor]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -10,6 +12,7 @@ permissions:
 
 jobs:
   unpack:
+    if: github.head_ref == 'agent/implement-monitor' || github.ref_name == 'agent/implement-monitor'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
