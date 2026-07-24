@@ -22,13 +22,13 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          ls -l .bootstrap
           cat .bootstrap/chunk_00 .bootstrap/chunk_0102 .bootstrap/chunk_0304 .bootstrap/chunk_0506 .bootstrap/chunk_0708 > /tmp/project.b64
           test "$(sha256sum /tmp/project.b64 | cut -d' ' -f1)" = "7911c26dacd2d49e53c49191aad6f785af1d8e2d47571d9b9112d9580f9d401b"
           base64 -d /tmp/project.b64 > /tmp/project.tgz
           test "$(sha256sum /tmp/project.tgz | cut -d' ' -f1)" = "e28ae3878205b39fb30bec0171405fe63f956d8136781de44b5f172df04e1ef0"
           gzip -t /tmp/project.tgz
           tar -xzf /tmp/project.tgz -C .
+          rm -f .github/workflows/ci.yml
           rm -rf .bootstrap
           git config user.name "OpenAI"
           git config user.email "noreply@openai.com"
