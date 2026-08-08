@@ -132,6 +132,7 @@ class USAspendingCollector:
         page: int = 1,
         limit: int = 100,
         max_pages: int = 250,
+        enrich_uei: bool = False,
     ) -> list[ContractEvidence]:
         start = start_date or (observed_at.date() - lookback)
         end = end_date or observed_at.date()
@@ -162,7 +163,7 @@ class USAspendingCollector:
                 record = self.normalizer.normalize(row, observed_at=observed_at)
                 if not record.award_id or not record.recipient_name:
                     continue
-                if record.recipient_uei is None and self.recipient_resolver is not None:
+                if enrich_uei and record.recipient_uei is None and self.recipient_resolver is not None:
                     uei = await self.recipient_resolver.resolve_uei(record.recipient_name)
                     if uei:
                         record = record.model_copy(update={"recipient_uei": uei})
