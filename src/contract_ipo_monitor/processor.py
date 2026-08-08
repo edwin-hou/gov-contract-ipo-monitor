@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Awaitable, Callable
 import inspect
 
@@ -12,11 +12,33 @@ from .models import Candidate, ContractEvidence, ListingSignal, MarketSnapshot
 
 
 class EvidenceProcessor:
-    def __init__(self, db: Database, *, now: Callable[[], datetime] | None = None, market_lookup: Callable[[str], MarketSnapshot | None | Awaitable[MarketSnapshot | None]] | None = None, archive: EvidenceArchive | None = None):
+    def __init__(
+        self,
+        db: Database,
+        *,
+        now: Callable[[], datetime] | None = None,
+        market_lookup: Callable[[str], MarketSnapshot | None | Awaitable[MarketSnapshot | None]] | None = None,
+        archive: EvidenceArchive | None = None,
+        max_price: float = 5.0,
+        max_market_cap: float = 300_000_000,
+        quote_max_age_hours: int = 24,
+    ):
         self.db = db
         self.now = now or (lambda: datetime.now(UTC))
         self.market_lookup = market_lookup
         self.archive = archive
+        self.max_price = max_price
+        self.max_market_cap = max_market_cap
+        self.max_quote_age = timedelta(hours=quote_max_age_hours)
+
+    def _gate(self) -> AlertGate:
+        return AlertGate(
+            self.db,
+            now=self.now(),
+            max_price=self.max_price,
+            max_market_cap=self.max_market_cap,
+            max_quote_age=self.max_quote_age,
+        )
 
     def ingest_contract(self, evidence: ContractEvidence) -> list[GateResult]:
         observed = self.now()
@@ -102,7 +124,7 @@ class EvidenceProcessor:
             "Listing completion, financing, dilution, liquidity, and execution risks remain material.",
             *signal.risk_findings,
         )
-        return AlertGate(self.db, now=self.now()).evaluate(Candidate(contract=evidence, listing=signal, market=market, risks=risks))
+        return self._gate().evaluate(Candidate(contract=evidence, listing=signal, market=market, risks=risks))
 
     def _evaluate(self, evidence: ContractEvidence, signal: ListingSignal) -> GateResult:
         market = self.market_lookup(signal.ticker) if signal.ticker and self.market_lookup else None
@@ -112,4 +134,4 @@ class EvidenceProcessor:
             *signal.risk_findings,
         )
         candidate = Candidate(contract=evidence, listing=signal, market=market, risks=risks)
-        return AlertGate(self.db, now=self.now()).evaluate(candidate)
+        return self._gate().evaluate(candidate)
