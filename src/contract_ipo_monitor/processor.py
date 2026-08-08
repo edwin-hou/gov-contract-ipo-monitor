@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Awaitable, Callable
 import inspect
 
@@ -11,20 +11,55 @@ from .gate import AlertGate, GateResult
 from .models import Candidate, ContractEvidence, ListingSignal, MarketSnapshot
 
 
+def _stable_contract_payload(evidence: ContractEvidence) -> dict:
+    """Return the source-content identity without observation timestamps.
+
+    `retrieved_at`/`published_at` may be synthesized at collection time. The raw payload hash
+    and normalized substantive fields are what determine whether a source record changed.
+    """
+    payload = evidence.model_dump(mode="json")
+    payload.pop("retrieved_at", None)
+    payload.pop("published_at", None)
+    return payload
+
+
 class EvidenceProcessor:
-    def __init__(self, db: Database, *, now: Callable[[], datetime] | None = None, market_lookup: Callable[[str], MarketSnapshot | None | Awaitable[MarketSnapshot | None]] | None = None, archive: EvidenceArchive | None = None):
+    def __init__(
+        self,
+        db: Database,
+        *,
+        now: Callable[[], datetime] | None = None,
+        market_lookup: Callable[[str], MarketSnapshot | None | Awaitable[MarketSnapshot | None]] | None = None,
+        archive: EvidenceArchive | None = None,
+        max_price: float = 5.0,
+        max_market_cap: float = 300_000_000,
+        quote_max_age_hours: int = 24,
+    ):
         self.db = db
         self.now = now or (lambda: datetime.now(UTC))
         self.market_lookup = market_lookup
         self.archive = archive
+        self.max_price = max_price
+        self.max_market_cap = max_market_cap
+        self.max_quote_age = timedelta(hours=quote_max_age_hours)
+
+    def _gate(self) -> AlertGate:
+        return AlertGate(
+            self.db,
+            now=self.now(),
+            max_price=self.max_price,
+            max_market_cap=self.max_market_cap,
+            max_quote_age=self.max_quote_age,
+        )
 
     def ingest_contract(self, evidence: ContractEvidence) -> list[GateResult]:
         observed = self.now()
-        inserted = self.db.insert_source_record(evidence.source, evidence.source_record_id, evidence.model_dump(mode="json"), observed_at=observed)
+        source_payload = _stable_contract_payload(evidence)
+        inserted = self.db.insert_source_record(evidence.source, evidence.source_record_id, source_payload, observed_at=observed)
         if not inserted.inserted:
             return []
         if self.archive:
-            self.archive.write(evidence.source, evidence.source_record_id, evidence.model_dump(mode="json"), observed_at=observed)
+            self.archive.write(evidence.source, evidence.source_record_id, source_payload, observed_at=observed)
         self.db.store_contract_evidence(evidence, source_record_id=inserted.row_id, created_at=observed)
         if evidence.cancelled or evidence.deleted or evidence.status.lower() in {"cancelled", "deleted", "rescinded"}:
             self.db.enqueue_correction(award_id=evidence.award_id, reason=f"Contract status changed to {evidence.status}.", source_url=evidence.source_url, created_at=observed)
@@ -59,11 +94,12 @@ class EvidenceProcessor:
 
     async def ingest_contract_async(self, evidence: ContractEvidence) -> list[GateResult]:
         observed = self.now()
-        inserted = self.db.insert_source_record(evidence.source, evidence.source_record_id, evidence.model_dump(mode="json"), observed_at=observed)
+        source_payload = _stable_contract_payload(evidence)
+        inserted = self.db.insert_source_record(evidence.source, evidence.source_record_id, source_payload, observed_at=observed)
         if not inserted.inserted:
             return []
         if self.archive:
-            self.archive.write(evidence.source, evidence.source_record_id, evidence.model_dump(mode="json"), observed_at=observed)
+            self.archive.write(evidence.source, evidence.source_record_id, source_payload, observed_at=observed)
         self.db.store_contract_evidence(evidence, source_record_id=inserted.row_id, created_at=observed)
         if evidence.cancelled or evidence.deleted or evidence.status.lower() in {"cancelled", "deleted", "rescinded"}:
             self.db.enqueue_correction(award_id=evidence.award_id, reason=f"Contract status changed to {evidence.status}.", source_url=evidence.source_url, created_at=observed)
@@ -102,7 +138,7 @@ class EvidenceProcessor:
             "Listing completion, financing, dilution, liquidity, and execution risks remain material.",
             *signal.risk_findings,
         )
-        return AlertGate(self.db, now=self.now()).evaluate(Candidate(contract=evidence, listing=signal, market=market, risks=risks))
+        return self._gate().evaluate(Candidate(contract=evidence, listing=signal, market=market, risks=risks))
 
     def _evaluate(self, evidence: ContractEvidence, signal: ListingSignal) -> GateResult:
         market = self.market_lookup(signal.ticker) if signal.ticker and self.market_lookup else None
@@ -112,4 +148,4 @@ class EvidenceProcessor:
             *signal.risk_findings,
         )
         candidate = Candidate(contract=evidence, listing=signal, market=market, risks=risks)
-        return AlertGate(self.db, now=self.now()).evaluate(candidate)
+        return self._gate().evaluate(candidate)

@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class Settings(BaseModel):
@@ -22,6 +22,9 @@ class Settings(BaseModel):
     smtp_recipients: tuple[str, ...] = ()
     sec_interval_seconds: int = 30
     usaspending_interval_seconds: int = 300
+    usaspending_initial_lookback_days: int = 7
+    usaspending_overlap_days: int = 2
+    usaspending_max_pages: int = 250
     sam_interval_seconds: int = 21600
     smtp_poll_seconds: int = 5
     max_price: float = 5.0
@@ -52,6 +55,9 @@ class Settings(BaseModel):
             smtp_recipients=recipients,
             sec_interval_seconds=int(os.getenv("SEC_INTERVAL_SECONDS", "30")),
             usaspending_interval_seconds=int(os.getenv("USASPENDING_INTERVAL_SECONDS", "300")),
+            usaspending_initial_lookback_days=int(os.getenv("USASPENDING_INITIAL_LOOKBACK_DAYS", "7")),
+            usaspending_overlap_days=int(os.getenv("USASPENDING_OVERLAP_DAYS", "2")),
+            usaspending_max_pages=int(os.getenv("USASPENDING_MAX_PAGES", "250")),
             sam_interval_seconds=int(os.getenv("SAM_INTERVAL_SECONDS", "21600")),
             smtp_poll_seconds=int(os.getenv("SMTP_POLL_SECONDS", "5")),
             max_price=float(os.getenv("MAX_PRICE", "5")),
@@ -76,6 +82,14 @@ class Settings(BaseModel):
             errors.append("SMTP_SECURITY must be starttls, ssl, or none.")
         if self.smtp_port <= 0 or self.smtp_port > 65535:
             errors.append("SMTP_PORT must be a valid TCP port.")
+        if self.usaspending_initial_lookback_days < 1:
+            errors.append("USASPENDING_INITIAL_LOOKBACK_DAYS must be at least 1.")
+        if self.usaspending_overlap_days < 0:
+            errors.append("USASPENDING_OVERLAP_DAYS cannot be negative.")
+        if self.usaspending_max_pages < 1:
+            errors.append("USASPENDING_MAX_PAGES must be at least 1.")
+        if self.max_price <= 0 or self.max_market_cap <= 0 or self.quote_max_age_hours <= 0:
+            errors.append("Qualification thresholds and quote age must be positive.")
         return errors
 
     def prepare_paths(self) -> None:

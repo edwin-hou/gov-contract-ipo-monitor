@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel
 
@@ -20,10 +20,22 @@ class GateResult(BaseModel):
 
 
 class AlertGate:
-    def __init__(self, db: Database, *, now: datetime | None = None, renderer: EmailRenderer | None = None):
+    def __init__(
+        self,
+        db: Database,
+        *,
+        now: datetime | None = None,
+        renderer: EmailRenderer | None = None,
+        max_price: float = 5.0,
+        max_market_cap: float = 300_000_000,
+        max_quote_age: timedelta = timedelta(hours=24),
+    ):
         self.db = db
         self.now = now or datetime.now(UTC)
         self.renderer = renderer or EmailRenderer()
+        self.max_price = max_price
+        self.max_market_cap = max_market_cap
+        self.max_quote_age = max_quote_age
 
     @staticmethod
     def fingerprint(candidate: Candidate) -> str:
@@ -38,7 +50,12 @@ class AlertGate:
         contract_result = ContractValidator().validate(candidate.contract)
         entity = EntityResolver().resolve(candidate.contract, candidate.listing)
         listing_result = ListingValidator(now=self.now).validate(candidate.listing)
-        small_result = SmallCompanyValidator(now=self.now).validate(candidate.listing, candidate.market)
+        small_result = SmallCompanyValidator(
+            now=self.now,
+            max_price=self.max_price,
+            max_market_cap=self.max_market_cap,
+            max_quote_age=self.max_quote_age,
+        ).validate(candidate.listing, candidate.market)
         decisions = (
             self._decision("contract", contract_result),
             GateDecision(gate="entity", passed=entity.matched, code=entity.method, reason=entity.explanation),

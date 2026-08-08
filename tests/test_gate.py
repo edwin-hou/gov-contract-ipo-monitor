@@ -82,3 +82,28 @@ def test_entity_mismatch_is_fail_closed(tmp_path: Path):
     result = AlertGate(db, now=NOW).evaluate(candidate)
     assert result.alert_created is False
     assert any(d.gate == "entity" and not d.passed for d in result.decisions)
+
+
+def test_custom_price_threshold_is_enforced(tmp_path: Path):
+    db = Database(tmp_path / "monitor.db")
+    db.initialize()
+    candidate = make_candidate()
+    result = AlertGate(db, now=NOW, max_price=3.5).evaluate(candidate)
+    assert result.alert_created is False
+    small = next(d for d in result.decisions if d.gate == "small_company")
+    assert small.passed is False
+    assert small.code == "proposed_price_too_high"
+
+
+def test_custom_market_cap_threshold_is_enforced(tmp_path: Path):
+    db = Database(tmp_path / "monitor.db")
+    db.initialize()
+    candidate = make_candidate()
+    candidate = candidate.model_copy(update={
+        "listing": candidate.listing.model_copy(update={"max_offering_size": 150_000_000})
+    })
+    result = AlertGate(db, now=NOW, max_market_cap=100_000_000).evaluate(candidate)
+    assert result.alert_created is False
+    small = next(d for d in result.decisions if d.gate == "small_company")
+    assert small.passed is False
+    assert small.code == "private_valuation_too_high"
