@@ -99,7 +99,11 @@ def test_custom_market_cap_threshold_is_enforced(tmp_path: Path):
     db = Database(tmp_path / "monitor.db")
     db.initialize()
     candidate = make_candidate()
+    candidate = candidate.model_copy(update={
+        "listing": candidate.listing.model_copy(update={"max_offering_size": 150_000_000})
+    })
     result = AlertGate(db, now=NOW, max_market_cap=100_000_000).evaluate(candidate)
-    assert result.alert_created is True
-    # The validator intentionally uses the smallest disclosed primary-source proxy.
-    # The $50M max offering size is below the custom $100M threshold.
+    assert result.alert_created is False
+    small = next(d for d in result.decisions if d.gate == "small_company")
+    assert small.passed is False
+    assert small.code == "private_valuation_too_high"
