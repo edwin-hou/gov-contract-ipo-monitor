@@ -5,7 +5,7 @@ import logging
 import random
 import signal
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
 
 import uvicorn
@@ -20,7 +20,7 @@ from .sources.http import PermanentHTTPError, ResilientClient
 from .sources.market import TwelveDataCollector
 from .sources.sam import SAMCollector
 from .sources.sec import SECCollector
-from .sources.usaspending import USAspendingCollector
+from .sources.usaspending import USAspendingCollector, USAspendingRecipientResolver
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,16 @@ class ListingSource(Protocol):
 
 
 class SECSource:
-    def __init__(self, collector: SECCollector, forms: tuple[str, ...]):
+    def __init__(
+        self,
+        collector: SECCollector,
+        forms: tuple[str, ...],
+        *,
+        recipient_resolver: USAspendingRecipientResolver | None = None,
+    ):
         self.collector = collector
         self.forms = forms
+        self.recipient_resolver = recipient_resolver
 
     async def collect(self, *, observed_at: datetime) -> list[Any]:
         signals: list[Any] = []
@@ -48,8 +55,17 @@ class SECSource:
                 except Exception as exc:
                     logger.warning("SEC filing parse failed", extra={"entry": entry.get("source_url"), "error": str(exc)})
                     continue
-                if signal is not None:
-                    signals.append(signal)
+                if signal is None:
+                    continue
+                if self.recipient_resolver is not None and not signal.linked_ueis:
+                    try:
+                        uei = await self.recipient_resolver.resolve_uei(signal.issuer_name)
+                    except Exception as exc:
+                        logger.info("Optional SEC-to-UEI enrichment failed", extra={"issuer": signal.issuer_name, "error": str(exc)})
+                    else:
+                        if uei:
+                            signal = signal.model_copy(update={"linked_ueis": (uei,)})
+                signals.append(signal)
         return signals
 
 
@@ -111,48 +127,104 @@ class MonitorService:
         db.initialize()
         health = HealthRegistry()
         health.set_database_ready(True)
-        sec_client = ResilientClient(headers={"User-Agent": settings.sec_user_agent, "Accept-Encoding": "gzip, deflate"}, max_attempts=3)
-        usa_client = ResilientClient(headers={"User-Agent": settings.sec_user_agent or "gov-contract-ipo-monitor"}, max_attempts=3)
+        sec_client = ResilientClient(
+            headers={"User-Agent": settings.sec_user_agent, "Accept-Encoding": "gzip, deflate"},
+            max_attempts=3,
+        )
+        usa_client = ResilientClient(
+            headers={"User-Agent": settings.sec_user_agent or "gov-contract-ipo-monitor"},
+            max_attempts=3,
+        )
         clients: list[ResilientClient] = [sec_client, usa_client]
-        sec_source = SECSource(SECCollector(sec_client), settings.enabled_sec_forms)
-        usa_source = USAspendingCollector(usa_client)
+        recipient_resolver = USAspendingRecipientResolver(usa_client)
+        sec_source = SECSource(
+            SECCollector(sec_client),
+            settings.enabled_sec_forms,
+            recipient_resolver=recipient_resolver,
+        )
+        usa_source = USAspendingCollector(usa_client, recipient_resolver=recipient_resolver)
         sam_source = None
         if settings.sam_api_key:
-            sam_client = ResilientClient(headers={"User-Agent": settings.sec_user_agent or "gov-contract-ipo-monitor"}, max_attempts=3)
+            sam_client = ResilientClient(
+                headers={"User-Agent": settings.sec_user_agent or "gov-contract-ipo-monitor"},
+                max_attempts=3,
+            )
             clients.append(sam_client)
             sam_source = SAMSource(SAMCollector(sam_client, settings.sam_api_key))
         market_lookup = None
         if settings.twelve_data_api_key:
-            market_client = ResilientClient(headers={"User-Agent": settings.sec_user_agent or "gov-contract-ipo-monitor"}, max_attempts=3)
+            market_client = ResilientClient(
+                headers={"User-Agent": settings.sec_user_agent or "gov-contract-ipo-monitor"},
+                max_attempts=3,
+            )
             clients.append(market_client)
             market = TwelveDataCollector(market_client, settings.twelve_data_api_key)
             market_lookup = lambda symbol: market.snapshot(symbol, observed_at=datetime.now(UTC))
         transport = SMTPTransport(
-            host=settings.smtp_host, port=settings.smtp_port,
-            username=settings.smtp_username or None, password=settings.smtp_password or None,
-            sender=settings.smtp_sender, recipients=settings.smtp_recipients,
+            host=settings.smtp_host,
+            port=settings.smtp_port,
+            username=settings.smtp_username or None,
+            password=settings.smtp_password or None,
+            sender=settings.smtp_sender,
+            recipients=settings.smtp_recipients,
             security=settings.smtp_security,
         )
         worker = SMTPWorker(db, transport=transport)
         return cls(
-            settings=settings, db=db, health=health, sec_source=sec_source,
-            usaspending_source=usa_source, sam_source=sam_source, smtp_worker=worker,
-            market_lookup=market_lookup, archive=EvidenceArchive(settings.evidence_archive_path),
+            settings=settings,
+            db=db,
+            health=health,
+            sec_source=sec_source,
+            usaspending_source=usa_source,
+            sam_source=sam_source,
+            smtp_worker=worker,
+            market_lookup=market_lookup,
+            archive=EvidenceArchive(settings.evidence_archive_path),
             clients=tuple(clients),
         )
+
+    def _collector_last_success(self, name: str) -> datetime | None:
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT last_success_at FROM collector_state WHERE name=?", (name,)).fetchone()
+        if row is None or not row["last_success_at"]:
+            return None
+        try:
+            value = datetime.fromisoformat(row["last_success_at"])
+        except ValueError:
+            return None
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+    def _usaspending_start_date(self, observed_at: datetime) -> date:
+        previous = self._collector_last_success("usaspending")
+        if previous is None:
+            return observed_at.date() - timedelta(days=self.settings.usaspending_initial_lookback_days)
+        return (previous - timedelta(days=self.settings.usaspending_overlap_days)).date()
+
+    async def _collect_usaspending_records(self, observed_at: datetime) -> list[Any]:
+        if isinstance(self.usaspending_source, USAspendingCollector):
+            return await self.usaspending_source.collect(
+                observed_at=observed_at,
+                start_date=self._usaspending_start_date(observed_at),
+                end_date=observed_at.date(),
+                max_pages=self.settings.usaspending_max_pages,
+            )
+        return await self.usaspending_source.collect(observed_at=observed_at)
 
     async def run_once(self) -> dict[str, int]:
         summary = {"contracts": 0, "listing_signals": 0, "sam_records": 0, "alerts_created": 0, "emails_sent": 0}
         self.health.set_database_ready(True)
+        observed = self.now()
         try:
-            contracts = await self.usaspending_source.collect(observed_at=self.now())
+            contracts = await self._collect_usaspending_records(observed)
             summary["contracts"] = len(contracts)
             for evidence in contracts:
                 results = await self.processor.ingest_contract_async(evidence)
                 summary["alerts_created"] += sum(int(result.alert_created) for result in results)
             self.health.mark_success("usaspending")
+            self.db.update_collector_state("usaspending", cursor=observed.date().isoformat(), success_at=observed, error=None)
         except Exception as exc:
             self.health.mark_error("usaspending", f"{type(exc).__name__}: {exc}", disabled=isinstance(exc, PermanentHTTPError))
+            self.db.update_collector_state("usaspending", error=f"{type(exc).__name__}: {exc}", disabled=isinstance(exc, PermanentHTTPError))
             logger.exception("USAspending collection failed")
 
         try:
@@ -229,7 +301,12 @@ class MonitorService:
         if self.sam_source is not None:
             tasks.append(asyncio.create_task(self._collector_loop("sam", self.settings.sam_interval_seconds, self._poll_sam)))
         if serve_health:
-            config = uvicorn.Config(create_health_app(self.health), host=self.settings.health_host, port=self.settings.health_port, log_level="info")
+            config = uvicorn.Config(
+                create_health_app(self.health, self.db),
+                host=self.settings.health_host,
+                port=self.settings.health_port,
+                log_level="info",
+            )
             server = uvicorn.Server(config)
             tasks.append(asyncio.create_task(server.serve()))
         await self.stop_event.wait()
@@ -240,9 +317,11 @@ class MonitorService:
             await client.aclose()
 
     async def _poll_usaspending(self) -> None:
-        records = await self.usaspending_source.collect(observed_at=self.now())
+        observed = self.now()
+        records = await self._collect_usaspending_records(observed)
         for record in records:
             await self.processor.ingest_contract_async(record)
+        self.db.update_collector_state("usaspending", cursor=observed.date().isoformat(), success_at=observed, error=None)
         self.health.mark_success("usaspending")
 
     async def _poll_sec(self) -> None:
