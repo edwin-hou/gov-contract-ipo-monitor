@@ -5,7 +5,7 @@ import logging
 import random
 import signal
 from collections.abc import Callable
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 import uvicorn
@@ -92,7 +92,15 @@ class MonitorService:
         self.sam_source = sam_source
         self.smtp_worker = smtp_worker
         self.now = now or (lambda: datetime.now(UTC))
-        self.processor = EvidenceProcessor(db, now=self.now, market_lookup=market_lookup, archive=archive)
+        self.processor = EvidenceProcessor(
+            db,
+            now=self.now,
+            market_lookup=market_lookup,
+            archive=archive,
+            max_price=settings.max_price,
+            max_market_cap=settings.max_market_cap,
+            quote_max_age_hours=settings.quote_max_age_hours,
+        )
         self.clients = clients
         self.stop_event = asyncio.Event()
 
