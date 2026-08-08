@@ -31,7 +31,7 @@ def listing(name="Acme Quantum, Inc.", uei="UEI123456789", active=True, status="
         active=active, status=status, route=ListingRoute.S1, form_type="S-1", is_initial_listing=True,
         intends_public_trading=True, expected_exchange="NASDAQ", proposed_price=4.0,
         proposed_valuation=200_000_000, max_offering_size=50_000_000,
-        linked_ueis=(uei,), external_corroboration=True,
+        linked_ueis=(uei,) if uei else (), external_corroboration=True,
         raw_payload_hash=f"listing-{status}",
     )
 
@@ -57,6 +57,19 @@ def test_processor_does_not_cross_join_similar_names(tmp_path: Path):
     results = processor.ingest_listing(listing(name="Acme Quantum Inc", uei="UEI-B"))
     assert results == []
     assert db.count("outbox_messages") == 0
+
+
+def test_official_uei_bridge_can_join_exact_legal_name_without_contract_uei(tmp_path: Path):
+    db = Database(tmp_path / "monitor.db")
+    db.initialize()
+    processor = EvidenceProcessor(db, now=lambda: NOW)
+    no_uei_contract = contract(uei=None).model_copy(update={"recipient_address": None})
+    processor.ingest_contract(no_uei_contract)
+    results = processor.ingest_listing(listing(uei="UEI123456789"))
+    assert len(results) == 1
+    assert results[0].alert_created is True
+    entity_decision = next(d for d in results[0].decisions if d.gate == "entity")
+    assert entity_decision.code == "official_recipient_identity"
 
 
 def test_withdrawal_after_alert_queues_correction(tmp_path: Path):
@@ -89,3 +102,26 @@ def test_health_endpoints_distinguish_liveness_and_readiness():
     registry.mark_success("usaspending")
     registry.set_database_ready(True)
     assert client.get("/readyz").status_code == 200
+
+
+def test_dashboard_and_rejection_api_explain_gate_failures(tmp_path: Path):
+    db = Database(tmp_path / "monitor.db")
+    db.initialize()
+    processor = EvidenceProcessor(db, now=lambda: NOW)
+    processor.ingest_contract(contract())
+    rejected = listing().model_copy(update={"proposed_price": 7.0})
+    processor.ingest_listing(rejected)
+
+    registry = HealthRegistry()
+    client = TestClient(create_health_app(registry, db))
+    response = client.get("/api/rejections")
+    assert response.status_code == 200
+    rows = response.json()["rejections"]
+    assert len(rows) == 1
+    assert rows[0]["company"] == "Acme Quantum, Inc."
+    assert "small_company" in rows[0]["failed_gates"]
+
+    dashboard = client.get("/dashboard")
+    assert dashboard.status_code == 200
+    assert "Acme Quantum, Inc." in dashboard.text
+    assert "price_too_high" in dashboard.text
