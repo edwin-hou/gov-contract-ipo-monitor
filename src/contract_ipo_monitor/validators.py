@@ -93,14 +93,39 @@ class SmallCompanyValidator:
             if market.price >= self.max_price:
                 return ValidationResult(passed=False, code="price_too_high", reason=f"Share price ${market.price:.2f} is not below ${self.max_price:.2f}.")
             if market.market_cap is None or market.market_cap >= self.max_market_cap:
-                return ValidationResult(passed=False, code="market_cap_too_high_or_missing", reason="Market capitalization is missing or not below $300 million.")
-            return ValidationResult(passed=True, code="public_small_company", reason="Fresh quote is below both price and market-cap thresholds.")
+                return ValidationResult(
+                    passed=False,
+                    code="market_cap_too_high_or_missing",
+                    reason=f"Market capitalization is missing or not below ${self.max_market_cap:,.0f}.",
+                )
+            return ValidationResult(passed=True, code="public_small_company", reason="Fresh quote is below both configured price and market-cap thresholds.")
 
-        proxies = [value for value in (signal.proposed_valuation, signal.max_offering_size, signal.transaction_value) if value is not None]
-        if not proxies:
-            return ValidationResult(passed=False, code="missing_private_valuation", reason="Private candidate lacks a primary-source valuation or offering-size proxy.")
-        if min(proxies) >= self.max_market_cap:
-            return ValidationResult(passed=False, code="private_valuation_too_high", reason="Available valuation/offering proxy is not below $300 million.")
+        proxy_name: str | None = None
+        proxy_value: float | None = None
+        if signal.proposed_valuation is not None:
+            proxy_name, proxy_value = "proposed valuation", signal.proposed_valuation
+        elif signal.transaction_value is not None:
+            proxy_name, proxy_value = "transaction value", signal.transaction_value
+        elif signal.max_offering_size is not None:
+            proxy_name, proxy_value = "maximum offering size", signal.max_offering_size
+
+        if proxy_value is None:
+            return ValidationResult(passed=False, code="missing_private_valuation", reason="Private candidate lacks a primary-source valuation, transaction value, or offering-size proxy.")
+        if proxy_value >= self.max_market_cap:
+            return ValidationResult(
+                passed=False,
+                code="private_valuation_too_high",
+                reason=f"Primary-source {proxy_name} of ${proxy_value:,.0f} is not below ${self.max_market_cap:,.0f}.",
+            )
         if signal.proposed_price is not None and signal.proposed_price >= self.max_price:
-            return ValidationResult(passed=False, code="proposed_price_too_high", reason="Disclosed proposed share price is not below $5.")
-        return ValidationResult(passed=True, code="private_small_company", reason="Primary filing supports a sub-$300 million valuation/offering proxy.")
+            return ValidationResult(
+                passed=False,
+                code="proposed_price_too_high",
+                reason=f"Disclosed proposed share price ${signal.proposed_price:.2f} is not below ${self.max_price:.2f}.",
+            )
+        return ValidationResult(
+            passed=True,
+            code="private_small_company",
+            reason=f"Primary filing {proxy_name} is below the configured ${self.max_market_cap:,.0f} threshold.",
+            details={"proxy_name": proxy_name, "proxy_value": proxy_value},
+        )
