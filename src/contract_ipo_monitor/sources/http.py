@@ -34,7 +34,10 @@ class ResilientClient:
         self.sleeper = sleeper
         self.client = httpx.AsyncClient(headers=headers, timeout=timeout, transport=transport, follow_redirects=True)
 
-    async def request_json(self, method: str, url: str, **kwargs: Any) -> Any:
+    def _backoff(self, attempt: int) -> float:
+        return self.base_delay * (2 ** (attempt - 1)) + random.uniform(0, self.base_delay)
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -43,9 +46,7 @@ class ResilientClient:
                 last_error = exc
             else:
                 if 200 <= response.status_code < 300:
-                    if response.status_code == 204 or not response.content:
-                        return None
-                    return response.json()
+                    return response
                 if 400 <= response.status_code < 500 and response.status_code != 429:
                     raise PermanentHTTPError(response.status_code, response.text[:500])
                 last_error = TransientHTTPError(f"HTTP {response.status_code}: {response.text[:500]}")
@@ -53,21 +54,23 @@ class ResilientClient:
                 if retry_after and retry_after.isdigit():
                     delay = float(retry_after)
                 else:
-                    delay = self.base_delay * (2 ** (attempt - 1)) + random.uniform(0, self.base_delay)
+                    delay = self._backoff(attempt)
                 if attempt < self.max_attempts:
                     await self.sleeper(delay)
                     continue
             if attempt < self.max_attempts:
-                await self.sleeper(self.base_delay * (2 ** (attempt - 1)) + random.uniform(0, self.base_delay))
+                await self.sleeper(self._backoff(attempt))
         raise TransientHTTPError(str(last_error or "request failed"))
 
+    async def request_json(self, method: str, url: str, **kwargs: Any) -> Any:
+        response = await self._request(method, url, **kwargs)
+        if response.status_code == 204 or not response.content:
+            return None
+        return response.json()
+
     async def request_text(self, method: str, url: str, **kwargs: Any) -> str:
-        response = await self.client.request(method, url, **kwargs)
-        if 200 <= response.status_code < 300:
-            return response.text
-        if 400 <= response.status_code < 500 and response.status_code != 429:
-            raise PermanentHTTPError(response.status_code, response.text[:500])
-        raise TransientHTTPError(f"HTTP {response.status_code}: {response.text[:500]}")
+        response = await self._request(method, url, **kwargs)
+        return response.text
 
     async def aclose(self) -> None:
         await self.client.aclose()
