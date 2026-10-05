@@ -5,7 +5,7 @@ import logging
 import random
 import signal
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
 
@@ -23,7 +23,7 @@ from .fundamentals import SECCompanyFactsCollector
 from .worldnews import WorldNewsCollector
 from .tracking import IPOTracker
 from .sentiment import summarize_sentiment
-from .sources.discourse import CompanyWatch, DiscourseCollector, DiscourseConfig
+from .sources.discourse import CompanyWatch, DiscourseCollector, DiscourseConfig, matching_companies
 from .smtp_worker import SMTPTransport, SMTPWorker
 from .sources.http import PermanentHTTPError, ResilientClient
 from .sources.market import TwelveDataCollector
@@ -527,9 +527,13 @@ class MonitorService:
         return inserted
 
     def create_report(self, counts: dict[str, Any] | None = None) -> dict[str, Any]:
-        records = self.research.records()
+        watches = self.companies()
+        # Keep original receipts intact, but apply corrected identity rules to
+        # restored evidence before measuring today's company sentiment.
+        records = [replace(item, company_names=matching_companies(item.title + " " + item.text, watches))
+                   for item in self.research.records()]
         sentiment = []
-        for company in self.companies():
+        for company in watches:
             summary = asdict(summarize_sentiment(company.name, records, now=self.now()))
             summary["company_name"] = company.name
             sentiment.append(summary)

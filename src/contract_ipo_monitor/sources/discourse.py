@@ -192,6 +192,9 @@ def plain_text(value: str, limit: int = 20000) -> str:
 
 def matching_companies(text: str, companies: Sequence[CompanyWatch]) -> tuple[str, ...]:
     """Explicit boundary matches; a ticker substring is never identity proof."""
+    # A company word inside a social-profile URL or navigation link is not a
+    # textual company mention. Keep surrounding prose and exact cashtags.
+    text = re.sub(r"(?:https?://|www\.)\S+", " ", text, flags=re.I)
     results = []
     for company in companies:
         terms = [_identity_term(company.name, canonical=True), *(_identity_term(alias) for alias in company.aliases)]

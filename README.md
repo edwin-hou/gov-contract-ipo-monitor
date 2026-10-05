@@ -22,6 +22,8 @@ Anduril, SpaceX, OpenAI, Anthropic, Databricks and Stripe, plus recent active IP
 
 Discovered issuers retain their legal names. Conservative aliases remove trailing legal suffixes from names with multiple words, so articles about “TRex Bio” can match “TRex Bio, Inc.” without matching unrelated substrings.
 
+Social-profile URL words and subsidiary navigation labels alone do not establish a parent-company mention; for example, a promoter's Instagram link is not treated as Meta investment commentary.
+
 The supplied Anduril video, https://youtu.be/0BE2AAOlYWI, is a default seed. If captions cannot be retrieved, the report explicitly states that its spoken content was not analyzed. Optional `YOUTUBE_API_KEY` enables bounded discovery; official captions downloads for arbitrary third-party videos cannot be assumed available.
 
 Hacker News collection uses the public Algolia API without an account or key, samples one recent page per watched company, and retains comment text, timestamps, and author-account origins. Set `HACKER_NEWS_ENABLED=false` to disable it. Search selection, community selection, quoted opinions, and unverified authors remain explicit limitations.
