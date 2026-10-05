@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from urllib.parse import quote
 from typing import Any
 
 from ..models import ContractEvidence, EvidenceClass
@@ -72,10 +73,10 @@ class USAspendingRecipientResolver:
 class USAspendingNormalizer:
     def normalize(self, row: dict[str, Any], *, observed_at: datetime) -> ContractEvidence:
         award_id = str(_first(row, "Award ID", "award_id", "piid", "generated_unique_award_id", default=""))
-        external_id = str(_first(row, "generated_unique_award_id", "internal_id", default=award_id))
+        external_id = str(_first(row, "generated_internal_id", "generated_unique_award_id", "internal_id", default=award_id))
         raw = json.dumps(row, sort_keys=True, default=str)
         obligation = _first(row, "Total Obligation", "total_obligation", "Award Amount", "award_amount")
-        value = _first(row, "Award Amount", "award_amount", "generated_subawards")
+        value = _first(row, "Award Amount", "award_amount")
         recipient = str(_first(row, "Recipient Name", "recipient_name", default=""))
         address_parts = [
             _first(row, "Recipient Address Line 1"),
@@ -85,16 +86,26 @@ class USAspendingNormalizer:
             _first(row, "Recipient State", "Recipient State Code"),
             _first(row, "Recipient Zip Code", "Recipient Zip5"),
         ]
+        location = _first(row, "Recipient Location")
+        if isinstance(location, dict):
+            address_parts = [location.get(key) for key in ("address_line1", "address_line2", "city_name", "state_code", "zip5", "country_name")]
+        modified = _first(row, "Last Modified Date", "last_modified_date")
+        published = datetime.fromisoformat(str(modified).replace("Z", "+00:00")) if modified else None
+        if published is not None and published.tzinfo is None:
+            published = published.replace(tzinfo=UTC)
+        signed = _first(row, "Base Obligation Date", "Signed Date", "Award Date", "award_date", "Start Date", "start_date")
+        if not signed:
+            raise ValueError("USAspending award is missing its source award date")
         return ContractEvidence(
             source="usaspending",
-            source_url=f"https://www.usaspending.gov/award/{external_id}",
+            source_url=f"https://www.usaspending.gov/award/{quote(external_id, safe='')}",
             source_record_id=external_id,
             retrieved_at=observed_at,
-            published_at=observed_at,
+            published_at=published,
             award_id=award_id,
             modification_number=str(_first(row, "Modification Number", "modification_number", default="0")),
             status="awarded",
-            award_date=_date(_first(row, "Signed Date", "Award Date", "award_date", "Start Date", "start_date"), observed_at.date()),
+            award_date=_date(signed, observed_at.date()),
             agency=str(_first(row, "Awarding Agency", "awarding_agency", default="Unknown agency")),
             subagency=_first(row, "Awarding Sub Agency", "awarding_subagency"),
             office=_first(row, "Awarding Office", "awarding_office"),
@@ -106,7 +117,7 @@ class USAspendingNormalizer:
             current_value=float(value) if value is not None else None,
             ceiling_amount=float(_first(row, "Potential Award Amount", "potential_award_amount")) if _first(row, "Potential Award Amount", "potential_award_amount") is not None else None,
             award_type=str(_first(row, "Contract Award Type", "Award Type", "award_type", default="contract")).lower().replace(" ", "_"),
-            start_date=_date(_first(row, "Start Date", "start_date"), observed_at.date()),
+            start_date=_date(_first(row, "Start Date", "start_date"), observed_at.date()) if _first(row, "Start Date", "start_date") else None,
             end_date=_date(_first(row, "End Date", "end_date"), observed_at.date()) if _first(row, "End Date", "end_date") else None,
             description=str(_first(row, "Contract Description", "Description", "description", default="No description supplied")),
             evidence_class=EvidenceClass.A,
@@ -136,6 +147,8 @@ class USAspendingCollector:
     ) -> list[ContractEvidence]:
         start = start_date or (observed_at.date() - lookback)
         end = end_date or observed_at.date()
+        if start > end or page < 1 or not 1 <= limit <= 100 or max_pages < 1:
+            raise ValueError("invalid USAspending collection window or pagination limits")
         current_page = page
         records: list[ContractEvidence] = []
         seen: set[tuple[str, str]] = set()
@@ -147,9 +160,9 @@ class USAspendingCollector:
                     "award_type_codes": ["A", "B", "C", "D"],
                 },
                 "fields": [
-                    "Award ID", "Recipient Name", "Award Amount", "Potential Award Amount",
-                    "Awarding Agency", "Awarding Sub Agency", "Awarding Office", "Start Date", "End Date",
-                    "Signed Date", "Contract Description", "Contract Award Type", "Recipient Address Line 1",
+                    "Award ID", "Recipient Name", "Award Amount", "Recipient UEI", "Recipient Location",
+                    "Awarding Agency", "Awarding Sub Agency", "Start Date", "End Date",
+                    "Base Obligation Date", "Last Modified Date", "Description", "Contract Award Type", "generated_internal_id",
                 ],
                 "page": current_page,
                 "limit": limit,
@@ -158,11 +171,13 @@ class USAspendingCollector:
                 "order": "desc",
             }
             data = await self.client.request_json("POST", self.URL, json=payload)
-            rows = (data or {}).get("results", [])
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                raise ValueError("USAspending response does not contain a results list")
+            rows = data["results"]
             for row in rows:
                 record = self.normalizer.normalize(row, observed_at=observed_at)
                 if not record.award_id or not record.recipient_name:
-                    continue
+                    raise ValueError("USAspending returned an award without an identifier or recipient")
                 if enrich_uei and record.recipient_uei is None and self.recipient_resolver is not None:
                     uei = await self.recipient_resolver.resolve_uei(record.recipient_name)
                     if uei:
@@ -180,6 +195,9 @@ class USAspendingCollector:
                     f"USAspending pagination exceeded max_pages={max_pages} for {start.isoformat()}..{end.isoformat()}; refusing to truncate silently."
                 )
             next_page = metadata.get("next")
-            current_page = int(next_page) if next_page is not None else current_page + 1
+            proposed_page = int(next_page) if next_page is not None else current_page + 1
+            if proposed_page <= current_page or not rows:
+                raise RuntimeError("USAspending pagination did not advance; refusing incomplete collection")
+            current_page = proposed_page
 
         return records

@@ -86,7 +86,7 @@ def test_withdrawal_after_alert_queues_correction(tmp_path: Path):
 
 
 def test_settings_validation_requires_contact_and_mail_configuration(tmp_path: Path):
-    settings = Settings(database_path=tmp_path / "db.sqlite", evidence_archive_path=tmp_path / "evidence")
+    settings = Settings(database_path=tmp_path / "db.sqlite", evidence_archive_path=tmp_path / "evidence", smtp_enabled=True)
     errors = settings.runtime_errors()
     assert any("SEC_USER_AGENT" in error for error in errors)
     assert any("SMTP_HOST" in error for error in errors)

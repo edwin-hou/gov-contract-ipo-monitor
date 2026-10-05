@@ -92,6 +92,25 @@ def recent_alerts(db: Database, *, limit: int = 50) -> list[dict[str, Any]]:
 
 
 def dashboard_html(db: Database, *, limit: int = 50) -> str:
+    from .tracking import IPOTracker
+    from .research import ResearchStore
+    tracker = IPOTracker(db)
+    tracker.initialize()
+    store = ResearchStore(db)
+    store.initialize()
+    report = store.latest_run() or {}
+    ipo_rows = "".join(
+        f"<tr><td>{escape(item['issuer_name'])}</td><td>{escape(item['status'])}</td><td>{escape(item['confidence'])}</td><td>{escape(str(item['last_filed_at']))}</td></tr>"
+        for item in tracker.candidates(limit=limit)
+    ) or '<tr><td colspan="4">No IPO evidence collected. Check collector status before interpreting an empty result.</td></tr>'
+    sentiment_rows = "".join(
+        f"<tr><td>{escape(item['company_name'])}</td><td>{escape(item['label'])}</td><td>{item['scored_count']}</td><td>{item['independent_origins']}</td><td>{escape('; '.join(item['bias_flags']))}</td></tr>"
+        for item in report.get('sentiment', [])
+    ) or '<tr><td colspan="5">No completed sentiment sample yet.</td></tr>'
+    coverage_rows = "".join(
+        f"<tr><td>{escape(item['source'])}</td><td>{escape(item['status'])}</td><td>{item.get('collected_count', 0)}</td><td>{escape(item.get('error') or '; '.join(item.get('limitations', [])))}</td></tr>"
+        for item in report.get('coverage', [])
+    ) or '<tr><td colspan="4">No online source receipt yet.</td></tr>'
     candidates = recent_candidates(db, limit=limit)
     states = collector_states(db)
     alerts = recent_alerts(db, limit=10)
@@ -146,7 +165,10 @@ th{{position:sticky;top:0;background:white}} .pill{{padding:3px 7px;border-radiu
 .alerted{{background:#d7f5df}} .rejected{{background:#ffe0e0}} .qualified_duplicate{{background:#fff1c7}}
 small{{color:#666}}
 </style></head><body><main>
-<h1>Government Contract + IPO Monitor</h1><small>Read-only operational view. No trading recommendations.</small>
+<h1>IPO and Sentiment Monitor</h1><small>IPO evidence across company sizes, online sentiment samples, and government contracts. Last report: {escape(str(report.get('completed_at', 'never')))} — {escape(str(report.get('status', 'not run')))}.</small>
+<div class="card"><h2>Company IPO evidence</h2><p>Filing stages do not establish that shares began trading. Company size and government contracts are not required.</p><table><thead><tr><th>Company</th><th>Stage</th><th>Evidence confidence</th><th>Last filing</th></tr></thead><tbody>{ipo_rows}</tbody></table></div>
+<div class="card"><h2>Online sentiment sample</h2><p>English lexicon estimate, balanced by source and origin. Unknown means insufficient evidence. Video metadata is excluded.</p><table><thead><tr><th>Company</th><th>Tone</th><th>Scored items</th><th>Origins</th><th>Bias flags</th></tr></thead><tbody>{sentiment_rows}</tbody></table></div>
+<div class="card"><h2>Online source coverage</h2><table><thead><tr><th>Source</th><th>Status</th><th>Items</th><th>Limitations</th></tr></thead><tbody>{coverage_rows}</tbody></table></div>
 <div class="card"><h2>Collectors</h2><table><thead><tr><th>Collector</th><th>Last success</th><th>Last error</th><th>Disabled</th></tr></thead><tbody>{collector_rows}</tbody></table></div>
 <div class="card"><h2>Recent candidate evaluations</h2><table><thead><tr><th>Observed</th><th>Company</th><th>Award</th><th>Route</th><th>Outcome</th><th>Failed gates</th><th>Reason</th></tr></thead><tbody>{candidate_html}</tbody></table></div>
 <div class="card"><h2>Recent confirmed alerts</h2><table><thead><tr><th>Created</th><th>Company</th><th>Award</th><th>Status</th></tr></thead><tbody>{alert_rows}</tbody></table></div>

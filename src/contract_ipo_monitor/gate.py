@@ -47,7 +47,7 @@ class AlertGate:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def evaluate(self, candidate: Candidate) -> GateResult:
-        contract_result = ContractValidator().validate(candidate.contract)
+        contract_result = ContractValidator(now=self.now).validate(candidate.contract)
         entity = EntityResolver().resolve(candidate.contract, candidate.listing)
         listing_result = ListingValidator(now=self.now).validate(candidate.listing)
         small_result = SmallCompanyValidator(

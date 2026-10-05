@@ -1,15 +1,75 @@
 from __future__ import annotations
 
+import asyncio
+import gzip
 import hashlib
 import re
 import xml.etree.ElementTree as ET
-from datetime import UTC, datetime
+from contextlib import closing
+from datetime import UTC, date, datetime
+from html.parser import HTMLParser
+from time import monotonic
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 
+from ..archive import EvidenceArchive
 from ..models import ListingRoute, ListingSignal
 from ..risk import RiskAnalyzer
+from ..tracking import IPOEvidence
 from .http import ResilientClient
+
+
+class _DocumentHTML(HTMLParser):
+    """Extract rendered words and filing-index table rows without script content."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.words: list[str] = []
+        self.rows: list[list[dict[str, Any]]] = []
+        self.links: list[str] = []
+        self._skip = 0
+        self._row: list[dict[str, Any]] | None = None
+        self._cell: dict[str, Any] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag in {"script", "style"}:
+            self._skip += 1
+        if tag == "tr":
+            self._row = []
+        if tag in {"td", "th"} and self._row is not None:
+            self._cell = {"words": [], "links": []}
+        if tag == "a" and attributes.get("href"):
+            self.links.append(attributes["href"])
+            if self._cell is not None:
+                self._cell["links"].append(attributes["href"])
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style"} and self._skip:
+            self._skip -= 1
+        if tag in {"td", "th"} and self._row is not None and self._cell is not None:
+            self._cell["text"] = " ".join(self._cell.pop("words"))
+            self._row.append(self._cell)
+            self._cell = None
+        if tag == "tr" and self._row is not None:
+            self.rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if data.strip():
+            self.words.append(data.strip())
+            if self._cell is not None:
+                self._cell["words"].append(data.strip())
+
+
+def document_text(raw: str) -> str:
+    if not re.search(r"<(?:html|body|div|p|table|span)\b", raw, re.I):
+        return re.sub(r"\s+", " ", raw).strip()
+    parser = _DocumentHTML()
+    parser.feed(raw)
+    return re.sub(r"\s+", " ", " ".join(parser.words)).strip()
 
 
 class SECNormalizer:
@@ -48,6 +108,103 @@ class SECNormalizer:
         r"outstanding immediately after (?:this|the) offering)[^0-9]{0,100}([0-9][0-9,]*)",
         re.I | re.S,
     )
+    REGISTRATION_FORMS = {"S-1", "S-1/A", "F-1", "F-1/A", "S-11", "S-11/A"}
+    CURRENT_INITIAL_RE = re.compile(
+        r"\bthis is (?:an?|our|the) initial public offering\b|"
+        r"\b(?:we|the company) (?:are|is) (?:offering|selling)[^.]{0,250}\binitial public offering\b",
+        re.I,
+    )
+    SOLE_RESALE_RE = re.compile(
+        r"\b(?:solely|exclusively)[^.]{0,120}\bresale\b|"
+        r"\bthis (?:prospectus|registration statement)[^.]{0,220}\bresale\b|"
+        r"\b(?:we are not|we will not be) (?:offering|selling) (?:any )?(?:shares|securities)\b",
+        re.I,
+    )
+    ALREADY_PUBLIC_RE = re.compile(
+        r"\b(?:our|the company's) (?:common stock|ordinary shares|shares|units) (?:is|are) "
+        r"(?:currently |already )?(?:listed|traded|quoted)\b|"
+        r"\b(?:completed|consummated|closed) our initial public offering\b|"
+        r"\bsince our initial public offering\b",
+        re.I,
+    )
+
+    @staticmethod
+    def registration_number(raw: str) -> str | None:
+        # EFFECT uses XML. Other filings and index pages have labelled file numbers.
+        patterns = (
+            r"<fileNumber>\s*((?:333|33)-\d+(?:-\d+)?)\s*</fileNumber>",
+            r"(?:registration|file)(?: statement)?(?: (?:no\.?|number))?[\s:#.]{0,15}((?:333|33)-\d+(?:-\d+)?)",
+            r"(?:filenum|fileNumber)=((?:333|33)-\d+(?:-\d+)?)",
+        )
+        matches = {match for pattern in patterns for match in re.findall(pattern, raw, re.I)}
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    @staticmethod
+    def effectiveness_metadata(raw: str) -> dict[str, Any]:
+        """Notice dates describe effectiveness, distinct from EDGAR posting time."""
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            return {}
+        if root.tag.rsplit("}", 1)[-1] != "edgarSubmission":
+            return {}
+        values = {element.tag.rsplit("}", 1)[-1]: (element.text or "").strip() for element in root.iter()}
+        metadata: dict[str, Any] = {}
+        if values.get("cik", "").isdigit():
+            metadata["cik"] = values["cik"]
+        if values.get("entityName"):
+            metadata["issuer_name"] = values["entityName"]
+        if values.get("form"):
+            metadata["underlying_form"] = values["form"]
+        if values.get("finalEffectivenessDispDate"):
+            metadata["effective_date"] = date.fromisoformat(values["finalEffectivenessDispDate"])
+        return metadata
+
+    def offering_classification(self, text: str) -> tuple[bool, str, str]:
+        cover = text[:30000]
+        initial = self.CURRENT_INITIAL_RE.search(cover)
+        primary = self.PRIMARY_OFFERING_RE.search(cover)
+        # Explicit resale on the cover remains resale even if IPO history is discussed.
+        if self.SOLE_RESALE_RE.search(cover):
+            return False, "resale", "Cover describes a resale registration, not a new IPO."
+        if self.ALREADY_PUBLIC_RE.search(cover) and not initial:
+            return False, "follow_on", "Issuer is already publicly traded or describes a completed historical IPO."
+        if initial:
+            return True, "ipo", "Current offering is explicitly described as an initial public offering."
+        if primary and self.NO_PUBLIC_MARKET_RE.search(cover):
+            return True, "ipo", "Primary offering and no previous public trading market are stated on the filing cover."
+        if self.RESALE_RE.search(cover) and not primary:
+            return False, "resale", "Selling stockholders and resale language without a current issuer offering."
+        return False, "unclassified", "Registration form alone does not establish an IPO; review the offering document."
+
+    def tracking_document(
+        self, *, form_type: str, accession: str, issuer_name: str, cik: str | None,
+        filed_at: datetime, source_url: str, text: str, registration_id: str | None = None,
+    ) -> IPOEvidence | None:
+        form = form_type.upper().strip()
+        clean = document_text(text)
+        metadata = self.effectiveness_metadata(text) if form == "EFFECT" else {}
+        issuer_name = metadata.get("issuer_name", issuer_name)
+        cik = metadata.get("cik", cik)
+        registration = registration_id or self.registration_number(text) or self.registration_number(clean[:30000])
+        if form in self.REGISTRATION_FORMS or form == "424B4":
+            is_ipo, kind, reason = self.offering_classification(clean)
+            event_type = "prospectus" if form == "424B4" else "amendment" if form.endswith("/A") else "registration"
+        elif form in {"EFFECT", "RW", "AW"}:
+            event_type = {"EFFECT": "effective", "RW": "withdrawn", "AW": "amendment_withdrawn"}[form]
+            is_ipo, kind = False, "lifecycle_notice"
+            reason = "Lifecycle notice applies only to its referenced SEC registration; it does not identify an IPO by itself."
+        else:
+            return None
+        return IPOEvidence(
+            event_id=accession, issuer_name=issuer_name, cik=cik, source="sec", source_kind="regulatory",
+            source_url=source_url, filed_at=filed_at, form_type=form, registration_id=registration,
+            underlying_form=metadata.get("underlying_form"), effective_date=metadata.get("effective_date"),
+            event_type=event_type, is_ipo=is_ipo, offering_kind=kind,
+            ticker=self._ticker(clean[:30000]), exchange=self._exchange(clean[:30000]),
+            proposed_price=self._price(clean[:30000]), evidence_excerpt=clean[:2500],
+            classification_reason=reason, raw_payload_hash=hashlib.sha256(text.encode()).hexdigest(),
+        )
 
     @staticmethod
     def _number(value: str) -> float:
@@ -76,9 +233,9 @@ class SECNormalizer:
     @staticmethod
     def _ticker(text: str) -> str | None:
         patterns = (
-            r"under (?:the )?(?:symbol|ticker symbol|trading symbol)\s*[\"'‘’:]?\s*([A-Z]{1,6})\b",
-            r"(?:symbol|ticker symbol|trading symbol)\s*[\"'‘’:]\s*([A-Z]{1,6})\b",
-            r"(?:Nasdaq|NYSE(?: American)?)[^.]{0,120}?\b(?:symbol|ticker)\s*[\"'‘’:]?\s*([A-Z]{1,6})\b",
+            r"under (?:the )?(?:symbol|ticker symbol|trading symbol)\s*[\"'‘’“”:]?\s*([A-Z]{1,6})\b",
+            r"(?:symbol|ticker symbol|trading symbol)\s*[\"'‘’“”:]\s*([A-Z]{1,6})\b",
+            r"(?:Nasdaq|NYSE(?: American)?)[^.]{0,120}?\b(?:symbol|ticker)\s*[\"'‘’“”:]?\s*([A-Z]{1,6})\b",
         )
         for pattern in patterns:
             match = re.search(pattern, text, re.I | re.S)
@@ -103,11 +260,13 @@ class SECNormalizer:
         filed_at: datetime,
         source_url: str,
         text: str,
+        registration_id: str | None = None,
     ) -> ListingSignal | None:
         form = form_type.upper().strip()
         raw_hash = hashlib.sha256(text.encode(errors="ignore")).hexdigest()
-        lower = text.lower()
-        if form in {"RW", "AW"} or "requests withdrawal" in lower or "request withdrawal" in lower:
+        registration_id = registration_id or self.registration_number(text)
+        text = document_text(text)
+        if form == "RW":
             return ListingSignal(
                 source="sec",
                 source_url=source_url,
@@ -119,8 +278,12 @@ class SECNormalizer:
                 status="withdrawn",
                 route=ListingRoute.S1,
                 form_type=form,
+                registration_id=registration_id,
                 raw_payload_hash=raw_hash,
             )
+        if form == "AW":
+            # AW withdraws an amendment, not the registration statement itself.
+            return None
 
         exchange = self._exchange(text)
         price = self._price(text)
@@ -156,13 +319,11 @@ class SECNormalizer:
             external_corroboration=True,
             risk_findings=risks,
             raw_payload_hash=raw_hash,
+            registration_id=registration_id,
         )
 
         if form in {"S-1", "S-1/A", "F-1", "F-1/A"}:
-            primary = bool(self.PRIMARY_OFFERING_RE.search(text))
-            initial = bool(self.INITIAL_RE.search(text)) or (primary and bool(self.NO_PUBLIC_MARKET_RE.search(text)))
-            if self.RESALE_RE.search(text) and not primary:
-                return None
+            initial, _kind, _reason = self.offering_classification(text)
             if not initial or not exchange:
                 return None
             route = ListingRoute.F1 if form.startswith("F-1") else ListingRoute.S1
@@ -205,17 +366,48 @@ class SECNormalizer:
                 )
         return None
 
-    def primary_document_url(self, index_url: str, index_html: str) -> str:
-        hrefs = re.findall(r'href=["\']([^"\']+)["\']', index_html, flags=re.I)
-        candidates = []
-        for href in hrefs:
-            lower = href.lower()
-            if not lower.endswith((".htm", ".html")):
+    def primary_document_url(self, index_url: str, index_html: str, form_type: str | None = None) -> str:
+        parser = _DocumentHTML()
+        parser.feed(index_html)
+
+        def safe_document(href: str) -> str | None:
+            joined = urljoin(index_url, href)
+            parsed = urlparse(joined)
+            if parsed.path.startswith("/ixviewer/") or parsed.path == "/ix":
+                query = parse_qs(parsed.query)
+                joined = urljoin(index_url, (query.get("doc") or [""])[0])
+                parsed = urlparse(joined)
+            if parsed.scheme != "https" or parsed.hostname not in {"sec.gov", "www.sec.gov"}:
+                return None
+            if not parsed.path.startswith("/Archives/edgar/data/"):
+                return None
+            if not parsed.path.lower().endswith((".htm", ".html", ".txt", ".xml")) or "-index." in parsed.path:
+                return None
+            # Fetch raw EFFECT XML instead of the XSL presentation wrapper.
+            return re.sub(r"/xsl[^/]+/", "/", joined, flags=re.I)
+
+        typed: list[tuple[int, str]] = []
+        for row in parser.rows:
+            if len(row) < 4 or not row[0]["text"].isdigit():
                 continue
-            if "-index." in lower or "xsl" in lower or "ixviewer" in lower:
+            filing_type = row[3]["text"].strip().upper()
+            if form_type and filing_type != form_type.strip().upper():
                 continue
-            candidates.append(urljoin(index_url, href))
-        return candidates[0] if candidates else index_url
+            if filing_type.startswith("EX-") or filing_type in {"GRAPHIC", "XML", "ZIP"}:
+                continue
+            for href in row[2]["links"]:
+                document = safe_document(href)
+                if document:
+                    typed.append((int(row[0]["text"]), document))
+        if typed:
+            return min(typed)[1]
+        if parser.rows and form_type:
+            return index_url
+        for href in parser.links:
+            document = safe_document(href)
+            if document:
+                return document
+        return index_url
 
     def parse_atom(self, xml_text: str) -> list[dict[str, Any]]:
         root = ET.fromstring(xml_text)
@@ -224,20 +416,26 @@ class SECNormalizer:
         for entry in root.findall("a:entry", ns):
             title = entry.findtext("a:title", default="", namespaces=ns)
             updated = entry.findtext("a:updated", default="", namespaces=ns)
-            link = entry.find("a:link", ns)
+            link = next((link for link in entry.findall("a:link", ns) if link.get("rel", "alternate") == "alternate"), None)
             category = entry.find("a:category", ns)
             form = category.get("term") if category is not None else title.split(" - ", 1)[0]
             href = link.get("href") if link is not None else ""
-            issuer = title.split(" - ", 1)[-1].rsplit(" (", 1)[0] if " - " in title else title
-            cik_match = re.search(r"\((\d{10})\)", title)
-            accession_match = re.search(r"(\d{10}-\d{2}-\d{6})", href)
+            issuer_part = title.split(" - ", 1)[-1] if " - " in title else title
+            issuer_match = re.match(r"^(.*?)\s*\((\d{1,10})\)(?:\s+\([^)]*\))*\s*$", issuer_part)
+            issuer = issuer_match.group(1).strip() if issuer_match else issuer_part.strip()
+            accession_match = re.search(r"(\d{10}-\d{2}-\d{6})", href or entry.findtext("a:id", default="", namespaces=ns))
+            if not href or not accession_match or not updated:
+                raise ValueError("SEC Atom entry missing accession, document URL, or published timestamp")
+            timestamp = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            if timestamp.utcoffset() is None:
+                raise ValueError("SEC Atom timestamp is missing timezone")
             entries.append(
                 {
                     "form_type": form,
                     "issuer_name": issuer,
-                    "cik": cik_match.group(1) if cik_match else None,
-                    "accession": accession_match.group(1) if accession_match else href.rstrip("/").split("/")[-1],
-                    "filed_at": datetime.fromisoformat(updated.replace("Z", "+00:00")) if updated else datetime.now(UTC),
+                    "cik": f"{int(issuer_match.group(2)):010d}" if issuer_match else None,
+                    "accession": accession_match.group(1),
+                    "filed_at": timestamp.astimezone(UTC),
                     "source_url": href,
                 }
             )
@@ -247,33 +445,164 @@ class SECNormalizer:
 class SECCollector:
     CURRENT_URL = "https://www.sec.gov/cgi-bin/browse-edgar"
 
-    def __init__(self, client: ResilientClient):
+    def __init__(self, client: ResilientClient, *, max_pages: int = 3, request_interval: float = 0.15, db=None, archive: EvidenceArchive | None = None, max_document_bytes: int = 10_000_000):
+        if max_pages < 1 or request_interval < 0 or max_document_bytes < 1:
+            raise ValueError("SEC pagination and request interval must be positive")
         self.client = client
         self.normalizer = SECNormalizer()
+        self.max_pages = max_pages
+        self.request_interval = request_interval
+        self.last_feed_truncated = False
+        self.db = db
+        self.archive = archive
+        self.max_document_bytes = max_document_bytes
+        self._request_lock = asyncio.Lock()
+        self._last_request = 0.0
+        self._addresses: dict[str, str | None] = {}
+        if db is not None:
+            with closing(db.connect()) as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS sec_processed_filings(
+                     accession TEXT PRIMARY KEY, processed_at TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS sec_raw_documents(
+                     sha256 TEXT PRIMARY KEY, source_url TEXT NOT NULL, gzip_blob BLOB NOT NULL,
+                     original_bytes INTEGER NOT NULL, archived_at TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS sec_raw_filing_archives(
+                     accession TEXT NOT NULL, document_sha256 TEXT NOT NULL REFERENCES sec_raw_documents(sha256),
+                     index_sha256 TEXT NOT NULL REFERENCES sec_raw_documents(sha256),
+                     document_url TEXT NOT NULL, index_url TEXT NOT NULL, archived_at TEXT NOT NULL,
+                     PRIMARY KEY(accession,document_sha256,index_sha256));
+                """)
+
+    async def _text(self, url: str, **kwargs) -> str:
+        await self._throttle()
+        text = await self.client.request_text("GET", url, **kwargs)
+        if len(text.encode("utf-8")) > self.max_document_bytes:
+            raise ValueError("SEC source document exceeds the configured byte limit")
+        return text
+
+    def _archive_documents(self, *, accession: str, index_url: str, index_html: str, document_url: str, document: str) -> str | None:
+        """Raw evidence travels with the SQLite checkpoint on hosted runners."""
+        timestamp = datetime.now(UTC)
+        reference = None
+        if self.db is not None:
+            documents = []
+            for source_url, raw in ((document_url, document), (index_url, index_html)):
+                content = raw.encode("utf-8")
+                if len(content) > self.max_document_bytes:
+                    raise ValueError("SEC source document exceeds the configured byte limit")
+                digest = hashlib.sha256(content).hexdigest()
+                documents.append((digest, source_url, gzip.compress(content, compresslevel=6, mtime=0), len(content), timestamp.isoformat()))
+            document_digest, index_digest = documents[0][0], documents[1][0]
+            with self.db.transaction() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO sec_raw_documents(sha256,source_url,gzip_blob,original_bytes,archived_at) VALUES(?,?,?,?,?)",
+                    documents,
+                )
+                conn.execute(
+                    """INSERT OR IGNORE INTO sec_raw_filing_archives
+                       (accession,document_sha256,index_sha256,document_url,index_url,archived_at) VALUES(?,?,?,?,?,?)""",
+                    (accession, document_digest, index_digest, document_url, index_url, timestamp.isoformat()),
+                )
+            reference = f"sqlite:sec_raw_documents/{document_digest}"
+        if self.archive is not None:
+            archive_path = self.archive.write(
+                "sec-raw", accession,
+                {"index_url": index_url, "document_url": document_url, "index_html": index_html, "document": document},
+                observed_at=timestamp,
+            )
+            if reference is None:
+                reference = str(archive_path)
+        return reference
+
+    async def _throttle(self) -> None:
+        async with self._request_lock:
+            delay = self.request_interval - (monotonic() - self._last_request)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_request = monotonic()
+
+    def is_processed(self, accession: str) -> bool:
+        if self.db is None:
+            return False
+        with closing(self.db.connect()) as conn:
+            return conn.execute("SELECT 1 FROM sec_processed_filings WHERE accession=?", (accession,)).fetchone() is not None
+
+    def mark_processed(self, accession: str, *, observed_at: datetime) -> None:
+        if self.db is None:
+            return
+        with closing(self.db.connect()) as conn:
+            conn.execute("INSERT OR IGNORE INTO sec_processed_filings(accession,processed_at) VALUES(?,?)", (accession, observed_at.isoformat()))
 
     async def current_entries(self, form_type: str, *, count: int = 100) -> list[dict[str, Any]]:
-        xml = await self.client.request_text(
-            "GET",
-            self.CURRENT_URL,
-            params={"action": "getcurrent", "type": form_type, "count": count, "output": "atom"},
-        )
-        return self.normalizer.parse_atom(xml)
+        if count < 1 or count > 100:
+            raise ValueError("SEC Atom page size must be between 1 and 100")
+        self.last_feed_truncated = False
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for page in range(self.max_pages):
+            xml = await self._text(
+                self.CURRENT_URL,
+                params={"action": "getcurrent", "type": form_type, "count": count, "start": page * count, "output": "atom", "owner": "exclude"},
+            )
+            parsed = self.normalizer.parse_atom(xml)
+            new = [entry for entry in parsed if entry["accession"] not in seen]
+            matching = [entry for entry in parsed if entry["form_type"].strip().upper() == form_type.strip().upper()]
+            for entry in new:
+                seen.add(entry["accession"])
+                if entry["form_type"].strip().upper() == form_type.strip().upper():
+                    entries.append(entry)
+            if matching and all(self.is_processed(entry["accession"]) for entry in matching):
+                break
+            if len(parsed) < count:
+                break
+            if not new:
+                # The upstream may ignore the requested pagination offset.
+                self.last_feed_truncated = any(not self.is_processed(entry["accession"]) for entry in matching)
+                break
+            if page == self.max_pages - 1:
+                self.last_feed_truncated = any(not self.is_processed(entry["accession"]) for entry in matching)
+        return entries
 
     async def issuer_address(self, cik: str | None) -> str | None:
         if not cik:
             return None
+        if cik in self._addresses:
+            return self._addresses[cik]
+        await self._throttle()
         data = await self.client.request_json("GET", f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json")
         business = ((data or {}).get("addresses") or {}).get("business") or {}
         parts = [business.get("street1"), business.get("street2"), business.get("city"), business.get("stateOrCountry"), business.get("zipCode")]
-        return ", ".join(str(part).strip() for part in parts if part) or None
+        address = ", ".join(str(part).strip() for part in parts if part) or None
+        self._addresses[cik] = address
+        return address
 
     async def classify_entry(self, entry: dict[str, Any]) -> ListingSignal | None:
-        index_html = await self.client.request_text("GET", entry["source_url"])
-        document_url = self.normalizer.primary_document_url(entry["source_url"], index_html)
-        text = index_html if document_url == entry["source_url"] else await self.client.request_text("GET", document_url)
-        enriched = dict(entry)
+        _event, signal = await self.collect_entry(entry)
+        return signal
+
+    async def collect_entry(self, entry: dict[str, Any]) -> tuple[IPOEvidence | None, ListingSignal | None]:
+        parsed_url = urlparse(entry["source_url"])
+        if (parsed_url.scheme != "https" or parsed_url.hostname not in {"sec.gov", "www.sec.gov"}
+                or not parsed_url.path.startswith("/Archives/edgar/data/") or parsed_url.username is not None):
+            raise ValueError("SEC entry does not reference an official EDGAR archive document")
+        index_html = await self._text(entry["source_url"])
+        document_url = self.normalizer.primary_document_url(entry["source_url"], index_html, entry["form_type"])
+        if document_url == entry["source_url"] and "-index." in document_url:
+            raise ValueError("No primary filing document found in SEC filing index")
+        text = index_html if document_url == entry["source_url"] else await self._text(document_url)
+        enriched = {key: entry[key] for key in ("form_type", "accession", "issuer_name", "cik", "filed_at")}
         enriched["source_url"] = document_url
+        enriched["registration_id"] = entry.get("registration_id") or self.normalizer.registration_number(text) or self.normalizer.registration_number(index_html)
+        event = self.normalizer.tracking_document(text=text, **enriched)
         signal = self.normalizer.classify_document(text=text, **enriched)
+        if event is not None or signal is not None:
+            reference = self._archive_documents(
+                accession=entry["accession"], index_url=entry["source_url"], index_html=index_html,
+                document_url=document_url, document=text,
+            )
+            if event is not None and reference is not None:
+                event = event.model_copy(update={"raw_archive_path": reference})
         if signal is not None and signal.issuer_address is None:
             try:
                 address = await self.issuer_address(signal.cik)
@@ -281,4 +610,4 @@ class SECCollector:
                 address = None
             if address:
                 signal = signal.model_copy(update={"issuer_address": address})
-        return signal
+        return event, signal

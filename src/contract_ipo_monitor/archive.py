@@ -23,8 +23,12 @@ class EvidenceArchive:
     def write(self, source: str, external_id: str, payload: Any, *, observed_at: datetime) -> Path:
         content = _canonical({"source": source, "external_id": external_id, "payload": payload})
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        safe_source = re.sub(r"[^a-zA-Z0-9_.-]", "_", source)
+        safe_source = re.sub(r"[^a-zA-Z0-9_.-]", "_", source).strip(".")
+        if not safe_source:
+            raise ValueError("source must have a nonempty archive name")
         directory = self.root / safe_source / f"{observed_at:%Y}" / f"{observed_at:%m}" / f"{observed_at:%d}"
+        if not directory.resolve().is_relative_to(self.root.resolve()):
+            raise ValueError("archive directory escapes its configured root")
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{digest}.json"
         if path.exists():

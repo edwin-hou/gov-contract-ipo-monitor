@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Lock
 from typing import Any
 
@@ -12,10 +12,12 @@ from .observability import collector_states, dashboard_html, recent_alerts, rece
 
 
 class HealthRegistry:
-    def __init__(self):
+    def __init__(self, *, max_age_seconds: int = 7200, collector_max_ages: dict[str, int] | None = None):
         self._lock = Lock()
         self._database_ready = False
         self._collectors: dict[str, dict[str, Any]] = {}
+        self.max_age_seconds = max_age_seconds
+        self.collector_max_ages = collector_max_ages or {}
 
     def set_database_ready(self, ready: bool) -> None:
         with self._lock:
@@ -42,17 +44,24 @@ class HealthRegistry:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             required = ("sec", "usaspending")
-            ready = self._database_ready and all(self._collectors.get(name, {}).get("ok") for name in required)
+            collectors = {name: dict(state) for name, state in self._collectors.items()}
+            now = datetime.now(UTC)
+            for name, state in collectors.items():
+                stamp = state.get("last_success_at")
+                if state.get("ok") and stamp and now - datetime.fromisoformat(stamp) > timedelta(seconds=self.collector_max_ages.get(name, self.max_age_seconds)):
+                    state["ok"] = False
+                    state["error"] = "Last successful collection is stale."
+            ready = self._database_ready and all(collectors.get(name, {}).get("ok") for name in required)
             return {
                 "live": True,
                 "ready": ready,
                 "database_ready": self._database_ready,
-                "collectors": dict(self._collectors),
+                "collectors": collectors,
             }
 
 
 def create_health_app(registry: HealthRegistry, db: Database | None = None) -> FastAPI:
-    app = FastAPI(title="Government Contract IPO Monitor", docs_url=None, redoc_url=None)
+    app = FastAPI(title="IPO and Sentiment Monitor", docs_url=None, redoc_url=None)
 
     @app.get("/healthz")
     def healthz():
@@ -64,6 +73,20 @@ def create_health_app(registry: HealthRegistry, db: Database | None = None) -> F
         return JSONResponse(payload, status_code=200 if payload["ready"] else 503)
 
     if db is not None:
+        @app.get("/api/ipos")
+        def ipos(limit: int = Query(100, ge=1, le=500)):
+            from .tracking import IPOTracker
+            tracker = IPOTracker(db)
+            tracker.initialize()
+            return {"summary": tracker.summary(), "ipos": tracker.candidates(limit=limit)}
+
+        @app.get("/api/research")
+        def research():
+            from .research import ResearchStore
+            store = ResearchStore(db)
+            store.initialize()
+            return store.latest_run() or {"status": "not_run", "sentiment": []}
+
         @app.get("/api/candidates")
         def candidates(limit: int = Query(50, ge=1, le=500)):
             return {"candidates": recent_candidates(db, limit=limit)}
