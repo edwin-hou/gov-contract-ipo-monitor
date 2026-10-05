@@ -7,7 +7,7 @@ The original contract-qualified email route is retained as an optional feature. 
 ## What it tracks
 
 - **SEC IPO evidence:** S-1/F-1/S-11 registrations and amendments, relevant Reg A and transaction filings, EFFECT notices, final prospectuses, and withdrawals. A registration alone is not an IPO. Resale registrations and historical IPO references are rejected. Lifecycle changes are scoped to CIK plus SEC registration file number; effectiveness/prospectus filing never means trading has begun.
-- **Online discourse:** company IPO news RSS summaries, public Reddit search posts, configured YouTube videos, and optional API-based YouTube discovery. Accessible English caption text is analyzed when available. Video title/description alone is excluded from sentiment.
+- **Online discourse:** company IPO news RSS summaries, public Hacker News stories and comments, public Reddit search posts, configured YouTube videos, and optional API-based YouTube discovery. Accessible English caption text is analyzed when available. Video title/description alone is excluded from sentiment.
 - **Government contracts:** USAspending awards and optional SAM.gov reconciliation. Unsupported procurement sources and missing keys are disclosed, not presented as nationwide coverage.
 - **Sentiment and bias:** an auditable English lexicon, negation handling, content deduplication, equal weighting by origin and then platform, and flags for sponsorship, financial interests, hype, speculation, sparse evidence, and selection bias. Engagement counts do not increase credibility. Insufficient evidence is `unknown`.
 
@@ -16,6 +16,8 @@ Default research watchlist: Anduril, SpaceX, OpenAI, Anthropic, Databricks, and 
 Discovered issuers retain their legal names. Conservative aliases remove trailing legal suffixes from names with multiple words, so articles about “TRex Bio” can match “TRex Bio, Inc.” without matching unrelated substrings.
 
 The supplied Anduril video, https://youtu.be/0BE2AAOlYWI, is a default seed. If captions cannot be retrieved, the report explicitly states that its spoken content was not analyzed. Optional `YOUTUBE_API_KEY` enables bounded discovery; official captions downloads for arbitrary third-party videos cannot be assumed available.
+
+Hacker News collection uses the public Algolia API without an account or key, samples one recent page per watched company, and retains comment text, timestamps, and author-account origins. Set `HACKER_NEWS_ENABLED=false` to disable it. Search selection, community selection, quoted opinions, and unverified authors remain explicit limitations.
 
 ## Run locally
 
@@ -66,9 +68,11 @@ Configure repository **Variables** for `SEC_USER_AGENT`, `WATCH_COMPANIES`, `YOU
 
 SEC discovery currently samples bounded current-feed pages, with durable processed-accession receipts and explicit truncation errors. It covers U.S. public filings, not confidential submissions or every international exchange. A page-limit gap is not proof there are no other IPOs.
 
+`SEC_MAX_DOCUMENT_BYTES` applies the same limit to SEC response streaming, decompression, and filing text. It defaults to 20 MiB (20971520 bytes), may be configured up to 50 MiB, and reports larger filings as collection gaps. Other sources retain their own limits.
+
 Relevant SEC receipts require valid archived filing and index documents inside the checkpoint. Missing or damaged archives are fetched again while retaining prior evidence versions. Explicit truncation errors from older saved runs migrate to unresolved historical coverage flags; a successful current poll does not erase them.
 
-News feeds are publisher summaries, Reddit communities are self-selected, and YouTube creators may have sponsorships or financial incentives. Blocked requests, missing English captions, source limits, stale items, and missing API keys are reported. This sample cannot represent all internet sentiment or validate an investment claim.
+News feeds are publisher summaries, Hacker News and Reddit communities are self-selected, and YouTube creators may have sponsorships or financial incentives. Author accounts do not establish independent people. Blocked requests, missing English captions, source limits, stale items, and missing API keys are reported. This sample cannot represent all internet sentiment or validate an investment claim.
 
 USAspending is periodically refreshed with overlap and pagination protection; its award search does not expose every cancellation or older modification. SAM reconciliation requires a key. State/local coverage remains incomplete; see `docs/state-local/README.md`.
 

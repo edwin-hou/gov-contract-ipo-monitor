@@ -27,6 +27,7 @@ def evidence(index=1, *, text="Anduril has promising technology and strong comme
 
 
 def collector(handler, **kwargs):
+    kwargs.setdefault("hacker_news_enabled", False)
     config = DiscourseConfig(company_news_enabled=False, reddit_enabled=False, **kwargs)
     return DiscourseCollector(config, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
 
@@ -81,7 +82,7 @@ def test_video_urls_require_exact_host_and_valid_id():
 
 @pytest.mark.asyncio
 async def test_private_dns_source_host_is_blocked_before_network(monkeypatch):
-    source = DiscourseCollector(DiscourseConfig(company_news_enabled=False, reddit_enabled=False))
+    source = DiscourseCollector(DiscourseConfig(company_news_enabled=False, reddit_enabled=False, hacker_news_enabled=False))
     async def private_address(*args, **kwargs):
         return [(2, 1, 6, "", ("127.0.0.1", 443))]
     monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", private_address)
@@ -143,7 +144,7 @@ async def test_overall_timeout_preserves_finished_news_and_marks_interrupted_red
             return httpx.Response(200, text=rss)
         entered.set()
         await asyncio.Event().wait()
-    source = DiscourseCollector(DiscourseConfig(company_news_enabled=False,
+    source = DiscourseCollector(DiscourseConfig(company_news_enabled=False, hacker_news_enabled=False,
         feed_urls=("https://feed.example/rss",)), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     task = asyncio.create_task(source.collect([COMPANIES[0]]))
     try:
@@ -222,7 +223,7 @@ async def test_failures_size_limit_redirects_and_xml_entities_report_coverage():
 
 @pytest.mark.asyncio
 async def test_reddit_blocks_are_explicit_without_bypass_or_error_body():
-    source = DiscourseCollector(DiscourseConfig(company_news_enabled=False), httpx.AsyncClient(
+    source = DiscourseCollector(DiscourseConfig(company_news_enabled=False, hacker_news_enabled=False), httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(403, text="secret error body"))))
     try:
         batch = await source.collect([COMPANIES[0]])
@@ -239,7 +240,7 @@ async def test_reddit_public_posts_ignore_deleted_content_and_engagement():
         {"data": {"permalink": "/r/stocks/comments/123/anduril", "subreddit": "stocks", "title": "Anduril IPO", "selftext": "Anduril is a promising company with strong potential but its valuation is risky.", "score": 90000, "created_utc": NOW.timestamp()}},
         {"data": {"permalink": "/r/stocks/comments/124/removed", "title": "Anduril", "selftext": "[deleted]"}},
     ]}}
-    source = DiscourseCollector(DiscourseConfig(company_news_enabled=False), httpx.AsyncClient(
+    source = DiscourseCollector(DiscourseConfig(company_news_enabled=False, hacker_news_enabled=False), httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))))
     try:
         batch = await source.collect([COMPANIES[0]])
@@ -317,7 +318,7 @@ async def test_company_news_and_api_discovery_are_bounded_and_keys_not_archived(
         if request.url.host == "news.google.com":
             return httpx.Response(200, text='<rss><channel/></rss>')
         return httpx.Response(403, text="private-api-key")
-    source = DiscourseCollector(DiscourseConfig(reddit_enabled=False, youtube_api_key="private-api-key"),
+    source = DiscourseCollector(DiscourseConfig(reddit_enabled=False, hacker_news_enabled=False, youtube_api_key="private-api-key"),
         httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     try:
         batch = await source.collect([COMPANIES[0]])
@@ -339,7 +340,7 @@ async def test_company_alias_queries_collect_brand_article_as_canonical_issuer()
         if request.url.host == "www.reddit.com":
             return httpx.Response(200, json={"data": {"children": []}})
         return httpx.Response(200, json={"items": []})
-    source = DiscourseCollector(DiscourseConfig(youtube_api_key="key"),
+    source = DiscourseCollector(DiscourseConfig(youtube_api_key="key", hacker_news_enabled=False),
         httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     try:
         batch = await source.collect([CompanyWatch(legal)])
@@ -430,3 +431,125 @@ def test_multiple_companies_unsupported_language_and_bias_are_explicit():
 def test_balanced_document_can_measure_neutral_tone():
     tone = score_evidence(evidence(text="Anduril is promising but risky, and the offering deserves careful evaluation by readers."), "Anduril")
     assert tone.label == "neutral" and tone.score == 0
+
+
+def hn_comment(identifier="123", *, author="reader1", company="Anduril", **kwargs):
+    return {"objectID": identifier, "_tags": ["comment"], "story_title": company + " IPO analysis",
+            "comment_text": company + " has promising research and strong technology for future commercial opportunities.",
+            "author": author, "created_at": NOW.isoformat(), "created_at_i": int(NOW.timestamp()),
+            "points": 9999, **kwargs}
+
+
+def test_hackernews_parser_safe_canonical_comments_and_author_origins():
+    source = collector(lambda request: httpx.Response(500))
+    watch = CompanyWatch("Lycia Therapeutics, Inc.")
+    row = hn_comment(company="Lycia Therapeutics", comment_text='<p>Lycia Therapeutics is promising &amp; strong.</p><script>execute()</script>')
+    records = source._parse_hackernews({"hits": [row]}, [watch], NOW)
+    assert len(records) == 1
+    assert records[0].company_names == (watch.name,)
+    assert records[0].source_kind == "hackernews" and records[0].text_kind == "public_comment"
+    assert records[0].source_url == "https://news.ycombinator.com/item?id=123"
+    assert records[0].origin_key == "hackernews:reader1"
+    assert records[0].author == "reader1" and records[0].published_at == NOW
+    assert records[0].text == "Lycia Therapeutics is promising & strong."
+    assert "community_selection" in records[0].bias_flags
+    assert "points" not in asdict(records[0])
+
+
+def test_hackernews_parser_bounds_and_rejects_invalid_deleted_unrelated_items():
+    source = collector(lambda request: httpx.Response(500), max_items_per_source=7)
+    payload = {"hits": [
+        hn_comment(identifier="-1"), hn_comment(identifier="123&url=evil"),
+        hn_comment(identifier="2", comment_text="[deleted]"),
+        hn_comment(identifier="3", dead=True),
+        hn_comment(identifier="4", company="Andurilish"),
+        hn_comment(identifier="5", _tags=[{}]),
+        hn_comment(identifier="6"), hn_comment(identifier="7"),
+    ]}
+    assert [item.source_url for item in source._parse_hackernews(payload, [COMPANIES[0]], NOW)] == ["https://news.ycombinator.com/item?id=6"]
+    with pytest.raises(ValueError, match="Algolia"):
+        source._parse_hackernews({"hits": "bad"}, COMPANIES, NOW)
+
+
+@pytest.mark.asyncio
+async def test_hackernews_query_is_date_bounded_one_page_and_restores_timestamp():
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"hits": [hn_comment("1", created_at=None), hn_comment("2")], "nbHits": 200})
+    source = collector(handler, hacker_news_enabled=True, max_items_per_source=1)
+    try:
+        batch = await source.collect([COMPANIES[0]])
+        assert len(requests) == 1
+        params = requests[0].url.params
+        assert params["query"] == "Anduril" and params["page"] == "0"
+        assert params["tags"] == "(story,comment)" and params["hitsPerPage"] == "1"
+        assert params["numericFilters"].startswith("created_at_i>")
+        assert len(batch.records) == 1 and batch.records[0].published_at == NOW
+        receipt = next(item for item in batch.coverage if item.source == "hackernews")
+        assert receipt.status == "ok" and "200 reported matches" in receipt.limitations[0]
+    finally:
+        await source.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_hackernews_partial_failure_keeps_other_company_comments():
+    def handler(request):
+        if request.url.params["query"] == "Anduril":
+            return httpx.Response(429, text="private error details")
+        return httpx.Response(200, json={"hits": [hn_comment(company="OpenAI")], "nbHits": 1})
+    source = collector(handler, hacker_news_enabled=True)
+    try:
+        batch = await source.collect([COMPANIES[0], CompanyWatch("OpenAI")])
+        assert batch.records[0].company_names == ("OpenAI",)
+        receipts = [item for item in batch.coverage if item.source == "hackernews"]
+        assert [item.status for item in receipts] == ["error", "ok"]
+        assert receipts[0].error == "HTTP 429"
+        assert source.partial_batch == batch
+    finally:
+        await source.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_hackernews_interruption_keeps_completed_feed():
+    entered = asyncio.Event()
+    async def handler(request):
+        if request.url.host == "feed.example":
+            return httpx.Response(200, text='<rss><channel><item><title>Anduril IPO</title><link>https://example.com/a</link></item></channel></rss>')
+        entered.set()
+        await asyncio.Event().wait()
+    source = collector(handler, hacker_news_enabled=True, feed_urls=("https://feed.example/rss",))
+    task = asyncio.create_task(source.collect([COMPANIES[0]]))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(task, timeout=0.01)
+        assert len(source.partial_batch.records) == 1
+        assert source.partial_batch.coverage[-1].source == "hackernews"
+        assert "Overall collection interrupted" in source.partial_batch.coverage[-1].error
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await source.client.aclose()
+
+
+def test_hackernews_sentiment_balances_author_accounts_and_platforms():
+    records = [evidence(index, kind="hackernews", origin="hackernews:prolific", text=f"Anduril has promising strong innovative excellent successful commercial opportunities number {index}.") for index in range(1, 10)]
+    records += [evidence(10, kind="hackernews", origin="hackernews:another", text="Anduril is risky weak overvalued dangerous controversial and overhyped for the future."),
+                evidence(11, origin="news:publisher", text="Anduril is risky weak overvalued dangerous controversial and overhyped after this announcement.")]
+    summary = summarize_sentiment("Anduril", records, now=NOW)
+    hackernews = next(item for item in summary.by_source if item.source_kind == "hackernews")
+    assert hackernews.independent_origins == 2 and abs(hackernews.score) < 0.01
+    assert summary.label == "negative"
+    assert "origin_weight_capped" in summary.bias_flags
+
+
+def test_hackernews_setting_defaults_enabled_and_respects_boolean_environment(monkeypatch):
+    from contract_ipo_monitor.config import Settings
+    monkeypatch.delenv("HACKER_NEWS_ENABLED", raising=False)
+    assert Settings.from_env(None).hacker_news_enabled is True
+    monkeypatch.setenv("HACKER_NEWS_ENABLED", "false")
+    assert Settings.from_env(None).hacker_news_enabled is False
+    monkeypatch.setenv("HACKER_NEWS_ENABLED", "invalid")
+    with pytest.raises(ValueError, match="HACKER_NEWS_ENABLED"):
+        Settings.from_env(None)

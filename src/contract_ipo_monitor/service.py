@@ -171,6 +171,7 @@ class MonitorService:
         sec_client = ResilientClient(
             headers={"User-Agent": settings.sec_user_agent, "Accept-Encoding": "gzip, deflate"},
             max_attempts=3,
+            max_response_bytes=settings.sec_max_document_bytes,
         )
         usa_client = ResilientClient(
             headers={"User-Agent": settings.sec_user_agent or "gov-contract-ipo-monitor"},
@@ -179,7 +180,7 @@ class MonitorService:
         clients: list[ResilientClient] = [sec_client, usa_client]
         recipient_resolver = USAspendingRecipientResolver(usa_client)
         sec_source = SECSource(
-            SECCollector(sec_client, max_pages=settings.sec_max_pages, db=db),
+            SECCollector(sec_client, max_pages=settings.sec_max_pages, db=db, max_document_bytes=settings.sec_max_document_bytes),
             settings.enabled_sec_forms,
             recipient_resolver=recipient_resolver,
         )
@@ -214,6 +215,7 @@ class MonitorService:
         discourse = DiscourseCollector(DiscourseConfig(
             feed_urls=settings.news_feed_urls, video_urls=settings.youtube_video_urls,
             reddit_enabled=settings.reddit_enabled, youtube_api_key=settings.youtube_api_key,
+            hacker_news_enabled=settings.hacker_news_enabled,
             user_agent=settings.sec_user_agent,
         )) if settings.discourse_enabled else None
         return cls(
@@ -462,10 +464,24 @@ class MonitorService:
         health = self.health.snapshot()
         coverage = self.research.coverage()
         with self.db.connect() as conn:
-            historic_gaps = [dict(row) for row in conn.execute("SELECT name,last_error,updated_at FROM collector_state WHERE name LIKE 'sec_feed_gap:%'")]
+            historic_gaps = [dict(row) for row in conn.execute("SELECT name,last_error,updated_at FROM collector_state WHERE name LIKE 'sec_feed_gap:%' ORDER BY name")]
+            # Count persisted identities independently of content versions and
+            # current-batch rechecks. One statement gives a consistent snapshot.
+            history = dict(conn.execute("""
+                SELECT
+                  (SELECT COUNT(*) FROM (
+                    SELECT 1 FROM contract_evidence
+                    GROUP BY json_extract(version_json, '$.source'), json_extract(version_json, '$.source_record_id')
+                  )) AS contract_records,
+                  (SELECT COUNT(*) FROM contract_evidence) AS contract_versions,
+                  (SELECT COUNT(*) FROM (SELECT 1 FROM ipo_evidence GROUP BY source,event_id)) AS ipo_filings,
+                  (SELECT COUNT(*) FROM ipo_evidence) AS ipo_versions,
+                  (SELECT COUNT(DISTINCT evidence_id) FROM discourse_evidence) AS commentary_items,
+                  (SELECT COUNT(*) FROM discourse_evidence) AS commentary_versions
+            """).fetchone())
         return serializable({
             "completed_at": self.now(), "status": "ok" if health["ready"] and not historic_gaps and all(item.get("ok") for item in health["collectors"].values()) else "degraded",
-            "counts": counts or {}, "health": health, "ipo_summary": self.tracker.summary(),
+            "counts": counts or {}, "history": history, "health": health, "ipo_summary": self.tracker.summary(),
             "ipos": self.tracker.candidates(limit=100), "sentiment": sentiment, "coverage": coverage,
             "watchlist": [company.name for company in self.companies()],
             "historic_coverage_gaps": historic_gaps,
@@ -474,7 +490,7 @@ class MonitorService:
                 "SEC coverage is U.S. public filings in bounded current-feed pages; confidential and international filings are not covered.",
                 "Watchlist companies are research targets; inclusion does not establish an announced or planned IPO.",
                 "Government contracts are supplementary evidence and are not required to track an IPO.",
-                "Sentiment is an English lexicon estimate of an accessible sample, balanced by publisher/Reddit community/YouTube channel and platform, with duplication controls; it is not internet-wide opinion.",
+                "Sentiment is an English lexicon estimate of an accessible sample, balanced by publisher, Hacker News account, Reddit community, YouTube channel, and platform, with duplication controls; it is not internet-wide opinion.",
                 "Unavailable captions mean the video's spoken content has not been analyzed; metadata is excluded from sentiment.",
                 "SAM.gov and market enrichment require optional API keys. State/local contract coverage remains incomplete.",
                 "SMTP is disabled by default; reports and GitHub Actions receipts remain available without email credentials.",

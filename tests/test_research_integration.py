@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from contract_ipo_monitor.config import Settings
 from contract_ipo_monitor.db import Database
 from contract_ipo_monitor.health import HealthRegistry, create_health_app
-from contract_ipo_monitor.research import ResearchStore, checkpoint_database, write_report
+from contract_ipo_monitor.research import ResearchStore, checkpoint_database, report_markdown, write_report
 from contract_ipo_monitor.service import MonitorService, SAMSource
 from contract_ipo_monitor.sources.discourse import DiscourseBatch, DiscourseEvidence, SourceCoverage
 from contract_ipo_monitor.tracking import IPOEvidence
@@ -75,6 +75,31 @@ def test_smtp_is_opt_in_and_bad_intervals_fail_configuration():
     assert any("SEC_INTERVAL_SECONDS" in error for error in settings.model_copy(update={"sec_interval_seconds": 0}).runtime_errors())
 
 
+def test_sec_document_limit_default_environment_and_bounds(monkeypatch):
+    default = Settings(sec_user_agent="IPO person@example.org")
+    assert default.sec_max_document_bytes == 20 * 1024 * 1024
+    for limit in (0, -1, 50 * 1024 * 1024 + 1):
+        assert any("SEC_MAX_DOCUMENT_BYTES" in error for error in default.model_copy(update={"sec_max_document_bytes": limit}).runtime_errors())
+    assert not any("SEC_MAX_DOCUMENT_BYTES" in error for error in default.model_copy(update={"sec_max_document_bytes": 50 * 1024 * 1024}).runtime_errors())
+    monkeypatch.setenv("SEC_MAX_DOCUMENT_BYTES", str(25 * 1024 * 1024))
+    configured = Settings.from_env(env_file=None)
+    assert configured.sec_max_document_bytes == 25 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", (20 * 1024 * 1024, 25 * 1024 * 1024))
+async def test_default_service_passes_same_sec_document_limit_to_http_and_collector(tmp_path, limit):
+    settings = Settings(database_path=tmp_path / "monitor.db", evidence_archive_path=tmp_path / "archive",
+                        sec_user_agent="IPO person@example.org", discourse_enabled=False, sec_max_document_bytes=limit)
+    monitor = MonitorService.build_default(settings)
+    try:
+        assert monitor.sec_source.collector.max_document_bytes == limit
+        assert monitor.sec_source.collector.client.max_response_bytes == limit
+        assert monitor.usaspending_source.client.max_response_bytes == 20 * 1024 * 1024
+    finally:
+        await monitor.aclose()
+
+
 def legacy_receipts(tmp_path, reports):
     db = database(tmp_path)
     store = ResearchStore(db)
@@ -107,6 +132,9 @@ def test_legacy_sec_truncation_remains_degraded_after_healthy_poll(tmp_path):
     assert report["health"]["ready"] is True
     assert report["status"] == "degraded"
     assert len(report["historic_coverage_gaps"]) == 2
+    readable = report_markdown(report)
+    assert f"| 8-K | {NOW.isoformat()} | {error} |" in readable
+    assert f"| EFFECT | {NOW.isoformat()} | {error} |" in readable
 
 
 def test_legacy_sec_cap_without_explicit_form_uses_unresolved_legacy_scope(tmp_path):
@@ -155,6 +183,41 @@ def service(tmp_path, sec=None, discourse=None):
     return MonitorService(settings=settings, db=database(tmp_path), health=HealthRegistry(),
                           sec_source=sec or EmptySource(), usaspending_source=EmptySource(), smtp_worker=None,
                           discourse_source=discourse, now=lambda: NOW)
+
+
+def test_report_history_counts_persisted_identities_separately_from_versions_and_rechecks(tmp_path):
+    from test_processor_service import contract
+
+    monitor = service(tmp_path)
+    original = contract()
+    monitor.processor.ingest_contract(original)
+    monitor.processor.ingest_contract(original)
+    monitor.processor.ingest_contract(original.model_copy(update={"raw_payload_hash": "changed-contract", "obligated_amount": 11_000_000}))
+    # The same external ID in a different source is a separate saved record.
+    monitor.processor.ingest_contract(original.model_copy(update={"source": "sam", "raw_payload_hash": "sam-contract"}))
+
+    filing = IPOEvidence(event_id="0000000001-26-000001", issuer_name="Anduril", cik="1", source="sec",
+        source_kind="regulatory", source_url="https://www.sec.gov/Archives/edgar/data/1/ipo.htm", filed_at=NOW,
+        event_type="registration", form_type="S-1", is_ipo=True, offering_kind="ipo")
+    assert monitor.tracker.record(filing, observed_at=NOW)
+    assert not monitor.tracker.record(filing, observed_at=NOW + timedelta(hours=1))
+    assert monitor.tracker.record(filing.model_copy(update={"raw_archive_path": "sqlite:sec_raw_documents/test"}), observed_at=NOW)
+    assert monitor.tracker.record(filing.model_copy(update={"event_id": "0000000001-26-000002"}), observed_at=NOW)
+
+    item = evidence()
+    assert monitor.research.record_batch(DiscourseBatch((item,), ())) == 1
+    assert monitor.research.record_batch(DiscourseBatch((replace(item, retrieved_at=NOW + timedelta(hours=1)),), ())) == 0
+    assert monitor.research.record_batch(DiscourseBatch((replace(item, text="Anduril is risky"), replace(item, evidence_id="two")), ())) == 2
+    report = monitor.create_report({"contracts": 2})
+    assert report["history"] == {
+        "contract_records": 2, "contract_versions": 3,
+        "ipo_filings": 2, "ipo_versions": 3,
+        "commentary_items": 2, "commentary_versions": 3,
+    }
+    # Rechecking existing awards changes run activity, never saved history.
+    monitor.processor.ingest_contract(original)
+    assert monitor.create_report({"contracts": 1})["history"] == report["history"]
+    assert "New evidence this run" not in report_markdown(report)
 
 
 @pytest.mark.asyncio

@@ -100,16 +100,47 @@ def report_markdown(report: dict[str, Any]) -> str:
              "## Collection", "", "| Source | Status | Details |", "|---|---|---|"]
     for name, state in report.get("health", {}).get("collectors", {}).items():
         lines.append(f"| {clean(name)} | {'ok' if state.get('ok') else 'degraded'} | {clean(state.get('error') or state.get('last_success_at') or '')} |")
-    lines += ["", f"New evidence this run: {clean(report.get('counts', {}))}", "", "## IPO evidence", "", "| Company | Stage | Evidence confidence | Source |", "|---|---|---|---|"]
+    counts = report.get("counts", {})
+    if counts:
+        activity_labels = {
+            "contracts": "Contract records checked", "listing_signals": "Listing signals checked",
+            "ipo_events": "Filing records checked for IPO evidence", "discourse_records": "Commentary versions added",
+            "sam_records": "SAM records checked", "alerts_created": "Alerts created", "emails_sent": "Emails accepted by SMTP",
+        }
+        lines += ["", "## Run activity", "", "Checks may include previously saved records.", "",
+                  "| Activity | Count |", "|---|---|"]
+        for name, count in counts.items():
+            lines.append(f"| {clean(activity_labels.get(name, name))} | {clean(count)} |")
+    history = report.get("history")
+    if history:
+        lines += ["", "## Saved history", "", "| Evidence | Unique records | Saved versions |", "|---|---|---|",
+                  f"| Contract records | {clean(history['contract_records'])} | {clean(history['contract_versions'])} |",
+                  f"| Filings reviewed for IPO evidence | {clean(history['ipo_filings'])} | {clean(history['ipo_versions'])} |",
+                  f"| Commentary items | {clean(history['commentary_items'])} | {clean(history['commentary_versions'])} |",
+                  "", "Saved versions retain changes to the same record."]
+    historic_gaps = report.get("historic_coverage_gaps", [])
+    if historic_gaps:
+        lines += ["", "## Unresolved historical coverage gaps", "",
+                  "A healthy current collection does not resolve these earlier gaps.", "",
+                  "| SEC form | Recorded at | Unresolved error |", "|---|---|---|"]
+        for gap in historic_gaps:
+            form = gap.get("name", "").removeprefix("sec_feed_gap:")
+            if form == "legacy":
+                form = "Unspecified legacy form"
+            lines.append(f"| {clean(form)} | {clean(gap.get('updated_at', ''))} | {clean(gap.get('last_error', ''))} |")
+    lines += ["", "## IPO evidence", "", "| Company | Stage | Evidence confidence | Source |", "|---|---|---|---|"]
     for candidate in report.get("ipos", []):
         url = next(iter(candidate.get("source_urls", [])), "")
         lines.append(f"| {clean(candidate['issuer_name'])} | {clean(candidate['status'])} | {clean(candidate['confidence'])} | {clean(url)} |")
     if not report.get("ipos"):
         lines += ["", "No IPO evidence has been collected yet. Check collection coverage before interpreting an empty result."]
-    lines += ["", "## Sentiment sample", ""]
+    lines += ["", "## Sentiment sample", "", "| Company | Sentiment | Scored items | Origins | Bias and coverage flags |", "|---|---|---|---|---|"]
     for company in report.get("sentiment", []):
-        lines += [f"### {clean(company.get('company_name', company.get('company', 'Company')))}", "", "```json", json.dumps(company, indent=2, ensure_ascii=False), "```", ""]
-    lines += ["## Source coverage", "", "| Source | Status | Items | Limitation or error |", "|---|---|---|---|"]
+        name = company.get("company_name", company.get("company", "Company"))
+        flags = "; ".join(flag.replace("_", " ") for flag in company.get("bias_flags", []))
+        lines.append(f"| {clean(name)} | {clean(company.get('label', 'unknown'))} | {clean(company.get('scored_count', 0))} | {clean(company.get('independent_origins', 0))} | {clean(flags)} |")
+    lines += ["", "Full scores, evidence, and exclusions are saved in [the detailed audit data](latest.json).", "",
+              "## Source coverage", "", "| Source | Status | Items | Limitation or error |", "|---|---|---|---|"]
     for source in report.get("coverage", []):
         detail = source.get("error") or "; ".join(source.get("limitations", []))
         lines.append(f"| {clean(source['source'])} | {clean(source['status'])} | {source.get('collected_count', 0)} | {clean(detail)} |")

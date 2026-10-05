@@ -27,10 +27,12 @@ class Settings(BaseModel):
     youtube_video_urls: tuple[str, ...] = ("https://youtu.be/0BE2AAOlYWI",)
     youtube_api_key: str = ""
     reddit_enabled: bool = True
+    hacker_news_enabled: bool = True
     discourse_interval_seconds: int = 3600
     discourse_max_companies: int = 12
     source_timeout_seconds: int = 600
     sec_max_pages: int = 3
+    sec_max_document_bytes: int = 20 * 1024 * 1024
     sec_interval_seconds: int = 30
     usaspending_interval_seconds: int = 300
     usaspending_initial_lookback_days: int = 7
@@ -78,10 +80,12 @@ class Settings(BaseModel):
             youtube_video_urls=values("YOUTUBE_VIDEO_URLS", "https://youtu.be/0BE2AAOlYWI"),
             youtube_api_key=os.getenv("YOUTUBE_API_KEY", ""),
             reddit_enabled=boolean("REDDIT_ENABLED", True),
+            hacker_news_enabled=boolean("HACKER_NEWS_ENABLED", True),
             discourse_interval_seconds=int(os.getenv("DISCOURSE_INTERVAL_SECONDS", "3600")),
             discourse_max_companies=int(os.getenv("DISCOURSE_MAX_COMPANIES", "12")),
             source_timeout_seconds=int(os.getenv("SOURCE_TIMEOUT_SECONDS", "600")),
             sec_max_pages=int(os.getenv("SEC_MAX_PAGES", "3")),
+            sec_max_document_bytes=int(os.getenv("SEC_MAX_DOCUMENT_BYTES", str(20 * 1024 * 1024))),
             sec_interval_seconds=int(os.getenv("SEC_INTERVAL_SECONDS", "30")),
             usaspending_interval_seconds=int(os.getenv("USASPENDING_INTERVAL_SECONDS", "300")),
             usaspending_initial_lookback_days=int(os.getenv("USASPENDING_INITIAL_LOOKBACK_DAYS", "7")),
@@ -124,6 +128,8 @@ class Settings(BaseModel):
                 errors.append(f"{name.upper()} must be positive.")
         if not 1 <= self.discourse_max_companies <= 50:
             errors.append("DISCOURSE_MAX_COMPANIES must be between 1 and 50.")
+        if not 1 <= self.sec_max_document_bytes <= 50 * 1024 * 1024:
+            errors.append("SEC_MAX_DOCUMENT_BYTES must be positive and cannot exceed 50 MiB (52428800 bytes).")
         if not self.enabled_sec_forms:
             errors.append("SEC_FORMS must contain at least one form.")
         return errors

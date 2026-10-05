@@ -448,7 +448,7 @@ class SECNormalizer:
 class SECCollector:
     CURRENT_URL = "https://www.sec.gov/cgi-bin/browse-edgar"
 
-    def __init__(self, client: ResilientClient, *, max_pages: int = 3, request_interval: float = 0.15, db=None, archive: EvidenceArchive | None = None, max_document_bytes: int = 10_000_000):
+    def __init__(self, client: ResilientClient, *, max_pages: int = 3, request_interval: float = 0.15, db=None, archive: EvidenceArchive | None = None, max_document_bytes: int = 20 * 1024 * 1024):
         if max_pages < 1 or request_interval < 0 or max_document_bytes < 1:
             raise ValueError("SEC pagination and request interval must be positive")
         self.client = client

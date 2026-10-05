@@ -1,7 +1,8 @@
 """Bounded public discourse ingestion. These records never verify an IPO.
 
-Feeds contain publisher summaries, Reddit contains public search posts, and
-YouTube contains metadata plus captions only when a public track is accessible.
+Feeds contain publisher summaries, Reddit contains public search posts,
+Hacker News contains public stories/comments, and YouTube contains metadata
+plus captions only when a public track is accessible.
 No remote HTML or script is executed and no engagement count is a truth score.
 """
 from __future__ import annotations
@@ -65,6 +66,7 @@ class DiscourseConfig:
     video_urls: tuple[str, ...] = ()
     company_news_enabled: bool = True
     reddit_enabled: bool = True
+    hacker_news_enabled: bool = True
     youtube_api_key: str = ""
     youtube_search_per_company: int = 3
     max_youtube_searches_per_run: int = 3
@@ -185,7 +187,7 @@ def _canonical_url(url: str) -> str:
 
 
 def _date(value: str | None) -> datetime | None:
-    if not value:
+    if not isinstance(value, str) or not value:
         return None
     try:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -397,6 +399,31 @@ class DiscourseCollector:
         else:
             coverage.append(SourceCoverage("reddit", "https://www.reddit.com", now, "disabled"))
             self._checkpoint(records, coverage)
+        if self.config.hacker_news_enabled:
+            for company in companies:
+                params = {
+                    "query": company.query_name, "tags": "(story,comment)", "page": 0,
+                    "hitsPerPage": self.config.max_items_per_source,
+                    "numericFilters": f"created_at_i>{int((now - timedelta(days=self.config.lookback_days)).timestamp())}",
+                }
+                url = "https://hn.algolia.com/api/v1/search_by_date?" + urlencode(params)
+                self._active_source = ("hackernews", url, now)
+                try:
+                    payload = json.loads(await self._get(url))
+                    items = self._parse_hackernews(payload, companies, now)
+                    records.extend(items)
+                    available = payload.get("nbHits", "unknown")
+                    coverage.append(SourceCoverage("hackernews", url, now, "ok", len(items), limitations=(
+                        f"One date-sorted page of at most {self.config.max_items_per_source} hits from {available} reported matches in {self.config.lookback_days} days; no further pages fetched",
+                        "Public story/comment sample from one technical community; topic and author self-selection bias",
+                        "Author origins are account labels, not audited independent people; votes and popularity are ignored",)))
+                except Exception as exc:
+                    coverage.append(SourceCoverage("hackernews", url, now, "error", error=_error(exc)))
+                self._checkpoint(records, coverage)
+                self._active_source = None
+        else:
+            coverage.append(SourceCoverage("hackernews", "https://hn.algolia.com", now, "disabled"))
+            self._checkpoint(records, coverage)
         video_seeds = list(self.config.video_urls)
         if self.config.youtube_api_key and self.config.youtube_search_per_company:
             count = min(len(companies), self.config.max_youtube_searches_per_run)
@@ -514,6 +541,53 @@ class DiscourseCollector:
                     results.append(record)
             except (TypeError, ValueError, OverflowError, OSError):
                 continue
+        return results
+
+    def _parse_hackernews(self, content: dict, companies: Sequence[CompanyWatch],
+                          now: datetime) -> list[DiscourseEvidence]:
+        if not isinstance(content, dict) or not isinstance(content.get("hits"), list):
+            raise ValueError("Expected an Algolia Hacker News search response")
+        results: list[DiscourseEvidence] = []
+        for row in content["hits"][:self.config.max_items_per_source]:
+            if not isinstance(row, dict):
+                continue
+            identifier = str(row.get("objectID", ""))
+            if not re.fullmatch(r"[0-9]{1,20}", identifier) or int(identifier) <= 0:
+                continue
+            tags = row.get("_tags", [])
+            if not isinstance(tags, list):
+                continue
+            tags = [tag for tag in tags if isinstance(tag, str)]
+            if not {"comment", "story"}.intersection(tags):
+                continue
+            is_comment = "comment" in tags
+            title = str((row.get("story_title") if is_comment else row.get("title")) or "")
+            text = str((row.get("comment_text") if is_comment else row.get("story_text")) or "")
+            if is_comment and (not plain_text(text) or plain_text(text).casefold() in {"[deleted]", "[removed]"}):
+                continue
+            if row.get("deleted") or row.get("dead"):
+                continue
+            author = row.get("author")
+            if not isinstance(author, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", author):
+                author = None
+            published = _date(row.get("created_at"))
+            if published is None and row.get("created_at_i") is not None:
+                try:
+                    published = datetime.fromtimestamp(float(row["created_at_i"]), UTC)
+                except (TypeError, ValueError, OverflowError, OSError):
+                    pass
+            flags = ("community_selection", "author_self_selection", "topic_search_selection",
+                     "quoted_opinions_possible", "unverified_claims")
+            if not author:
+                flags += ("author_origin_unknown",)
+            if not is_comment and not plain_text(text):
+                flags += ("story_headline_only",)
+            record = self._evidence(kind="hackernews", url="https://news.ycombinator.com/item?id=" + identifier,
+                origin="hackernews:" + (author or "unknown"), title=title, text=text,
+                text_kind="public_comment" if is_comment else "public_story", companies=companies,
+                now=now, published_at=published, author=author, language=None, flags=flags)
+            if record:
+                results.append(record)
         return results
 
     async def _youtube(self, identifier: str, companies: Sequence[CompanyWatch],

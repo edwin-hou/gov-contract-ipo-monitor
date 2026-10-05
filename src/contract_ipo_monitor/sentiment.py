@@ -192,7 +192,7 @@ def summarize_sentiment(company_name: str, evidence: Iterable[DiscourseEvidence]
     limitations = (
         "Observed tone in sampled sources is not representative of public opinion or future IPO performance.",
         "Deterministic English lexicon; sarcasm, quoted opinions, financial jargon and target attribution can be misread.",
-        "Each publisher, Reddit community and YouTube channel gets equal weight within its platform; platforms get equal weight.",
+        "Each publisher, Reddit community, Hacker News author account and YouTube channel gets equal weight within its platform; platforms get equal weight.",
         "Origin labels do not certify ownership independence; syndication with different wording may escape deduplication.",
         "At least three scored documents and two independent origins are required; unavailable evidence is unknown.",
         "Promotional flags identify possible bias, not proven misconduct; sentiment never confirms an IPO or contract.",
