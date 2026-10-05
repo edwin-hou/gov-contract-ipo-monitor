@@ -360,3 +360,103 @@ async def test_sec_byte_limit_precedes_classification_and_archiving(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM sec_raw_documents").fetchone()[0] == 0
     assert not collector.is_processed(entry["accession"])
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_receipt_replays_missing_archive_once_preserving_versions(tmp_path):
+    index = '''<table><tr><td>1</td><td>Registration</td>
+    <td><a href="offering.htm">offering</a></td><td>S-1</td></tr></table>'''
+    document = "Registration No. 333-123. This is our initial public offering of common stock."
+
+    def handler(request):
+        return httpx.Response(200, text=index if request.url.path.endswith("-index.htm") else document)
+
+    db = Database(tmp_path / "monitor.db")
+    db.initialize()
+    tracker = IPOTracker(db)
+    tracker.initialize()
+    client = ResilientClient(transport=httpx.MockTransport(handler))
+    collector = SECCollector(client, db=db, request_interval=0)
+    entry = SECNormalizer().parse_atom(atom(["0000000001-26-123456"]))[0]
+    legacy = collector.normalizer.tracking_document(
+        **{key: entry[key] for key in ("form_type", "accession", "issuer_name", "cik", "filed_at")},
+        source_url="https://www.sec.gov/Archives/edgar/data/42/offering.htm", text=document,
+    )
+    assert legacy.raw_archive_path is None
+    tracker.record(legacy, observed_at=NOW)
+    collector.mark_processed(entry["accession"], observed_at=NOW)
+    assert not collector.is_processed(entry["accession"])
+
+    recovered, _ = await collector.collect_entry(entry)
+    assert tracker.record(recovered, observed_at=NOW)
+    assert recovered.raw_archive_path.startswith("sqlite:sec_raw_documents/")
+    assert collector.is_processed(entry["accession"])
+    # History stays intact; the newest archived version makes later skips safe.
+    assert tracker.summary()["evidence"] == 2
+    assert not tracker.record(recovered, observed_at=NOW)
+    assert collector.is_processed(entry["accession"])
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE sec_raw_documents SET gzip_blob=? WHERE sha256=?", (b"damaged gzip", recovered.raw_payload_hash))
+    assert not collector.is_processed(entry["accession"])
+    # A new verified source fetch repairs corrupted storage under the same digest.
+    again, _ = await collector.collect_entry(entry)
+    assert not tracker.record(again, observed_at=NOW)
+    assert collector.is_processed(entry["accession"])
+    await client.aclose()
+
+
+def test_legacy_filesystem_receipt_requires_explicit_backend_and_actual_document(tmp_path):
+    document = "Registration No. 333-123. This is our initial public offering of common stock."
+    url = "https://www.sec.gov/Archives/edgar/data/42/offering.htm"
+    accession = "0000000001-26-123456"
+    archive = EvidenceArchive(tmp_path / "raw")
+    archived = archive.write(
+        "sec-raw", accession,
+        {"document_url": url, "index_url": url + "-index.htm", "document": document, "index_html": "Index body"},
+        observed_at=NOW,
+    )
+    legacy = SECNormalizer().tracking_document(
+        form_type="S-1", accession=accession, issuer_name="Example Inc", cik="42", filed_at=NOW,
+        source_url=url, text=document,
+    ).model_copy(update={"raw_archive_path": str(archived)})
+    db = Database(tmp_path / "monitor.db")
+    db.initialize()
+    tracker = IPOTracker(db)
+    tracker.initialize()
+    tracker.record(legacy, observed_at=NOW)
+    client = ResilientClient()
+    local = SECCollector(client, db=db, archive=archive)
+    local.mark_processed(accession, observed_at=NOW)
+    assert local.is_processed(accession)
+    # A transient filesystem archive cannot satisfy a hosted SQLite-only receipt.
+    hosted = SECCollector(client, db=db)
+    assert not hosted.is_processed(accession)
+    archived.unlink()
+    assert not local.is_processed(accession)
+
+
+@pytest.mark.asyncio
+async def test_recovered_receipt_checks_companion_index_archive(tmp_path):
+    index = '''<table><tr><td>1</td><td>Registration</td>
+    <td><a href="offering.htm">offering</a></td><td>S-1</td></tr></table>'''
+    document = "This is our initial public offering of common stock."
+
+    def handler(request):
+        return httpx.Response(200, text=index if request.url.path.endswith("-index.htm") else document)
+
+    db = Database(tmp_path / "monitor.db")
+    db.initialize()
+    tracker = IPOTracker(db)
+    tracker.initialize()
+    client = ResilientClient(transport=httpx.MockTransport(handler))
+    collector = SECCollector(client, db=db, request_interval=0)
+    entry = SECNormalizer().parse_atom(atom(["0000000001-26-123456"]))[0]
+    evidence, _ = await collector.collect_entry(entry)
+    tracker.record(evidence, observed_at=NOW)
+    collector.mark_processed(entry["accession"], observed_at=NOW)
+    assert collector.is_processed(entry["accession"])
+    with closing(db.connect()) as conn:
+        manifest = conn.execute("SELECT index_sha256 FROM sec_raw_filing_archives").fetchone()
+        conn.execute("UPDATE sec_raw_documents SET gzip_blob=? WHERE sha256=?", (b"damaged index", manifest["index_sha256"]))
+    assert not collector.is_processed(entry["accession"])
+    await client.aclose()

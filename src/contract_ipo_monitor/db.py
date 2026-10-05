@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -95,6 +96,41 @@ class Database:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS outbox_correction_key ON outbox_messages(correction_key) WHERE correction_key IS NOT NULL")
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)", (datetime.now(UTC).isoformat(),))
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?)", (datetime.now(UTC).isoformat(),))
+            self._migrate_legacy_sec_feed_gaps(conn)
+
+    @staticmethod
+    def _migrate_legacy_sec_feed_gaps(conn: sqlite3.Connection) -> None:
+        """Carry explicit old SEC truncation receipts into unresolved coverage state."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if conn.execute("SELECT 1 FROM schema_migrations WHERE version=3").fetchone():
+                conn.execute("COMMIT")
+                return
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='monitor_runs'").fetchone():
+                rows = conn.execute(
+                    """SELECT id,completed_at,
+                       CASE WHEN json_valid(report_json) THEN json_extract(report_json, '$.health.collectors.sec.error') END AS sec_error
+                       FROM monitor_runs ORDER BY id"""
+                )
+                known_forms = {"S-1", "S-1/A", "F-1", "F-1/A", "1-A", "1-A/A", "8-K", "8-K/A", "6-K", "6-K/A", "RW", "AW", "EFFECT", "424B4"}
+                pattern = re.compile(r"(?:^|[;:]\s+)([A-Z0-9][A-Z0-9/-]*):\s*feed page limit reached;\s*older filings may be missing")
+                for row in rows:
+                    error = row["sec_error"]
+                    if not isinstance(error, str) or "feed page limit reached; older filings may be missing" not in error:
+                        continue
+                    forms = {match.group(1) for match in pattern.finditer(error) if match.group(1) in known_forms}
+                    for form in sorted(forms) if forms else ("legacy",):
+                        conn.execute(
+                            """INSERT OR IGNORE INTO collector_state(name,cursor,last_success_at,last_error,disabled,updated_at)
+                               VALUES(?,?,NULL,?,0,?)""",
+                            (f"sec_feed_gap:{form}", _json({"unresolved": True, "legacy_run_id": row["id"]}), error, row["completed_at"]),
+                        )
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)", (datetime.now(UTC).isoformat(),))
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

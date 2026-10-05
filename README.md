@@ -13,6 +13,8 @@ The original contract-qualified email route is retained as an optional feature. 
 
 Default research watchlist: Anduril, SpaceX, OpenAI, Anthropic, Databricks, and Stripe, plus recent active IPO issuers discovered from filings. Inclusion on the watchlist does not assert an IPO is planned. Configure `WATCH_COMPANIES` to change it.
 
+Discovered issuers retain their legal names. Conservative aliases remove trailing legal suffixes from names with multiple words, so articles about “TRex Bio” can match “TRex Bio, Inc.” without matching unrelated substrings.
+
 The supplied Anduril video, https://youtu.be/0BE2AAOlYWI, is a default seed. If captions cannot be retrieved, the report explicitly states that its spoken content was not analyzed. Optional `YOUTUBE_API_KEY` enables bounded discovery; official captions downloads for arbitrary third-party videos cannot be assumed available.
 
 ## Run locally
@@ -63,6 +65,8 @@ Configure repository **Variables** for `SEC_USER_AGENT`, `WATCH_COMPANIES`, `YOU
 ## Important limits
 
 SEC discovery currently samples bounded current-feed pages, with durable processed-accession receipts and explicit truncation errors. It covers U.S. public filings, not confidential submissions or every international exchange. A page-limit gap is not proof there are no other IPOs.
+
+Relevant SEC receipts require valid archived filing and index documents inside the checkpoint. Missing or damaged archives are fetched again while retaining prior evidence versions. Explicit truncation errors from older saved runs migrate to unresolved historical coverage flags; a successful current poll does not erase them.
 
 News feeds are publisher summaries, Reddit communities are self-selected, and YouTube creators may have sponsorships or financial incentives. Blocked requests, missing English captions, source limits, stale items, and missing API keys are reported. This sample cannot represent all internet sentiment or validate an investment claim.
 

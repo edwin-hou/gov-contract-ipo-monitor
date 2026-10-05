@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import gzip
 import hashlib
+import json
 import re
 import xml.etree.ElementTree as ET
+import zlib
 from contextlib import closing
 from datetime import UTC, date, datetime
 from html.parser import HTMLParser
+from pathlib import Path
 from time import monotonic
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -496,7 +499,8 @@ class SECCollector:
             document_digest, index_digest = documents[0][0], documents[1][0]
             with self.db.transaction() as conn:
                 conn.executemany(
-                    "INSERT OR IGNORE INTO sec_raw_documents(sha256,source_url,gzip_blob,original_bytes,archived_at) VALUES(?,?,?,?,?)",
+                    """INSERT INTO sec_raw_documents(sha256,source_url,gzip_blob,original_bytes,archived_at) VALUES(?,?,?,?,?)
+                       ON CONFLICT(sha256) DO UPDATE SET gzip_blob=excluded.gzip_blob,original_bytes=excluded.original_bytes""",
                     documents,
                 )
                 conn.execute(
@@ -526,7 +530,86 @@ class SECCollector:
         if self.db is None:
             return False
         with closing(self.db.connect()) as conn:
-            return conn.execute("SELECT 1 FROM sec_processed_filings WHERE accession=?", (accession,)).fetchone() is not None
+            if conn.execute("SELECT 1 FROM sec_processed_filings WHERE accession=?", (accession,)).fetchone() is None:
+                return False
+            # Receipts created before raw archiving was added need a one-time replay.
+            # The latest version supersedes older missing references after recovery.
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ipo_evidence'").fetchone():
+                row = conn.execute(
+                    "SELECT evidence_json FROM ipo_evidence WHERE source='sec' AND event_id=? ORDER BY id DESC LIMIT 1",
+                    (accession,),
+                ).fetchone()
+                if row:
+                    try:
+                        evidence = json.loads(row["evidence_json"])
+                    except (ValueError, TypeError):
+                        return False
+                    return self._has_durable_archive(conn, accession, evidence)
+            # Alternate listing routes (e.g. an 8-K business combination) can have
+            # a legacy signal without an IPO event. Ordinary ignored 8-Ks do not.
+            row = conn.execute(
+                "SELECT version_json FROM listing_signals WHERE signal_id=? ORDER BY id DESC LIMIT 1", (accession,),
+            ).fetchone()
+            if row:
+                try:
+                    evidence = json.loads(row["version_json"])
+                except (ValueError, TypeError):
+                    return False
+                if evidence.get("source") == "sec":
+                    return self._has_durable_archive(conn, accession, evidence)
+            return True
+
+    def _has_durable_archive(self, conn, accession: str, evidence: dict[str, Any]) -> bool:
+        reference = evidence.get("raw_archive_path")
+        expected_digest = evidence.get("raw_payload_hash")
+        # The source hash ties archive bytes to this precise classification version.
+        if (not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+                or (reference is not None and not isinstance(reference, str))):
+            return False
+        if reference and not reference.startswith("sqlite:"):
+            # Only an explicitly configured filesystem backend can satisfy a local
+            # archive receipt. Hosted default storage must travel inside SQLite.
+            if self.archive is None:
+                return False
+            try:
+                path = Path(reference).resolve()
+                if not path.is_relative_to(self.archive.root.resolve()) or path.stat().st_size > 12 * self.max_document_bytes + 10000:
+                    return False
+                archived = json.loads(path.read_text(encoding="utf-8"))
+                payload = archived["payload"]
+                document = payload["document"].encode("utf-8")
+                index = payload["index_html"].encode("utf-8")
+                return (
+                    archived.get("external_id") == accession and archived.get("source") == "sec-raw"
+                    and payload.get("document_url") == evidence.get("source_url")
+                    and bool(payload.get("index_url"))
+                    and len(document) <= self.max_document_bytes and len(index) <= self.max_document_bytes
+                    and hashlib.sha256(document).hexdigest() == expected_digest
+                )
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                return False
+        if reference and reference != f"sqlite:sec_raw_documents/{expected_digest}":
+            return False
+        manifest = conn.execute(
+            """SELECT document_sha256,index_sha256 FROM sec_raw_filing_archives
+               WHERE accession=? AND document_sha256=? AND document_url=? LIMIT 1""",
+            (accession, expected_digest, evidence.get("source_url")),
+        ).fetchone()
+        if manifest is None:
+            return False
+        for digest in {manifest["document_sha256"], manifest["index_sha256"]}:
+            row = conn.execute("SELECT gzip_blob,original_bytes FROM sec_raw_documents WHERE sha256=?", (digest,)).fetchone()
+            if row is None or not 0 <= row["original_bytes"] <= self.max_document_bytes:
+                return False
+            try:
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                content = decompressor.decompress(row["gzip_blob"], self.max_document_bytes + 1)
+                if (not decompressor.eof or decompressor.unconsumed_tail or decompressor.unused_data
+                        or len(content) != row["original_bytes"] or hashlib.sha256(content).hexdigest() != digest):
+                    return False
+            except (zlib.error, TypeError):
+                return False
+        return True
 
     def mark_processed(self, accession: str, *, observed_at: datetime) -> None:
         if self.db is None:

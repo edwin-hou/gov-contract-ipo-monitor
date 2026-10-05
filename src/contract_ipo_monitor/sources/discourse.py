@@ -29,6 +29,35 @@ class CompanyWatch:
     name: str
     aliases: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("Company name must be nonempty text")
+        # Remove only complete trailing legal suffixes, never internal words or
+        # substrings such as Bancorp. Preserve the SEC/legal name as identity.
+        suffix = re.compile(
+            r"(?:,\s*|\s+)(?:inc|corp|ltd|limited|corporation|l\.?\s*l\.?\s*c|p\.?\s*l\.?\s*c)\.?[,;\s]*$",
+            re.I,
+        )
+        short = self.name.strip()
+        while True:
+            stripped = suffix.sub("", short).rstrip(" ,.;")
+            if stripped == short:
+                break
+            short = stripped
+        aliases = list(self.aliases)
+        # Automatic one-word aliases are too ambiguous for entity matching.
+        # A caller can explicitly supply such a brand name when appropriate.
+        if short != self.name.strip() and len(re.findall(r"[^\W_]+", short)) >= 2 and sum(c.isalpha() for c in short) >= 6:
+            if not any(alias.casefold() == short.casefold() for alias in aliases):
+                aliases.append(short)
+        object.__setattr__(self, "aliases", tuple(aliases))
+
+    @property
+    def query_name(self) -> str:
+        """Use the shortest configured/generated brand spelling for searches."""
+        return min((value.strip() for value in (self.name, *self.aliases) if value.strip()),
+                   key=lambda value: (len(value), value.casefold()))
+
 
 @dataclass(frozen=True)
 class DiscourseConfig:
@@ -330,7 +359,7 @@ class DiscourseCollector:
         feeds = list(dict.fromkeys(self.config.feed_urls))
         if self.config.company_news_enabled:
             feeds.extend("https://news.google.com/rss/search?" + urlencode({
-                "q": f'"{company.name}" IPO when:{self.config.lookback_days}d',
+                "q": f'"{company.query_name}" IPO when:{self.config.lookback_days}d',
                 "hl": "en-US", "gl": "US", "ceid": "US:en",
             }) for company in companies)
         for feed in dict.fromkeys(feeds):
@@ -351,7 +380,7 @@ class DiscourseCollector:
         if self.config.reddit_enabled:
             for company in companies:
                 url = "https://www.reddit.com/search.json?" + urlencode({
-                    "q": f'"{company.name}"', "sort": "new", "t": "month",
+                    "q": f'"{company.query_name}"', "sort": "new", "t": "month",
                     "limit": self.config.max_items_per_source,
                 })
                 self._active_source = ("reddit", url, now)
@@ -378,13 +407,13 @@ class DiscourseCollector:
                     "YouTube discovery is capped per run and rotates companies by UTC hour to limit API quota use",)))
                 self._checkpoint(records, coverage)
             for company in search_companies:
-                search_url = "https://www.youtube.com/results?" + urlencode({"search_query": company.name + " IPO"})
+                search_url = "https://www.youtube.com/results?" + urlencode({"search_query": company.query_name + " IPO"})
                 self._active_source = ("youtube_search", search_url, now)
                 try:
                     # Publish time is explicitly bounded; ranking is not representative sampling.
                     since = now.replace(microsecond=0) - timedelta(days=self.config.lookback_days)
                     result = json.loads(await self._get("https://www.googleapis.com/youtube/v3/search", params={
-                        "part": "snippet", "type": "video", "q": company.name + " IPO",
+                        "part": "snippet", "type": "video", "q": company.query_name + " IPO",
                         "order": "date", "publishedAfter": since.isoformat().replace("+00:00", "Z"),
                         "maxResults": self.config.youtube_search_per_company,
                         "key": self.config.youtube_api_key,

@@ -75,6 +75,63 @@ def test_smtp_is_opt_in_and_bad_intervals_fail_configuration():
     assert any("SEC_INTERVAL_SECONDS" in error for error in settings.model_copy(update={"sec_interval_seconds": 0}).runtime_errors())
 
 
+def legacy_receipts(tmp_path, reports):
+    db = database(tmp_path)
+    store = ResearchStore(db)
+    store.initialize()
+    with db.connect() as conn:
+        conn.execute("DELETE FROM schema_migrations WHERE version=3")
+    for report in reports:
+        store.save_run(report)
+    return db
+
+
+def test_legacy_sec_truncation_remains_degraded_after_healthy_poll(tmp_path):
+    error = "RuntimeError: Partial SEC collection (2 failures): 8-K: feed page limit reached; older filings may be missing; EFFECT: feed page limit reached; older filings may be missing"
+    previous = {"completed_at": NOW.isoformat(), "status": "degraded", "health": {"collectors": {"sec": {"ok": False, "error": error}}}}
+    healthy = {"completed_at": (NOW + timedelta(minutes=1)).isoformat(), "status": "ok", "health": {"collectors": {"sec": {"ok": True, "error": None}}}}
+    db = legacy_receipts(tmp_path, (previous, healthy))
+    db.initialize()
+    db.update_collector_state("sec", success_at=NOW + timedelta(minutes=2), error=None)
+    db.initialize()
+    with db.connect() as conn:
+        rows = conn.execute("SELECT * FROM collector_state WHERE name LIKE 'sec_feed_gap:%' ORDER BY name").fetchall()
+        assert [row["name"] for row in rows] == ["sec_feed_gap:8-K", "sec_feed_gap:EFFECT"]
+        assert all(row["last_error"] == error and row["updated_at"] == NOW.isoformat() for row in rows)
+        assert all(json.loads(row["cursor"])["unresolved"] for row in rows)
+    monitor = service(tmp_path)
+    monitor.health.set_database_ready(True)
+    monitor.health.mark_success("sec")
+    monitor.health.mark_success("usaspending")
+    report = monitor.create_report()
+    assert report["health"]["ready"] is True
+    assert report["status"] == "degraded"
+    assert len(report["historic_coverage_gaps"]) == 2
+
+
+def test_legacy_sec_cap_without_explicit_form_uses_unresolved_legacy_scope(tmp_path):
+    error = "SEC feed page limit reached; older filings may be missing"
+    db = legacy_receipts(tmp_path, ({"completed_at": NOW.isoformat(), "status": "degraded", "health": {"collectors": {"sec": {"error": error}}}},))
+    db.initialize()
+    with db.connect() as conn:
+        row = conn.execute("SELECT * FROM collector_state WHERE name LIKE 'sec_feed_gap:%'").fetchone()
+        assert row["name"] == "sec_feed_gap:legacy"
+        assert row["last_error"] == error and row["updated_at"] == NOW.isoformat()
+
+
+def test_legacy_generic_or_other_source_failures_do_not_create_sec_caps(tmp_path):
+    reports = [
+        {"completed_at": NOW.isoformat(), "status": "degraded", "health": {"collectors": {"sec": {"error": "TimeoutError: filing request timed out"}}}},
+        {"completed_at": NOW.isoformat(), "status": "degraded", "health": {"collectors": {"discourse": {"error": "8-K: feed page limit reached; older filings may be missing"}, "sec": {"error": None}}}},
+    ]
+    db = legacy_receipts(tmp_path, reports)
+    with db.connect() as conn:
+        conn.execute("INSERT INTO monitor_runs(completed_at,status,report_json) VALUES(?,?,?)", (NOW.isoformat(), "degraded", "invalid JSON"))
+    db.initialize()
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM collector_state WHERE name LIKE 'sec_feed_gap:%'").fetchone()[0] == 0
+
+
 @pytest.mark.asyncio
 async def test_each_sam_run_reconciles_active_and_deleted_records():
     calls = []

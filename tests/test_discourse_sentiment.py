@@ -37,6 +37,36 @@ def test_identity_boundaries_and_aliases_do_not_match_substrings():
     assert matching_companies("Anduril and STRIPE", COMPANIES) == ("Anduril", "Stripe")
 
 
+@pytest.mark.parametrize("name,short", [
+    ("Lycia Therapeutics, Inc.", "Lycia Therapeutics"),
+    ("DayOne Data Centers Ltd", "DayOne Data Centers"),
+    ("TRex Bio, Inc.", "TRex Bio"),
+    ("Example Robotics CORP.", "Example Robotics"),
+    ("Example Robotics Corporation", "Example Robotics"),
+    ("Example Robotics LLC", "Example Robotics"),
+    ("Example Robotics L.L.C.", "Example Robotics"),
+    ("Example Robotics PLC", "Example Robotics"),
+    ("Example Robotics Limited", "Example Robotics"),
+    ("Example Robotics, Inc., Ltd.", "Example Robotics"),
+])
+def test_automatic_legal_aliases_preserve_canonical_name(name, short):
+    watch = CompanyWatch(name)
+    assert watch.name == name
+    assert watch.aliases == (short,)
+    assert watch.query_name == short
+    assert matching_companies(short + " is preparing its IPO.", [watch]) == (name,)
+    assert matching_companies(short + "ish is preparing its IPO.", [watch]) == ()
+
+
+def test_legal_aliases_do_not_strip_internal_suffixes_or_infer_short_brands():
+    for name in ["Bancorp", "Acme Corp", "A B LLC", "Acme Widgets Inc Research", "Corporation Data Group"]:
+        assert CompanyWatch(name).aliases == ()
+    watch = CompanyWatch("Lycia Therapeutics, Inc.", ("Lycia", "LycTx"))
+    assert watch.aliases == ("Lycia", "LycTx", "Lycia Therapeutics")
+    assert watch.query_name == "Lycia"
+    assert CompanyWatch("Acme Corp", ("Acme",)).query_name == "Acme"
+
+
 def test_text_ingestion_strips_markup_scripts_and_controls():
     assert plain_text('<b>Anduril</b><script>evil()</script> &amp; <style>hidden</style>Stripe\x00') == "Anduril & Stripe"
 
@@ -294,6 +324,31 @@ async def test_company_news_and_api_discovery_are_bounded_and_keys_not_archived(
         assert requests[0].url.params["q"].startswith('"Anduril" IPO')
         assert requests[1].url.params["maxResults"] == "3"
         assert "private-api-key" not in json.dumps(asdict(batch), default=str)
+    finally:
+        await source.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_company_alias_queries_collect_brand_article_as_canonical_issuer():
+    requests = []
+    legal = "Lycia Therapeutics, Inc."
+    def handler(request):
+        requests.append(request)
+        if request.url.host == "news.google.com":
+            return httpx.Response(200, text='<rss><channel><item><title>Lycia Therapeutics prepares an IPO</title><link>https://news.example/lycia</link><description>Lycia Therapeutics has promising research and strong commercial opportunities.</description></item><item><title>Lycia Therapeuticsish unrelated IPO</title><link>https://news.example/unrelated</link></item></channel></rss>')
+        if request.url.host == "www.reddit.com":
+            return httpx.Response(200, json={"data": {"children": []}})
+        return httpx.Response(200, json={"items": []})
+    source = DiscourseCollector(DiscourseConfig(youtube_api_key="key"),
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        batch = await source.collect([CompanyWatch(legal)])
+        assert len(batch.records) == 1
+        assert batch.records[0].company_names == (legal,)
+        assert requests[0].url.params["q"].startswith('"Lycia Therapeutics" IPO')
+        assert requests[1].url.params["q"] == '"Lycia Therapeutics"'
+        assert requests[2].url.params["q"] == "Lycia Therapeutics IPO"
+        assert score_evidence(batch.records[0], legal).label == "positive"
     finally:
         await source.client.aclose()
 
