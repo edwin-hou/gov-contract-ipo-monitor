@@ -61,7 +61,7 @@ class HealthRegistry:
 
 
 def create_health_app(registry: HealthRegistry, db: Database | None = None) -> FastAPI:
-    app = FastAPI(title="IPO and Sentiment Monitor", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Company and Trade Research Monitor", docs_url=None, redoc_url=None)
 
     @app.get("/healthz")
     def healthz():
@@ -86,6 +86,21 @@ def create_health_app(registry: HealthRegistry, db: Database | None = None) -> F
             store = ResearchStore(db)
             store.initialize()
             return store.latest_run() or {"status": "not_run", "sentiment": []}
+
+        @app.get("/api/companies")
+        def companies():
+            report = research()
+            return {"completed_at": report.get("completed_at"), "companies": report.get("listed_companies", []), "universe": report.get("universe", {})}
+
+        @app.get("/api/trades")
+        def trades():
+            report = research()
+            return {"completed_at": report.get("completed_at"), "status": report.get("status"), "trade_ideas": report.get("trade_ideas", [])}
+
+        @app.get("/api/world-news")
+        def world_news():
+            report = research()
+            return {"completed_at": report.get("completed_at"), "events": report.get("world_news", []), "coverage": report.get("world_coverage", [])}
 
         @app.get("/api/candidates")
         def candidates(limit: int = Query(50, ge=1, le=500)):

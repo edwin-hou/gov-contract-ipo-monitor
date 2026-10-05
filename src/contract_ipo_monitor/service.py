@@ -17,6 +17,10 @@ from .db import Database
 from .health import HealthRegistry, create_health_app
 from .processor import EvidenceProcessor
 from .research import ResearchStore, serializable
+from .market import DailyPriceCollector
+from .market_monitor import MarketMonitor
+from .fundamentals import SECCompanyFactsCollector
+from .worldnews import WorldNewsCollector
 from .tracking import IPOTracker
 from .sentiment import summarize_sentiment
 from .sources.discourse import CompanyWatch, DiscourseCollector, DiscourseConfig
@@ -130,6 +134,11 @@ class MonitorService:
         archive: EvidenceArchive | None = None,
         clients: tuple[ResilientClient, ...] = (),
         discourse_source: DiscourseCollector | None = None,
+        price_source: Any = None,
+        world_source: Any = None,
+        fundamentals_source: Any = None,
+        instruments: Any = None,
+        benchmarks: Any = None,
     ):
         self.settings = settings
         self.db = db
@@ -154,6 +163,9 @@ class MonitorService:
         self.tracker.initialize()
         self.research = ResearchStore(db)
         self.research.initialize()
+        self.markets = MarketMonitor(db, settings, now=self.now, price_source=price_source,
+                                     world_source=world_source, fundamentals_source=fundamentals_source,
+                                     instruments=instruments, benchmarks=benchmarks)
         self.stop_event = asyncio.Event()
 
     @classmethod
@@ -166,6 +178,8 @@ class MonitorService:
             "usaspending": 2 * settings.usaspending_interval_seconds + settings.source_timeout_seconds,
             "sam": 2 * settings.sam_interval_seconds + settings.source_timeout_seconds,
             "discourse": 2 * settings.discourse_interval_seconds + settings.source_timeout_seconds,
+            "markets": 2 * settings.market_interval_seconds + settings.source_timeout_seconds,
+            "world_news": 2 * settings.market_interval_seconds + settings.source_timeout_seconds,
         })
         health.set_database_ready(True)
         sec_client = ResilientClient(
@@ -214,10 +228,24 @@ class MonitorService:
         worker = SMTPWorker(db, transport=transport) if settings.smtp_enabled else None
         discourse = DiscourseCollector(DiscourseConfig(
             feed_urls=settings.news_feed_urls, video_urls=settings.youtube_video_urls,
+            forum_feed_urls=settings.forum_feed_urls, forums_enabled=settings.forums_enabled,
             reddit_enabled=settings.reddit_enabled, youtube_api_key=settings.youtube_api_key,
+            reddit_access_token=settings.reddit_access_token, reddit_client_id=settings.reddit_client_id,
+            reddit_client_secret=settings.reddit_client_secret, reddit_refresh_token=settings.reddit_refresh_token,
+            reddit_posts_per_company=settings.reddit_posts_per_company,
+            reddit_comments_per_post=settings.reddit_comments_per_post,
+            reddit_max_comments_per_run=settings.reddit_max_comments_per_run,
             hacker_news_enabled=settings.hacker_news_enabled,
             user_agent=settings.sec_user_agent,
         )) if settings.discourse_enabled else None
+        prices = world = fundamentals = None
+        if settings.markets_enabled:
+            prices = DailyPriceCollector(api_key=settings.twelve_data_api_key)
+            world = WorldNewsCollector()
+            facts_client = ResilientClient(headers={"User-Agent": settings.sec_user_agent}, max_attempts=2,
+                                           allowed_hosts=("data.sec.gov",), max_response_bytes=8_000_000)
+            clients.append(facts_client)
+            fundamentals = SECCompanyFactsCollector(facts_client)
         return cls(
             settings=settings,
             db=db,
@@ -230,6 +258,7 @@ class MonitorService:
             archive=EvidenceArchive(settings.evidence_archive_path),
             clients=tuple(clients),
             discourse_source=discourse,
+            price_source=prices, world_source=world, fundamentals_source=fundamentals,
         )
 
     def _collector_last_success(self, name: str) -> datetime | None:
@@ -260,7 +289,8 @@ class MonitorService:
         return await self.usaspending_source.collect(observed_at=observed_at)
 
     async def run_once(self) -> dict[str, Any]:
-        summary = {"contracts": 0, "listing_signals": 0, "ipo_events": 0, "discourse_records": 0, "sam_records": 0, "alerts_created": 0, "emails_sent": 0}
+        summary = {"contracts": 0, "listing_signals": 0, "ipo_events": 0, "discourse_records": 0, "sam_records": 0, "alerts_created": 0, "emails_sent": 0,
+                   "price_histories": 0, "financial_updates": 0, "world_events": 0, "trade_ideas": 0}
         self.health.set_database_ready(True)
         self._alerts_before = self.db.count("alerts")
         observed = self.now()
@@ -302,6 +332,17 @@ class MonitorService:
                 self.db.update_collector_state("sam", error=f"{type(exc).__name__}: {exc}")
                 logger.exception("SAM collection failed")
 
+        for name, source, poll in (("markets", self.markets.price_source, self._poll_markets),
+                                   ("world_news", self.markets.world_source, self._poll_world)):
+            if source is None:
+                continue
+            try:
+                await poll()
+            except Exception as exc:
+                self.health.mark_error(name, f"{type(exc).__name__}: {exc}")
+                self.db.update_collector_state(name, error=f"{type(exc).__name__}: {exc}")
+                logger.exception("Market research collection incomplete", extra={"collector": name})
+        summary.update(self.markets.last_counts)
         if self.discourse_source is not None:
             try:
                 summary["discourse_records"] = await self._poll_discourse()
@@ -315,6 +356,9 @@ class MonitorService:
                 summary["emails_sent"] += 1
         summary["alerts_created"] = self.db.count("alerts") - self._alerts_before
         self.last_report = self.create_report(summary)
+        summary["trade_ideas"] = sum(item["action"] != "wait" for item in self.last_report["trade_ideas"])
+        self.last_report["counts"]["trade_ideas"] = summary["trade_ideas"]
+        self.markets.store.save_ideas(self.last_report["trade_ideas"], observed_at=self.now())
         self.research.save_run(self.last_report)
         return summary
 
@@ -370,6 +414,10 @@ class MonitorService:
             tasks.append(asyncio.create_task(self._collector_loop("sam", self.settings.sam_interval_seconds, self._poll_sam)))
         if self.discourse_source is not None:
             tasks.append(asyncio.create_task(self._collector_loop("discourse", self.settings.discourse_interval_seconds, self._poll_discourse)))
+        if self.markets.price_source is not None:
+            tasks.append(asyncio.create_task(self._collector_loop("markets", self.settings.market_interval_seconds, self._poll_markets)))
+        if self.markets.world_source is not None:
+            tasks.append(asyncio.create_task(self._collector_loop("world_news", self.settings.market_interval_seconds, self._poll_world)))
         if serve_health:
             config = uvicorn.Config(
                 create_health_app(self.health, self.db),
@@ -425,10 +473,34 @@ class MonitorService:
         return signals
 
     def companies(self) -> tuple[CompanyWatch, ...]:
+        public = [CompanyWatch(item.name, aliases=(*item.aliases, "$" + item.symbol)) for item in self.markets.instruments] if self.settings.markets_enabled else []
         names = list(self.settings.watch_companies)
         names += [candidate["issuer_name"] for candidate in self.tracker.candidates(limit=50) if candidate["ipo_confirmed"] and candidate["active"]]
-        names = list(dict.fromkeys(names))[:self.settings.discourse_max_companies]
-        return tuple(CompanyWatch(name, aliases=("Anduril Industries",) if name == "Anduril" else ()) for name in names)
+        watches = public + [CompanyWatch(name, aliases=("Anduril Industries",) if name == "Anduril" else ()) for name in dict.fromkeys(names)]
+        seen = set()
+        unique = []
+        for company in watches:
+            if company.name.casefold() not in seen:
+                seen.add(company.name.casefold())
+                unique.append(company)
+        return tuple(unique[:self.settings.discourse_max_companies])
+
+    async def _poll_markets(self) -> None:
+        await asyncio.wait_for(self.markets.collect_prices(), timeout=self.settings.source_timeout_seconds)
+        failures = [item for item in self.markets.store.coverage("markets") if item["status"] in {"error", "unavailable", "insufficient", "not_attempted"}]
+        if failures:
+            raise RuntimeError(f"{len(failures)} market source gaps: " + "; ".join(f"{item['symbol']}: {item.get('error')}" for item in failures[:3]))
+        self.health.mark_success("markets")
+        self.db.update_collector_state("markets", success_at=self.now(), error=None)
+
+    async def _poll_world(self) -> None:
+        await asyncio.wait_for(self.markets.collect_world(), timeout=self.settings.source_timeout_seconds)
+        coverage = self.markets.store.coverage("world")
+        failures = [item for item in coverage if item["status"] != "ok"]
+        if failures or not coverage:
+            raise RuntimeError(f"World-news coverage incomplete: {len(failures)} source gaps")
+        self.health.mark_success("world_news")
+        self.db.update_collector_state("world_news", success_at=self.now(), error=None)
 
     async def _poll_discourse(self) -> int:
         if self.discourse_source is None:
@@ -479,8 +551,10 @@ class MonitorService:
                   (SELECT COUNT(DISTINCT evidence_id) FROM discourse_evidence) AS commentary_items,
                   (SELECT COUNT(*) FROM discourse_evidence) AS commentary_versions
             """).fetchone())
+        market_report = self.markets.report(sentiment)
         return serializable({
-            "completed_at": self.now(), "status": "ok" if health["ready"] and not historic_gaps and all(item.get("ok") for item in health["collectors"].values()) else "degraded",
+            **market_report,
+            "completed_at": self.now(), "status": "ok" if health["ready"] and not historic_gaps and all(item.get("ok") for item in health["collectors"].values()) and (not self.settings.markets_enabled or market_report.get("world_coverage_ready") and market_report.get("price_coverage") and not market_report.get("market_restore_errors")) else "degraded",
             "counts": counts or {}, "history": history, "health": health, "ipo_summary": self.tracker.summary(),
             "ipos": self.tracker.candidates(limit=100), "sentiment": sentiment, "coverage": coverage,
             "watchlist": [company.name for company in self.companies()],
@@ -492,7 +566,10 @@ class MonitorService:
                 "Government contracts are supplementary evidence and are not required to track an IPO.",
                 "Sentiment is an English lexicon estimate of an accessible sample, balanced by publisher, Hacker News account, Reddit community, YouTube channel, and platform, with duplication controls; it is not internet-wide opinion.",
                 "Unavailable captions mean the video's spoken content has not been analyzed; metadata is excluded from sentiment.",
-                "SAM.gov and market enrichment require optional API keys. State/local contract coverage remains incomplete.",
+                "SAM.gov, Reddit OAuth, video discovery and some native-exchange price providers require optional approved access. State/local contract coverage remains incomplete.",
+                "The reviewed shortlist spans global issuers but is concentrated in technology and U.S. listings; it is not an exhaustive ranking of world markets.",
+                "Trade ideas are conditional days-to-weeks research screens using past daily prices; valuation, portfolio suitability and predictive accuracy remain unverified.",
+                "World-news associations use explicit exposure themes and publisher headlines; they tighten risk checks without establishing a verified event or price direction.",
                 "SMTP is disabled by default; reports and GitHub Actions receipts remain available without email credentials.",
             ],
         })
@@ -502,6 +579,7 @@ class MonitorService:
             await client.aclose()
         if self.discourse_source is not None:
             await self.discourse_source.aclose()
+        await self.markets.aclose()
 
     async def _report_loop(self) -> None:
         from .research import write_report
@@ -510,6 +588,7 @@ class MonitorService:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=60)
             except TimeoutError:
                 report = self.create_report()
+                self.markets.store.save_ideas(report["trade_ideas"], observed_at=self.now())
                 self.research.save_run(report)
                 write_report(report, self.settings.database_path.parent / "reports")
 

@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Settings(BaseModel):
@@ -27,9 +27,24 @@ class Settings(BaseModel):
     youtube_video_urls: tuple[str, ...] = ("https://youtu.be/0BE2AAOlYWI",)
     youtube_api_key: str = ""
     reddit_enabled: bool = True
+    reddit_access_token: str = Field(default="", repr=False)
+    reddit_client_id: str = ""
+    reddit_client_secret: str = Field(default="", repr=False)
+    reddit_refresh_token: str = Field(default="", repr=False)
+    reddit_posts_per_company: int = 5
+    reddit_comments_per_post: int = 10
+    reddit_max_comments_per_run: int = 60
+    forum_feed_urls: tuple[str, ...] = ("https://forum.valuepickr.com/latest.rss",)
+    forums_enabled: bool = True
     hacker_news_enabled: bool = True
+    markets_enabled: bool = True
+    watch_symbols: tuple[str, ...] = ()
+    market_interval_seconds: int = 3600
+    fundamental_refresh_days: int = 7
+    fundamental_max_age_days: int = 120
+    price_max_age_business_days: int = 1
     discourse_interval_seconds: int = 3600
-    discourse_max_companies: int = 12
+    discourse_max_companies: int = 30
     source_timeout_seconds: int = 600
     sec_max_pages: int = 3
     sec_max_document_bytes: int = 20 * 1024 * 1024
@@ -80,9 +95,24 @@ class Settings(BaseModel):
             youtube_video_urls=values("YOUTUBE_VIDEO_URLS", "https://youtu.be/0BE2AAOlYWI"),
             youtube_api_key=os.getenv("YOUTUBE_API_KEY", ""),
             reddit_enabled=boolean("REDDIT_ENABLED", True),
+            reddit_access_token=os.getenv("REDDIT_ACCESS_TOKEN", ""),
+            reddit_client_id=os.getenv("REDDIT_CLIENT_ID", ""),
+            reddit_client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
+            reddit_refresh_token=os.getenv("REDDIT_REFRESH_TOKEN", ""),
+            reddit_posts_per_company=int(os.getenv("REDDIT_POSTS_PER_COMPANY", "5")),
+            reddit_comments_per_post=int(os.getenv("REDDIT_COMMENTS_PER_POST", "10")),
+            reddit_max_comments_per_run=int(os.getenv("REDDIT_MAX_COMMENTS_PER_RUN", "60")),
+            forum_feed_urls=values("FORUM_FEED_URLS", "https://forum.valuepickr.com/latest.rss"),
+            forums_enabled=boolean("FORUMS_ENABLED", True),
             hacker_news_enabled=boolean("HACKER_NEWS_ENABLED", True),
+            markets_enabled=boolean("MARKETS_ENABLED", True),
+            watch_symbols=values("WATCH_SYMBOLS"),
+            market_interval_seconds=int(os.getenv("MARKET_INTERVAL_SECONDS", "3600")),
+            fundamental_refresh_days=int(os.getenv("FUNDAMENTAL_REFRESH_DAYS", "7")),
+            fundamental_max_age_days=int(os.getenv("FUNDAMENTAL_MAX_AGE_DAYS", "120")),
+            price_max_age_business_days=int(os.getenv("PRICE_MAX_AGE_BUSINESS_DAYS", "1")),
             discourse_interval_seconds=int(os.getenv("DISCOURSE_INTERVAL_SECONDS", "3600")),
-            discourse_max_companies=int(os.getenv("DISCOURSE_MAX_COMPANIES", "12")),
+            discourse_max_companies=int(os.getenv("DISCOURSE_MAX_COMPANIES", "30")),
             source_timeout_seconds=int(os.getenv("SOURCE_TIMEOUT_SECONDS", "600")),
             sec_max_pages=int(os.getenv("SEC_MAX_PAGES", "3")),
             sec_max_document_bytes=int(os.getenv("SEC_MAX_DOCUMENT_BYTES", str(20 * 1024 * 1024))),
@@ -123,11 +153,26 @@ class Settings(BaseModel):
             errors.append("USASPENDING_MAX_PAGES must be at least 1.")
         if self.max_price <= 0 or self.max_market_cap <= 0 or self.quote_max_age_hours <= 0:
             errors.append("Qualification thresholds and quote age must be positive.")
-        for name in ("sec_interval_seconds", "usaspending_interval_seconds", "sam_interval_seconds", "smtp_poll_seconds", "discourse_interval_seconds", "source_timeout_seconds", "sec_max_pages"):
+        for name in ("sec_interval_seconds", "usaspending_interval_seconds", "sam_interval_seconds", "smtp_poll_seconds", "discourse_interval_seconds", "source_timeout_seconds", "sec_max_pages", "market_interval_seconds", "fundamental_refresh_days", "fundamental_max_age_days"):
             if getattr(self, name) < 1:
                 errors.append(f"{name.upper()} must be positive.")
         if not 1 <= self.discourse_max_companies <= 50:
             errors.append("DISCOURSE_MAX_COMPANIES must be between 1 and 50.")
+        if not 0 <= self.price_max_age_business_days <= 5:
+            errors.append("PRICE_MAX_AGE_BUSINESS_DAYS must be between 0 and 5.")
+        if not 1 <= self.reddit_posts_per_company <= 10 or not 0 <= self.reddit_comments_per_post <= 50 or not 0 <= self.reddit_max_comments_per_run <= 300:
+            errors.append("Reddit collection bounds are invalid (posts 1-10, comments/post 0-50, comments/run 0-300).")
+        if (self.reddit_client_secret or self.reddit_refresh_token) and not self.reddit_client_id:
+            errors.append("REDDIT_CLIENT_ID is required with Reddit client secret or refresh token.")
+        if any(len(value) > 8192 or any(character.isspace() for character in value) for value in (self.reddit_access_token, self.reddit_client_id, self.reddit_client_secret, self.reddit_refresh_token)):
+            errors.append("Reddit credential format is invalid.")
+        if len(self.forum_feed_urls) > 30 or len(self.news_feed_urls) > 30 or len(self.youtube_video_urls) > 30:
+            errors.append("At most 30 URLs per forum, news, or video source list.")
+        if self.watch_symbols:
+            from .universe import default_universe
+            unknown = set(self.watch_symbols) - {instrument.symbol for instrument in default_universe()}
+            if unknown:
+                errors.append("WATCH_SYMBOLS contains unreviewed instruments: " + ", ".join(sorted(unknown)))
         if not 1 <= self.sec_max_document_bytes <= 50 * 1024 * 1024:
             errors.append("SEC_MAX_DOCUMENT_BYTES must be positive and cannot exceed 50 MiB (52428800 bytes).")
         if not self.enabled_sec_forms:

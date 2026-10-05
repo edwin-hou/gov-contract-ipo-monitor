@@ -228,8 +228,9 @@ async def test_reddit_blocks_are_explicit_without_bypass_or_error_body():
     try:
         batch = await source.collect([COMPANIES[0]])
         assert not batch.records
-        assert batch.coverage[0].status == "error"
-        assert batch.coverage[0].error == "HTTP 403"
+        receipt = next(item for item in batch.coverage if item.source == "reddit")
+        assert receipt.status == "error"
+        assert receipt.error == "HTTP 403"
     finally:
         await source.client.aclose()
 
@@ -322,7 +323,7 @@ async def test_company_news_and_api_discovery_are_bounded_and_keys_not_archived(
         httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     try:
         batch = await source.collect([COMPANIES[0]])
-        assert requests[0].url.params["q"].startswith('"Anduril" IPO')
+        assert requests[0].url.params["q"].startswith('"Anduril" when:')
         assert requests[1].url.params["maxResults"] == "3"
         assert "private-api-key" not in json.dumps(asdict(batch), default=str)
     finally:
@@ -346,9 +347,9 @@ async def test_company_alias_queries_collect_brand_article_as_canonical_issuer()
         batch = await source.collect([CompanyWatch(legal)])
         assert len(batch.records) == 1
         assert batch.records[0].company_names == (legal,)
-        assert requests[0].url.params["q"].startswith('"Lycia Therapeutics" IPO')
+        assert requests[0].url.params["q"].startswith('"Lycia Therapeutics" when:')
         assert requests[1].url.params["q"] == '"Lycia Therapeutics"'
-        assert requests[2].url.params["q"] == "Lycia Therapeutics IPO"
+        assert requests[2].url.params["q"] == "Lycia Therapeutics"
         assert score_evidence(batch.records[0], legal).label == "positive"
     finally:
         await source.client.aclose()
@@ -553,3 +554,229 @@ def test_hackernews_setting_defaults_enabled_and_respects_boolean_environment(mo
     monkeypatch.setenv("HACKER_NEWS_ENABLED", "invalid")
     with pytest.raises(ValueError, match="HACKER_NEWS_ENABLED"):
         Settings.from_env(None)
+
+
+def reddit_post(identifier="abc", *, author="post_reader", text="Apple has promising products and strong commercial opportunities."):
+    return {"kind": "t3", "data": {"id": identifier, "permalink": f"/r/stocks/comments/{identifier}/company_analysis/",
+        "subreddit": "stocks", "subreddit_type": "public", "author": author, "title": "Apple analysis",
+        "selftext": text, "created_utc": NOW.timestamp()}}
+
+
+def reddit_comment(identifier="xyz", *, body="Apple is promising with strong commercial opportunity for the future.", author="comment_reader", **kwargs):
+    return {"kind": "t1", "data": {"id": identifier, "body": body, "author": author,
+        "subreddit_type": "public", "created_utc": NOW.timestamp(), **kwargs}}
+
+
+def reddit_thread(comments, *, post=None):
+    return [{"data": {"children": [post or reddit_post()]}}, {"data": {"children": comments}}]
+
+
+def reddit_collector(handler, **kwargs):
+    return DiscourseCollector(DiscourseConfig(company_news_enabled=False, hacker_news_enabled=False,
+        reddit_enabled=True, **kwargs), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+def test_cashtag_aliases_do_not_match_bare_short_ticker_words():
+    watches = [CompanyWatch("On Holding AG", ("ON", "$ON")), CompanyWatch("C3.ai", ("AI", "$AI"))]
+    assert matching_companies("I am bullish on AI technology and plan ON buying tomorrow.", watches) == ()
+    assert matching_companies("$ON is strong, while $AI is risky.", watches) == ("On Holding AG", "C3.ai")
+    assert matching_companies("$ONLY and $AIM are unrelated identifiers.", watches) == ()
+    assert matching_companies("on$ON or a$AI is an embedded substring.", watches) == ()
+    assert matching_companies("C3.ai is a company.", watches) == ("C3.ai",)
+    assert watches[0].query_name == "On Holding AG"
+
+
+def test_queries_prefer_brand_names_to_short_cashtags_without_losing_alias_matches():
+    watch = CompanyWatch("Micron Technology", ("Micron", "$MU"))
+    assert watch.query_name == "Micron"
+    assert matching_companies("$MU posted new results", [watch]) == ("Micron Technology",)
+    assert not matching_companies("mu denotes the mean here", [watch])
+    assert CompanyWatch("Meta Platforms", ("Meta", "$META")).query_name == "Meta"
+    assert CompanyWatch("$MU").query_name == "$MU"
+
+
+@pytest.mark.asyncio
+async def test_oauth_bearer_uses_read_only_reddit_endpoints_and_author_origins():
+    requests = []
+    def handler(request):
+        requests.append(request)
+        assert request.method == "GET" and request.url.host == "oauth.reddit.com"
+        assert request.headers["Authorization"] == "bearer test-bearer"
+        if request.url.path == "/search.json":
+            return httpx.Response(200, json={"data": {"children": [reddit_post()]}})
+        return httpx.Response(200, json=reddit_thread([reddit_comment()]))
+    source = reddit_collector(handler, reddit_access_token="test-bearer", reddit_posts_per_company=1)
+    try:
+        batch = await source.collect([CompanyWatch("Apple")])
+        assert len(requests) == 2
+        assert requests[1].url.params["sort"] == "new" and requests[1].url.params["depth"] == "2"
+        comment = next(item for item in batch.records if item.text_kind == "public_comment")
+        assert comment.origin_key == "reddit:author:comment_reader"
+        assert comment.published_at == NOW and comment.company_names == ("Apple",)
+        assert comment.source_url.endswith("/xyz/")
+        assert "test-bearer" not in repr(source.config)
+        assert "test-bearer" not in json.dumps(asdict(batch), default=str)
+    finally:
+        await source.client.aclose()
+
+
+@pytest.mark.parametrize("refresh", ["", "test-refresh"])
+@pytest.mark.asyncio
+async def test_reddit_oauth_grants_are_bounded_and_tokens_cached(refresh):
+    requests = []
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/api/v1/access_token":
+            assert request.method == "POST" and request.url.host == "www.reddit.com"
+            assert request.headers["Authorization"].startswith("Basic ")
+            assert b"grant_type=refresh_token" in request.content if refresh else b"grant_type=client_credentials" in request.content
+            if refresh:
+                assert b"refresh_token=test-refresh" in request.content
+            else:
+                assert b"scope=read" in request.content
+            return httpx.Response(200, json={"access_token": "issued-test-token", "token_type": "bearer", "scope": "read", "expires_in": 3600})
+        assert request.method == "GET" and request.url.host == "oauth.reddit.com"
+        assert request.headers["Authorization"] == "bearer issued-test-token"
+        return httpx.Response(200, json={"data": {"children": []}})
+    source = reddit_collector(handler, reddit_client_id="test-client", reddit_client_secret="test-secret", reddit_refresh_token=refresh)
+    try:
+        await source.collect([CompanyWatch("Apple")])
+        batch = await source.collect([CompanyWatch("Apple")])
+        assert sum(request.method == "POST" for request in requests) == 1
+        assert all("issued-test-token" not in str(request.url) for request in requests)
+        serialized = json.dumps(asdict(batch), default=str) + repr(source.config)
+        assert not any(value in serialized for value in ["issued-test-token", "test-secret", "test-refresh"])
+    finally:
+        await source.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reddit_oauth_permission_failure_has_no_anonymous_fallback_and_no_token_leak():
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(401, text="test-secret issued-test-token")
+    source = reddit_collector(handler, reddit_client_id="test-client", reddit_client_secret="test-secret")
+    try:
+        batch = await source.collect([CompanyWatch("Apple")])
+        assert len(requests) == 1 and requests[0].method == "POST"
+        receipt = next(item for item in batch.coverage if item.source == "reddit_oauth")
+        assert receipt.error == "HTTP 401"
+        assert "test-secret" not in json.dumps(asdict(batch), default=str)
+    finally:
+        await source.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reddit_comment_global_budget_survives_failure_and_keeps_posts():
+    comment_requests = []
+    def handler(request):
+        if request.url.path == "/search.json":
+            return httpx.Response(200, json={"data": {"children": [reddit_post("abc"), reddit_post("def")]}})
+        comment_requests.append(request)
+        if request.url.path == "/comments/abc.json":
+            return httpx.Response(503, text="private response body")
+        return httpx.Response(200, json=reddit_thread([reddit_comment("x1"), reddit_comment("x2")], post=reddit_post("def")))
+    source = reddit_collector(handler, reddit_access_token="test-bearer", reddit_posts_per_company=2,
+        reddit_comments_per_post=2, reddit_max_comments_per_run=3)
+    try:
+        batch = await source.collect([CompanyWatch("Apple")])
+        assert [request.url.params["limit"] for request in comment_requests] == ["2", "1"]
+        assert len([item for item in batch.records if item.text_kind == "public_post"]) == 2
+        assert len([item for item in batch.records if item.text_kind == "public_comment"]) == 1
+        states = [item.status for item in batch.coverage if item.source == "reddit_comments"]
+        assert states == ["error", "ok"] and source.partial_batch == batch
+    finally:
+        await source.client.aclose()
+
+
+def test_reddit_comments_exclude_removed_private_unrelated_and_bounded_depth():
+    source = reddit_collector(lambda request: httpx.Response(500))
+    post = source._parse_reddit({"data": {"children": [reddit_post()]}}, [CompanyWatch("Apple")], NOW)[0]
+    nested = reddit_comment("child", replies={"data": {"children": [reddit_comment("grand", replies={"data": {"children": [reddit_comment("depth2", replies={"data": {"children": [reddit_comment("beyondMax")]}})]}})]}})
+    comments = [reddit_comment("deleted", body="[deleted]"), reddit_comment("private", subreddit_type="private"),
+        reddit_comment("unrelated", body="This has no named company opinion."), {"kind": "more", "data": {}}, nested]
+    records = source._parse_reddit_comments(reddit_thread(comments), post, [CompanyWatch("Apple")], NOW, limit=10)
+    assert [item.source_url.rsplit("/", 2)[-2] for item in records] == ["child", "grand", "depth2"]
+    assert len(source._parse_reddit_comments(reddit_thread([nested]), post, [CompanyWatch("Apple")], NOW, limit=1)) == 1
+    private_post = reddit_post()
+    private_post["data"]["subreddit_type"] = "private"
+    with pytest.raises(ValueError, match="Private"):
+        source._parse_reddit_comments(reddit_thread([nested], post=private_post), post, [CompanyWatch("Apple")], NOW, limit=10)
+
+
+@pytest.mark.asyncio
+async def test_reddit_comment_timeout_preserves_completed_post():
+    entered = asyncio.Event()
+    async def handler(request):
+        if request.url.path == "/search.json":
+            return httpx.Response(200, json={"data": {"children": [reddit_post()]}})
+        entered.set()
+        await asyncio.Event().wait()
+    source = reddit_collector(handler, reddit_access_token="test-bearer")
+    task = asyncio.create_task(source.collect([CompanyWatch("Apple")]))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(task, timeout=0.01)
+        assert source.partial_batch.records[0].text_kind == "public_post"
+        assert source.partial_batch.coverage[-1].source == "reddit_comments"
+        assert "Overall collection interrupted" in source.partial_batch.coverage[-1].error
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await source.client.aclose()
+
+
+@pytest.mark.parametrize("mode,expected", [("general", '"Apple" when:'), ("ipo", '"Apple" IPO when:')])
+@pytest.mark.asyncio
+async def test_news_query_modes_cover_existing_company_news(mode, expected):
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, text='<rss><channel/></rss>')
+    source = DiscourseCollector(DiscourseConfig(company_news_enabled=True, reddit_enabled=False,
+        hacker_news_enabled=False, news_query_mode=mode), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        await source.collect([CompanyWatch("Apple")])
+        assert requests[0].url.params["q"].startswith(expected)
+    finally:
+        await source.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_forum_atom_posts_safe_text_author_origins_and_partial_failures():
+    atom = '<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Apple company discussion</title><link href="https://forum.example/thread/123"/><content type="html">&lt;p&gt;Apple is promising &amp;amp; strong.&lt;/p&gt;&lt;script&gt;execute()&lt;/script&gt;</content><author><name>reader1</name></author><published>2026-10-05T20:00:00Z</published></entry></feed>'
+    def handler(request):
+        assert "Authorization" not in request.headers
+        return httpx.Response(200, text=atom) if request.url.path == "/working" else httpx.Response(503)
+    source = collector(handler, forum_feed_urls=("https://forum.example/working", "https://forum.example/broken"))
+    try:
+        batch = await source.collect([CompanyWatch("Apple")])
+        assert len(batch.records) == 1
+        post = batch.records[0]
+        assert post.source_kind == "forum" and post.text_kind == "forum_post"
+        assert post.author == "reader1" and post.origin_key == "forum:forum.example:author:reader1"
+        assert post.text == "Apple is promising & strong." and post.published_at == NOW
+        assert [item.status for item in batch.coverage if item.source == "forum_rss"] == ["ok", "error"]
+        assert "quoted_opinions_possible" in post.bias_flags
+    finally:
+        await source.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oauth_credentials_never_reach_configured_forum_hosts():
+    def handler(request):
+        if request.url.host == "forum.example":
+            assert "Authorization" not in request.headers
+            return httpx.Response(200, text='<rss><channel/></rss>')
+        assert request.url.host == "oauth.reddit.com"
+        assert request.headers["Authorization"] == "bearer test-bearer"
+        return httpx.Response(200, json={"data": {"children": []}})
+    source = reddit_collector(handler, reddit_access_token="test-bearer", forum_feed_urls=("https://forum.example/rss",))
+    try:
+        batch = await source.collect([CompanyWatch("Apple")])
+        assert next(item for item in batch.coverage if item.source == "forum_rss").status == "ok"
+        assert next(item for item in batch.coverage if item.source == "reddit").status == "ok"
+    finally:
+        await source.client.aclose()

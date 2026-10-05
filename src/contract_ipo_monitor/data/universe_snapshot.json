@@ -1,0 +1,561 @@
+{
+  "reviewed_at": "2026-10-05",
+  "methodology": "Reviewed global issuers with an explicit traded listing and comparable latest reported quarterly total revenue growth of at least 10% year over year, positive reported US GAAP/IFRS net income, and dated issuer/SEC evidence. Order eligible companies by YoY total revenue growth, then net margin. Amounts are absolute reporting-currency units, not millions; no FX conversion is used. Evidence expires 120 days after reporting; quarter period ends must be at most 180 days old and annual fallback period ends at most 450 days old. A recent restatement cannot renew an ancient period. This curated shortlist is not an exhaustive global screen or a claim to identify the world's fastest-growing or most-profitable companies. Fundamentals select research candidates; independently verified prices and trading risk checks determine an actionable state.",
+  "limitations": [
+    "Selection and survivorship bias: ten reviewed large issuers, concentrated in technology and AI infrastructure; many profitable growers worldwide were not screened.",
+    "Different GAAP/IFRS accounting policies, fiscal quarter dates and income attribution reduce cross-company comparability. Ratios are historical results, not expected returns.",
+    "U.S. listings and Tencent native Hong Kong HKD listing have observed default price coverage. Tencent remains watch-only until a comparable HKD benchmark or validated FX-adjusted relative performance is available. This does not provide native exchange execution or exhaustive global price coverage.",
+    "Issuer releases are primary financial evidence but promotional commentary is not treated as independent evidence of future performance.",
+    "SEC refresh excludes custom XBRL tags and incomplete comparison contexts. Reviewed snapshots remain visible as dated fallback and become ineligible when expired.",
+    "Quarterly profits can include investment gains, taxes and other non-operating effects; growth and net margin alone do not establish valuation or cash-flow quality."
+  ],
+  "reviewed_exclusions": [
+    {
+      "name": "SAP",
+      "reason": "Q2 2026 total revenue grew 9% at actual exchange rates, below the 10% filter. Cloud-only or constant-currency growth is not substituted for company total revenue.",
+      "source_url": "https://www.sap.com/investors/en.html",
+      "reported_at": "2026-07-23"
+    }
+  ],
+  "instruments": [
+    {
+      "symbol": "MU",
+      "name": "Micron Technology",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "mu.us",
+      "aliases": [
+        "Micron",
+        "Micron Technology Inc"
+      ],
+      "sector": "semiconductor memory",
+      "macro_exposures": [
+        "ai_compute",
+        "china_trade",
+        "energy",
+        "export_controls",
+        "geopolitics",
+        "inflation",
+        "memory",
+        "rates",
+        "regulation",
+        "semiconductors",
+        "supply_chain"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "723125",
+      "reporting_currency": "USD",
+      "yahoo_symbol": "MU",
+      "nasdaq_symbol": "MU",
+      "issuer_country": "United States",
+      "listing_source_url": "https://www.sec.gov/edgar/browse/?CIK=723125&owner=exclud"
+    },
+    {
+      "symbol": "NVDA",
+      "name": "NVIDIA",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "nvda.us",
+      "aliases": [
+        "Nvidia Corporation"
+      ],
+      "sector": "semiconductors",
+      "macro_exposures": [
+        "ai_compute",
+        "china_trade",
+        "energy",
+        "export_controls",
+        "geopolitics",
+        "inflation",
+        "rates",
+        "regulation",
+        "semiconductors",
+        "supply_chain",
+        "taiwan_geopolitics"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "1045810",
+      "reporting_currency": "USD",
+      "yahoo_symbol": "NVDA",
+      "nasdaq_symbol": "NVDA",
+      "issuer_country": "United States",
+      "listing_source_url": "https://investor.nvidia.com/home/default.aspx"
+    },
+    {
+      "symbol": "PLTR",
+      "name": "Palantir Technologies",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "pltr.us",
+      "aliases": [
+        "Palantir",
+        "Palantir Technologies Inc"
+      ],
+      "sector": "enterprise software",
+      "macro_exposures": [
+        "ai_compute",
+        "defense_spending",
+        "energy",
+        "enterprise_software",
+        "geopolitics",
+        "inflation",
+        "interest_rates",
+        "rates",
+        "regulation",
+        "supply_chain"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "1321655",
+      "reporting_currency": "USD",
+      "yahoo_symbol": "PLTR",
+      "nasdaq_symbol": "PLTR",
+      "issuer_country": "United States",
+      "listing_source_url": "https://investors.palantir.com/"
+    },
+    {
+      "symbol": "AVGO",
+      "name": "Broadcom",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "avgo.us",
+      "aliases": [
+        "Broadcom Inc"
+      ],
+      "sector": "semiconductors and infrastructure software",
+      "macro_exposures": [
+        "ai_compute",
+        "china_trade",
+        "energy",
+        "enterprise_software",
+        "export_controls",
+        "geopolitics",
+        "inflation",
+        "rates",
+        "regulation",
+        "semiconductors",
+        "supply_chain"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "1730168",
+      "reporting_currency": "USD",
+      "yahoo_symbol": "AVGO",
+      "nasdaq_symbol": "AVGO",
+      "issuer_country": "United States",
+      "listing_source_url": "https://investors.broadcom.com/"
+    },
+    {
+      "symbol": "MELI",
+      "name": "MercadoLibre",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "meli.us",
+      "aliases": [
+        "Mercado Libre",
+        "MercadoLibre Inc",
+        "Mercado Pago"
+      ],
+      "sector": "e-commerce and financial services",
+      "macro_exposures": [
+        "consumer_spending",
+        "geopolitics",
+        "inflation",
+        "interest_rates",
+        "latin_america_fx",
+        "rates",
+        "regulation"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "1099590",
+      "reporting_currency": "USD",
+      "yahoo_symbol": "MELI",
+      "nasdaq_symbol": "MELI",
+      "issuer_country": "Uruguay",
+      "listing_source_url": "https://investor.mercadolibre.com/"
+    },
+    {
+      "symbol": "TSM",
+      "name": "Taiwan Semiconductor Manufacturing Company",
+      "exchange": "NYSE",
+      "currency": "USD",
+      "provider_symbol": "tsm.us",
+      "aliases": [
+        "TSMC",
+        "Taiwan Semiconductor"
+      ],
+      "sector": "semiconductor foundry",
+      "macro_exposures": [
+        "ai_compute",
+        "china_trade",
+        "energy",
+        "export_controls",
+        "geopolitics",
+        "inflation",
+        "rates",
+        "regulation",
+        "semiconductors",
+        "supply_chain",
+        "taiwan_geopolitics"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "1046179",
+      "listing_kind": "ADR",
+      "reporting_currency": "TWD",
+      "yahoo_symbol": "TSM",
+      "nasdaq_symbol": "TSM",
+      "issuer_country": "Taiwan",
+      "listing_source_url": "https://investor.tsmc.com/english/stock-information"
+    },
+    {
+      "symbol": "META",
+      "name": "Meta Platforms",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "meta.us",
+      "aliases": [
+        "Meta Platforms Inc",
+        "Facebook",
+        "Instagram"
+      ],
+      "sector": "digital advertising and social platforms",
+      "macro_exposures": [
+        "advertising",
+        "ai_compute",
+        "cloud_spending",
+        "consumer_spending",
+        "energy",
+        "inflation",
+        "rates",
+        "regulation",
+        "supply_chain"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "1326801",
+      "reporting_currency": "USD",
+      "yahoo_symbol": "META",
+      "nasdaq_symbol": "META",
+      "issuer_country": "United States",
+      "listing_source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000162828026003942/0001628280-26-003942-index.htm"
+    },
+    {
+      "symbol": "ASML",
+      "name": "ASML Holding",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "asml.us",
+      "aliases": [
+        "ASML",
+        "ASML Holding NV"
+      ],
+      "sector": "semiconductor manufacturing equipment",
+      "macro_exposures": [
+        "china_trade",
+        "energy",
+        "europe_fx",
+        "export_controls",
+        "geopolitics",
+        "inflation",
+        "memory",
+        "rates",
+        "regulation",
+        "semiconductors",
+        "supply_chain"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "937966",
+      "listing_kind": "ordinary",
+      "reporting_currency": "EUR",
+      "yahoo_symbol": "ASML",
+      "nasdaq_symbol": "ASML",
+      "issuer_country": "Netherlands",
+      "listing_source_url": "https://www.investor.asml.com/share-information"
+    },
+    {
+      "symbol": "MSFT",
+      "name": "Microsoft",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "msft.us",
+      "aliases": [
+        "Microsoft Corporation"
+      ],
+      "sector": "cloud and enterprise software",
+      "macro_exposures": [
+        "ai_compute",
+        "cloud_spending",
+        "energy",
+        "enterprise_software",
+        "inflation",
+        "interest_rates",
+        "rates",
+        "regulation",
+        "supply_chain"
+      ],
+      "benchmark_symbol": "ACWI",
+      "cik": "789019",
+      "reporting_currency": "USD",
+      "yahoo_symbol": "MSFT",
+      "nasdaq_symbol": "MSFT",
+      "issuer_country": "United States",
+      "listing_source_url": "https://www.sec.gov/edgar/browse/?CIK=0000789019"
+    },
+    {
+      "symbol": "0700.HK",
+      "name": "Tencent Holdings",
+      "exchange": "HKEX",
+      "currency": "HKD",
+      "provider_symbol": "0700.hk",
+      "aliases": [
+        "Tencent",
+        "Tencent Holdings Limited",
+        "WeChat",
+        "Weixin"
+      ],
+      "sector": "games, digital advertising and financial services",
+      "macro_exposures": [
+        "advertising",
+        "consumer_spending",
+        "china_policy",
+        "regulation",
+        "rates",
+        "inflation",
+        "geopolitics",
+        "energy"
+      ],
+      "benchmark_symbol": "ACWI",
+      "listing_kind": "ordinary",
+      "reporting_currency": "CNY",
+      "yahoo_symbol": "0700.HK",
+      "nasdaq_symbol": null,
+      "issuer_country": "China",
+      "listing_source_url": "https://www.tencent.com/wp-content/uploads/2026/08/Tencent-Announces-2026-Second-Quarter-Results.pdf"
+    }
+  ],
+  "benchmarks": [
+    {
+      "symbol": "ACWI",
+      "name": "iShares MSCI ACWI ETF",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "provider_symbol": "acwi.us",
+      "aliases": [
+        "MSCI All Country World Index"
+      ],
+      "sector": "global equity benchmark",
+      "macro_exposures": [],
+      "benchmark_symbol": "ACWI",
+      "listing_kind": "etf",
+      "yahoo_symbol": "ACWI",
+      "nasdaq_symbol": "ACWI",
+      "issuer_country": "United States",
+      "listing_source_url": "https://www.ishares.com/us/products/239600/ishares-msci-acwi-etf"
+    }
+  ],
+  "financials": [
+    {
+      "symbol": "MU",
+      "source_url": "https://investors.micron.com/news/press-release/2026/Micron-Technology-Inc--Reports-Record-Fiscal-Fourth-Quarter-and-Full-Year-2026-Results/default.aspx",
+      "period_end": "2026-09-03",
+      "prior_period_end": "2025-08-28",
+      "reported_at": "2026-09-30",
+      "revenue": 54229000000,
+      "prior_revenue": 11315000000,
+      "net_income": 37701000000,
+      "currency": "USD",
+      "accounting_standard": "US GAAP",
+      "period_type": "quarter",
+      "period_label": "Q4 FY2026",
+      "limitations": [
+        "Exceptional growth and margins occur during an AI memory cycle; they must not be extrapolated. Current fiscal quarter includes 14 weeks versus 13 in the prior-year quarter."
+      ],
+      "period_start": "2026-05-29",
+      "prior_period_start": "2025-05-30",
+      "supporting_urls": [
+        "https://www.sec.gov/Archives/edgar/data/723125/000072312526000013/a2026q3ex991-pressrelease.htm",
+        "https://www.sec.gov/Archives/edgar/data/723125/000072312525000019/mu-20250625.htm"
+      ]
+    },
+    {
+      "symbol": "NVDA",
+      "source_url": "https://investor.nvidia.com/news/press-release-details/2026/NVIDIA-Announces-Financial-Results-for-Second-Quarter-Fiscal-2027/",
+      "period_end": "2026-07-26",
+      "prior_period_end": "2025-07-27",
+      "reported_at": "2026-08-26",
+      "revenue": 96221000000,
+      "prior_revenue": 46743000000,
+      "net_income": 59688000000,
+      "currency": "USD",
+      "accounting_standard": "US GAAP",
+      "period_type": "quarter",
+      "period_label": "Q2 FY2027",
+      "supporting_urls": [
+        "https://investor.nvidia.com/files/doc_financials/2027/NVDA-2027-Q2-10Q-Final-including-exhibits.pdf"
+      ],
+      "limitations": [
+        "GAAP net income includes non-operating investment effects; this reported margin is not an adjusted operating margin. Demand concentration and export controls remain material exposures."
+      ]
+    },
+    {
+      "symbol": "PLTR",
+      "source_url": "https://investors.palantir.com/files/2026%20Q2%20PLTR%2010-Q.pdf",
+      "period_end": "2026-06-30",
+      "period_start": "2026-04-01",
+      "prior_period_end": "2025-06-30",
+      "prior_period_start": "2025-04-01",
+      "reported_at": "2026-08-04",
+      "revenue": 1935464000,
+      "prior_revenue": 1003697000,
+      "net_income": 1065962000,
+      "currency": "USD",
+      "accounting_standard": "US GAAP",
+      "period_type": "quarter",
+      "period_label": "Q2 2026",
+      "limitations": [
+        "Consolidated GAAP income includes noncontrolling interests; attributable-to-common income is a different numerator. Approximately half of quarterly revenue is from government customers; reported profit includes non-operating income."
+      ],
+      "supporting_urls": [
+        "https://www.sec.gov/Archives/edgar/data/1321655/000132165526000041/0001321655-26-000041-index.htm"
+      ]
+    },
+    {
+      "symbol": "AVGO",
+      "source_url": "https://investors.broadcom.com/news-releases/news-release-details/broadcom-inc-announces-third-quarter-fiscal-year-2026-financial",
+      "period_end": "2026-08-02",
+      "prior_period_end": "2025-08-03",
+      "reported_at": "2026-09-02",
+      "revenue": 29591000000,
+      "prior_revenue": 15952000000,
+      "net_income": 13088000000,
+      "currency": "USD",
+      "accounting_standard": "US GAAP",
+      "period_type": "quarter",
+      "period_label": "Q3 FY2026",
+      "limitations": [
+        "GAAP net income is used instead of adjusted EBITDA or non-GAAP earnings. Semiconductor and infrastructure software mixes differ from pure chipmakers."
+      ]
+    },
+    {
+      "symbol": "MELI",
+      "source_url": "https://investor.mercadolibre.com/open-file?file=aHR0cHM6Ly9odHRwMi5tbHN0YXRpYy5jb20vc3RvcmFnZS9tbC1jbXMtYmFja2VuZC9jbXMtZG9jdW1lbnRzLXByb2QvNWRiYmE5MTktNzIxYy00OTE2LWJiOTEtYzc2YTg3MTNmN2YwLzIxYzk4MzdhLWMyMTItNGQ2ZC1hYTE0LTMwNDFjMjZiMTE0My9MZXR0ZXJfdG9fU2hhcmVob2xkZXJzLnBkZg%3D%3D",
+      "period_end": "2026-06-30",
+      "period_start": "2026-04-01",
+      "prior_period_end": "2025-06-30",
+      "prior_period_start": "2025-04-01",
+      "reported_at": "2026-08-05",
+      "revenue": 10169000000,
+      "prior_revenue": 6790000000,
+      "net_income": 466000000,
+      "currency": "USD",
+      "accounting_standard": "US GAAP",
+      "period_type": "quarter",
+      "period_label": "Q2 2026",
+      "revenue_label": "net revenues and financial income",
+      "limitations": [
+        "Revenue includes financial income; incomplete customer-contract XBRL revenue is not interchangeable. Net margin is only about 4.6%; operating income declined despite revenue growth, with investment spending and currency exposure."
+      ]
+    },
+    {
+      "symbol": "TSM",
+      "source_url": "https://investor.tsmc.com/english/encrypt/files/encrypt_file/qr/phase4_reports/2026-07/bf09036349a253e83f78155099133806cad0320b/2Q26%20ManagementReport.pdf",
+      "period_end": "2026-06-30",
+      "period_start": "2026-04-01",
+      "prior_period_end": "2025-06-30",
+      "prior_period_start": "2025-04-01",
+      "reported_at": "2026-07-16",
+      "revenue": 1270380000000,
+      "prior_revenue": 933790000000,
+      "net_income": 706560000000,
+      "currency": "TWD",
+      "accounting_standard": "Taiwan IFRS",
+      "period_type": "quarter",
+      "period_label": "Q2 2026",
+      "net_income_label": "net income attributable to shareholders of the parent",
+      "supporting_urls": [
+        "https://investor.tsmc.com/english/quarterly-results/2026/q2"
+      ],
+      "limitations": [
+        "Published figures are rounded to NT$0.01 billion. Income is attributable to parent shareholders, while some other issuers report consolidated income. TWD revenue/profit are paired consistently; ADR prices are USD and USD revenue growth reflects different FX effects."
+      ]
+    },
+    {
+      "symbol": "META",
+      "source_url": "https://investor.atmeta.com/investor-news/press-release-details/2026/Meta-Reports-Second-Quarter-2026-Results/",
+      "period_end": "2026-06-30",
+      "period_start": "2026-04-01",
+      "prior_period_end": "2025-06-30",
+      "prior_period_start": "2025-04-01",
+      "reported_at": "2026-07-29",
+      "revenue": 60801000000,
+      "prior_revenue": 47516000000,
+      "net_income": 15848000000,
+      "currency": "USD",
+      "accounting_standard": "US GAAP",
+      "period_type": "quarter",
+      "period_label": "Q2 2026",
+      "limitations": [
+        "GAAP net income declined from $18,337 million in the prior-year quarter despite revenue growth; positive profitability does not imply improving profit. Capital spending and operating costs weigh on cash flows."
+      ]
+    },
+    {
+      "symbol": "ASML",
+      "source_url": "https://investor.asml.com/news-releases/news-release-details/q2-2026-financial-results",
+      "period_end": "2026-06-28",
+      "prior_period_end": "2025-06-29",
+      "reported_at": "2026-07-15",
+      "revenue": 9326000000,
+      "prior_revenue": 7692000000,
+      "net_income": 2918000000,
+      "currency": "EUR",
+      "accounting_standard": "US GAAP",
+      "period_type": "quarter",
+      "period_label": "Q2 2026",
+      "revenue_label": "total net sales",
+      "supporting_urls": [
+        "https://ourbrand.asml.com/asset/9078cf4d-91fd-4dd9-a5d5-d1caab6dc046/2026_07_15_Presentation-Investor-Relations-Q2-2026.pdf",
+        "https://www.asml.com/news/press-releases/2025/q2-2025-financial-results"
+      ],
+      "limitations": [
+        "Quarterly release figures use US GAAP, not the separate IFRS statutory report. Published values are rounded to EUR millions; lithography shipment timing can make quarterly growth uneven. Nasdaq shares are registered ordinary shares traded in USD."
+      ]
+    },
+    {
+      "symbol": "MSFT",
+      "source_url": "https://www.microsoft.com/en-us/investor/earnings/fy-2026-q4/press-release-webcast",
+      "period_end": "2026-06-30",
+      "period_start": "2026-04-01",
+      "prior_period_end": "2025-06-30",
+      "prior_period_start": "2025-04-01",
+      "reported_at": "2026-07-29",
+      "revenue": 90007000000,
+      "prior_revenue": 76441000000,
+      "net_income": 35766000000,
+      "currency": "USD",
+      "accounting_standard": "US GAAP",
+      "period_type": "quarter",
+      "period_label": "Q4 FY2026",
+      "limitations": [
+        "GAAP net income includes investment effects; adjusted earnings are not substituted. Cloud and AI capital expenditure creates risks beyond current revenue growth and accounting profit."
+      ]
+    },
+    {
+      "symbol": "0700.HK",
+      "source_url": "https://www.tencent.com/wp-content/uploads/2026/08/Tencent-Announces-2026-Second-Quarter-Results.pdf",
+      "period_end": "2026-06-30",
+      "period_start": "2026-04-01",
+      "prior_period_end": "2025-06-30",
+      "prior_period_start": "2025-04-01",
+      "reported_at": "2026-08-12",
+      "revenue": 204785000000,
+      "prior_revenue": 184504000000,
+      "net_income": 57977000000,
+      "currency": "CNY",
+      "accounting_standard": "IFRS",
+      "period_type": "quarter",
+      "period_label": "Q2 2026",
+      "net_income_label": "consolidated IFRS profit for the period",
+      "limitations": [
+        "Yahoo metadata for 0700.HK confirmed the Hong Kong venue and HKD trading currency, with 100 completed daily bars on 2026-10-05. A comparable HKD benchmark or validated FX-adjusted relative performance remains unverified, so the current USD global benchmark keeps this issuer watch-only.",
+        "Uses IFRS profit for the period, not adjusted non-IFRS profit or profit attributable to equity holders. Quarter free cash flow was negative CNY13.8 billion amid AI-related prepayments; reported net income is not free cash flow."
+      ]
+    }
+  ]
+}

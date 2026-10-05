@@ -12,7 +12,7 @@ from .service import MonitorService
 from .research import ResearchStore, checkpoint_database, write_report
 from .sources.state_local import AdapterInventory
 
-app = typer.Typer(no_args_is_help=True, help="Company IPO, public sentiment, and government contract research monitor")
+app = typer.Typer(no_args_is_help=True, help="Company, IPO, world news and conditional trade research monitor")
 
 
 @app.command("init-db")

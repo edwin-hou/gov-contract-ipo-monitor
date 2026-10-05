@@ -1,4 +1,4 @@
-name: IPO and sentiment monitor
+name: Company, IPO and trade research monitor
 
 on:
   schedule:
@@ -19,18 +19,25 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 70
     env:
-      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || 'IPOSentimentMonitor/0.3 edwin.s.hou@gmail.com' }}
+      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || 'CompanyTradeResearchMonitor/0.4 edwin.s.hou@gmail.com' }}
       DATABASE_PATH: data/monitor.db
       SMTP_ENABLED: 'false'
       WATCH_COMPANIES: ${{ vars.WATCH_COMPANIES || 'Anduril,SpaceX,OpenAI,Anthropic,Databricks,Stripe' }}
       YOUTUBE_VIDEO_URLS: ${{ vars.YOUTUBE_VIDEO_URLS || 'https://youtu.be/0BE2AAOlYWI' }}
       NEWS_FEED_URLS: ${{ vars.NEWS_FEED_URLS }}
+      FORUM_FEED_URLS: ${{ vars.FORUM_FEED_URLS || 'https://forum.valuepickr.com/latest.rss' }}
+      WATCH_SYMBOLS: ${{ vars.WATCH_SYMBOLS }}
+      REDDIT_ACCESS_TOKEN: ${{ secrets.REDDIT_ACCESS_TOKEN }}
+      REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+      REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+      REDDIT_REFRESH_TOKEN: ${{ secrets.REDDIT_REFRESH_TOKEN }}
       YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
       SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
       TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
       SOURCE_TIMEOUT_SECONDS: '600'
+      SEC_MAX_DOCUMENT_BYTES: ${{ vars.SEC_MAX_DOCUMENT_BYTES || '52428800' }}
       USASPENDING_MAX_PAGES: '250'
     steps:
       - uses: actions/checkout@v4

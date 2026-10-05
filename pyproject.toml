@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gov-contract-ipo-monitor"
-version = "0.3.0"
-description = "Company IPO evidence, bias-aware online sentiment, and government contract monitor"
+version = "0.4.0"
+description = "Global company research, conditional trade ideas, IPOs, world news and bias-aware commentary"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
@@ -17,6 +17,7 @@ dependencies = [
   "python-dotenv>=1.0",
   "typer>=0.12",
   "uvicorn>=0.30",
+  "tzdata>=2025.1",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +28,9 @@ gov-contract-ipo-monitor = "contract_ipo_monitor.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+contract_ipo_monitor = ["data/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

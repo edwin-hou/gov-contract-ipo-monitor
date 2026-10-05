@@ -93,9 +93,24 @@ class ResearchStore:
 
 
 def report_markdown(report: dict[str, Any]) -> str:
+    from html import escape
+    from .dashboard import action_label, display_number, safe_external_url
+
     def clean(value: Any) -> str:
-        return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ").replace("<", "&lt;").replace(">", "&gt;")
-    lines = ["# IPO and sentiment monitor", "", f"Run: {clean(report['completed_at'])} · **{clean(report['status'])}**", "",
+        value = "Unavailable" if value is None else str(value)
+        return escape(value, quote=True).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ").replace("[", "\\[").replace("]", "\\]").replace("`", "\\`")
+
+    def link(value: Any, label: Any = "Source") -> str:
+        url = safe_external_url(value)
+        return f"[{clean(label)}]({url})" if url else "Source unavailable"
+
+    def items(value: Any) -> list[str]:
+        return [str(item) for item in value if item is not None] if isinstance(value, (list, tuple)) else []
+
+    def rows(value: Any) -> list[dict[str, Any]]:
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, (list, tuple)) else []
+
+    lines = ["# Global company, IPO and sentiment monitor", "", f"Run: {clean(report['completed_at'])} · **{clean(report['status'])}**", "",
              "IPO status comes from regulatory evidence. Sentiment describes the collected sample and never confirms an IPO or predicts returns.", "",
              "## Collection", "", "| Source | Status | Details |", "|---|---|---|"]
     for name, state in report.get("health", {}).get("collectors", {}).items():
@@ -128,10 +143,92 @@ def report_markdown(report: dict[str, Any]) -> str:
             if form == "legacy":
                 form = "Unspecified legacy form"
             lines.append(f"| {clean(form)} | {clean(gap.get('updated_at', ''))} | {clean(gap.get('last_error', ''))} |")
+    market_scope = any(key in report for key in ("listed_companies", "universe", "trade_ideas", "price_coverage", "world_news", "world_coverage"))
+    if market_scope:
+        metadata = report.get("universe") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        lines += ["", "## Listed-company growth and profit screen", "",
+                  "A configurable shortlist of global issuers, not an exhaustive global market screen. Historical growth and profit do not establish fair valuation or expected returns. Amounts are absolute reporting-currency units; financial reporting currency can differ from trading currency.", "",
+                  f"Research reviewed: {clean(metadata.get('reviewed_at'))}. {clean(metadata.get('methodology', ''))}", "",
+                  *[f"- {clean(item)}" for item in items(metadata.get("limitations"))], "",
+                  "| Issuer / country | Symbol / exchange / trading currency | YoY total revenue growth | Reported net margin | Net income / reporting currency | Period / reported date / basis | Screen and reasons | Primary evidence |",
+                  "|---|---|---|---|---|---|---|---|"]
+        companies = rows(report.get("listed_companies"))
+        financial_notes = []
+        for company in companies:
+            financials = company.get("financials") or {}
+            if not isinstance(financials, dict):
+                financials = {}
+            basis = " ".join(items([financials.get("period_type"), financials.get("accounting_standard")]))
+            state = "Passes financial screen" if company.get("eligible") is True else "Does not pass financial screen"
+            lines.append(f"| {clean(company.get('name'))} / {clean(company.get('issuer_country'))} | {clean(company.get('symbol'))} / {clean(company.get('exchange'))} / {clean(company.get('trading_currency'))} | {display_number(company.get('revenue_growth_percent'), decimals=1, suffix='%')} | {display_number(company.get('net_margin_percent'), decimals=1, suffix='%')} | {display_number(financials.get('net_income'), decimals=0)} {clean(financials.get('currency', ''))} | {clean(financials.get('period_end'))} / {clean(financials.get('reported_at'))} / {clean(basis)} | {state}: {clean('; '.join(items(company.get('reasons'))))} | {link(financials.get('source_url'), 'Financial results')} |")
+            for limitation in items(financials.get("limitations")):
+                financial_notes.append(f"{clean(company.get('symbol'))} financial limitation: {clean(limitation)}")
+        for note in financial_notes:
+            lines += ["", note]
+        if not companies:
+            lines += ["", "No sourced listed-company research is saved yet."]
+        for exclusion in rows(metadata.get("reviewed_exclusions")):
+            lines += ["", f"Reviewed exclusion — {clean(exclusion.get('name'))}: {clean(exclusion.get('reason'))}. {link(exclusion.get('source_url'))}."]
+        lines += ["", "## Conditional trade ideas", "",
+                  "Conditional buy means review the entry trigger and all checks before considering a purchase. Reduce if already owned is a review for an existing holding. Wait means the required evidence or setup is missing. No orders are placed.", "",
+                  "Prices are latest completed daily observations, not executable live quotes. Screening rules have no validated return forecast. Invalidation is a risk reference, not a guaranteed exit; gaps and costs can increase losses. For reduce-if-owned, the holding review level is the recent low to check against a fresh quote. Levels use the displayed trading currency.", "",
+                  "| Company / listing / currency | Research state | Last completed close / date | Conditional entry | Invalidation / holding review level | Target reference | Risk / reward reference | Main check / why wait |",
+                  "|---|---|---|---|---|---|---|---|"]
+        ideas = rows(report.get("trade_ideas"))
+        for idea in ideas:
+            action = idea.get("action", "wait")
+            indicator = idea.get("indicators") or {}
+            if not isinstance(indicator, dict):
+                indicator = {}
+            levels = [display_number(idea.get(key)) if action == "conditional_buy" or key == "invalidation" and action == "reduce_if_owned" else "—"
+                      for key in ("entry", "invalidation", "target", "risk_reward")]
+            checks = items(idea.get("conditions")) or items(idea.get("reasons")) or ["No verified setup or required evidence is available."]
+            lines.append(f"| {clean(idea.get('symbol'))} · {clean(idea.get('company'))} / {clean(idea.get('exchange'))} / {clean(idea.get('currency'))} / {clean(idea.get('listing_kind'))} | {action_label(action)} | {display_number(indicator.get('last_close'))} {clean(idea.get('currency'))} / {clean(idea.get('price_as_of'))} | {' | '.join(levels)} | {clean(checks[0])} |")
+        if not ideas:
+            lines += ["", "No conditional trade ideas are saved yet."]
+        for idea in ideas:
+            action = idea.get("action", "wait")
+            reasons, checks = items(idea.get("reasons")), items(idea.get("conditions"))
+            if action not in {"conditional_buy", "reduce_if_owned"} and not checks:
+                checks = reasons or ["No verified setup or required evidence is available."]
+            lines += ["", f"### {clean(idea.get('symbol'))}: {action_label(action)}", "",
+                      f"Horizon: {clean(idea.get('horizon'))}. Generated: {clean(idea.get('generated_at'))}. Confidence: {clean(idea.get('confidence'))}.", "",
+                      "Why wait:" if action not in {"conditional_buy", "reduce_if_owned"} else "Conditions to review:", "",
+                      *[f"- {clean(item)}" for item in checks], "", "Research reasons:", "",
+                      *[f"- {clean(item)}" for item in reasons], "", "Risks and limitations:", "",
+                      *[f"- {clean(item)}" for item in items(idea.get("risks")) + items(idea.get("limitations"))]]
+            for event in rows(idea.get("world_context")):
+                lines += ["", f"Related publisher report: {link(event.get('source_url'), event.get('title'))} — {clean(event.get('publisher'))}, {clean(event.get('published_at'))}; {clean(', '.join(items(event.get('themes'))))}. {clean(event.get('interpretation') or 'Exposure interpretation is unverified; price direction is unknown.')}"]
+            urls = items(idea.get("evidence_urls"))
+            lines += ["", "Evidence: " + (" · ".join(link(url) for url in urls) or "No linked evidence is available.")]
+        lines += ["", "## Price coverage", "", "| Symbol | Provider | Status | Completed price date | Error / limitation |", "|---|---|---|---|---|"]
+        for receipt in rows(report.get("price_coverage")):
+            detail = "; ".join(items([receipt.get("error"), *items(receipt.get("limitations"))]))
+            lines.append(f"| {clean(receipt.get('symbol'))} | {clean(receipt.get('source'))} | {clean(receipt.get('status'))} | {clean(receipt.get('as_of'))} | {clean(detail)} |")
+        if not report.get("price_coverage"):
+            lines += ["", "No price source receipt yet. Missing verified history keeps ideas in wait."]
+        lines += ["", "## World-news context", "",
+                  "Headlines and feed summaries reflect publisher selection. The underlying events are publisher-reported and unverified here. Themes are keyword matches; relevance to an issuer is an interpretation and does not establish market direction.", "",
+                  "| Reported headline | Publisher | Published | Matched themes | Unverified interpretation |", "|---|---|---|---|---|"]
+        events = rows(report.get("world_news"))
+        for event in events[:50]:
+            lines.append(f"| {link(event.get('source_url'), event.get('title'))} | {clean(event.get('publisher'))} | {clean(event.get('published_at'))} | {clean(', '.join(items(event.get('themes'))) or 'No matched theme')} | {clean(event.get('interpretation') or 'Theme relevance is an unverified inference.')} Price direction is unknown. |")
+        if len(events) > 50:
+            lines += ["", f"Showing the latest 50 of {len(events)} saved headlines in this report. The detailed audit data retains all entries."]
+        if not events:
+            lines += ["", "No publisher-reported world headlines saved yet."]
+        lines += ["", "## World-news coverage", "", "| Source | Status | Observed | Items | Error / limitation |", "|---|---|---|---|---|"]
+        for receipt in rows(report.get("world_coverage")):
+            detail = "; ".join(items([receipt.get("error"), *items(receipt.get("limitations"))]))
+            lines.append(f"| {link(receipt.get('source_url'), receipt.get('source'))} | {clean(receipt.get('status'))} | {clean(receipt.get('observed_at'))} | {clean(receipt.get('collected_count', 0))} | {clean(detail)} |")
+        if not report.get("world_coverage"):
+            lines += ["", "No world-news source receipt yet."]
     lines += ["", "## IPO evidence", "", "| Company | Stage | Evidence confidence | Source |", "|---|---|---|---|"]
     for candidate in report.get("ipos", []):
         url = next(iter(candidate.get("source_urls", [])), "")
-        lines.append(f"| {clean(candidate['issuer_name'])} | {clean(candidate['status'])} | {clean(candidate['confidence'])} | {clean(url)} |")
+        lines.append(f"| {clean(candidate['issuer_name'])} | {clean(candidate['status'])} | {clean(candidate['confidence'])} | {link(url)} |")
     if not report.get("ipos"):
         lines += ["", "No IPO evidence has been collected yet. Check collection coverage before interpreting an empty result."]
     lines += ["", "## Sentiment sample", "", "| Company | Sentiment | Scored items | Origins | Bias and coverage flags |", "|---|---|---|---|---|"]
@@ -143,7 +240,7 @@ def report_markdown(report: dict[str, Any]) -> str:
               "## Source coverage", "", "| Source | Status | Items | Limitation or error |", "|---|---|---|---|"]
     for source in report.get("coverage", []):
         detail = source.get("error") or "; ".join(source.get("limitations", []))
-        lines.append(f"| {clean(source['source'])} | {clean(source['status'])} | {source.get('collected_count', 0)} | {clean(detail)} |")
+        lines.append(f"| {clean(source['source'])} | {clean(source['status'])} | {clean(source.get('collected_count', 0))} | {clean(detail)} |")
     lines += ["", "## Limitations", "", *[f"- {clean(item)}" for item in report.get("limitations", [])], ""]
     return "\n".join(lines)
 

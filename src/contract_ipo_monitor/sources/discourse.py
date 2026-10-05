@@ -1,6 +1,6 @@
 """Bounded public discourse ingestion. These records never verify an IPO.
 
-Feeds contain publisher summaries, Reddit contains public search posts,
+Feeds contain publisher/forum summaries, Reddit contains bounded public posts/comments,
 Hacker News contains public stories/comments, and YouTube contains metadata
 plus captions only when a public track is accessible.
 No remote HTML or script is executed and no engagement count is a truth score.
@@ -12,17 +12,30 @@ import hashlib
 import html
 import ipaddress
 import json
+import math
 import re
 import socket
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import httpx
+
+
+def _identity_term(value: str, *, canonical: bool = False) -> str | None:
+    term = value.strip()
+    if term.startswith("$"):
+        return term if re.fullmatch(r"\$[A-Za-z][A-Za-z0-9]{0,9}(?:[.-][A-Za-z0-9]{1,3})?", term) else None
+    if len(term) < 3 or term.casefold() in {"and", "the", "inc", "corp", "ltd", "llc", "plc", "ai", "company", "group", "holdings", "stock", "shares"}:
+        return None
+    if not canonical and re.fullmatch(r"[A-Z]{1,5}(?:[.-][A-Z])?", term):
+        # Bare ticker aliases such as ON or AI are ordinary words in text.
+        return None
+    return term
 
 
 @dataclass(frozen=True)
@@ -55,17 +68,30 @@ class CompanyWatch:
 
     @property
     def query_name(self) -> str:
-        """Use the shortest configured/generated brand spelling for searches."""
-        return min((value.strip() for value in (self.name, *self.aliases) if value.strip()),
+        """Prefer a natural brand spelling; cashtags remain matching aliases."""
+        values = [_identity_term(self.name, canonical=True), *(_identity_term(value) for value in self.aliases)]
+        usable = [value for value in values if value]
+        natural = [value for value in usable if not value.startswith("$")]
+        return min(natural or usable, default=self.name.strip(),
                    key=lambda value: (len(value), value.casefold()))
 
 
 @dataclass(frozen=True)
 class DiscourseConfig:
     feed_urls: tuple[str, ...] = ()
+    forum_feed_urls: tuple[str, ...] = ()
+    forums_enabled: bool = True
     video_urls: tuple[str, ...] = ()
     company_news_enabled: bool = True
+    news_query_mode: str = "general"
     reddit_enabled: bool = True
+    reddit_access_token: str = field(default="", repr=False)
+    reddit_client_id: str = field(default="", repr=False)
+    reddit_client_secret: str = field(default="", repr=False)
+    reddit_refresh_token: str = field(default="", repr=False)
+    reddit_posts_per_company: int = 5
+    reddit_comments_per_post: int = 10
+    reddit_max_comments_per_run: int = 60
     hacker_news_enabled: bool = True
     youtube_api_key: str = ""
     youtube_search_per_company: int = 3
@@ -86,6 +112,18 @@ class DiscourseConfig:
             raise ValueError("timeout_seconds or lookback_days outside safe bounds")
         if len(self.feed_urls) > 30 or len(self.video_urls) > 30:
             raise ValueError("At most 30 feeds and 30 seed videos per run")
+        if len(self.forum_feed_urls) > 30:
+            raise ValueError("At most 30 forum feeds per run")
+        if self.news_query_mode not in {"general", "ipo"}:
+            raise ValueError("news_query_mode must be general or ipo")
+        if not 0 <= self.reddit_posts_per_company <= 10 or not 0 <= self.reddit_comments_per_post <= 50 or not 0 <= self.reddit_max_comments_per_run <= 500:
+            raise ValueError("Reddit post/comment limits outside safe bounds")
+        if self.reddit_client_secret and not self.reddit_client_id or self.reddit_refresh_token and not self.reddit_client_id:
+            raise ValueError("Reddit client_id is required with client_secret/refresh_token")
+        if any(len(value) > 8192 or any(character.isspace() for character in value) for value in (
+            self.reddit_access_token, self.reddit_client_id, self.reddit_client_secret, self.reddit_refresh_token,
+        )):
+            raise ValueError("Reddit credential format is invalid")
         if not 0 <= self.youtube_search_per_company <= 5 or not 1 <= self.max_videos_per_run <= 30:
             raise ValueError("YouTube search/video limits outside safe bounds")
         if not 1 <= self.max_youtube_searches_per_run <= 20:
@@ -154,10 +192,12 @@ def plain_text(value: str, limit: int = 20000) -> str:
 
 def matching_companies(text: str, companies: Sequence[CompanyWatch]) -> tuple[str, ...]:
     """Explicit boundary matches; a ticker substring is never identity proof."""
-    return tuple(company.name for company in companies if any(
-        alias.strip() and re.search(r"(?<!\w)" + re.escape(alias.strip()) + r"(?!\w)", text, re.I)
-        for alias in (company.name, *company.aliases)
-    ))
+    results = []
+    for company in companies:
+        terms = [_identity_term(company.name, canonical=True), *(_identity_term(alias) for alias in company.aliases)]
+        if any(term and re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text, re.I) for term in terms):
+            results.append(company.name)
+    return tuple(results)
 
 
 def _safe_url(url: str) -> str:
@@ -269,6 +309,8 @@ class DiscourseCollector:
         self._active_source: tuple[str, str, datetime] | None = None
         self._completed_records: list[DiscourseEvidence] = []
         self._completed_coverage: list[SourceCoverage] = []
+        self._reddit_token = ""
+        self._reddit_token_expires_at: datetime | None = None
 
     def _checkpoint(self, records: Sequence[DiscourseEvidence],
                     coverage: Sequence[SourceCoverage], *, video: bool = False) -> None:
@@ -295,13 +337,16 @@ class DiscourseCollector:
             await self.client.aclose()
 
     async def _get(self, url: str, **kwargs) -> str:
+        return await self._request("GET", url, **kwargs)
+
+    async def _request(self, method: str, url: str, *, headers: dict[str, str] | None = None, **kwargs) -> str:
         _safe_url(url)
         # Streaming limits decompressed bytes and the whole response duration.
         async def read() -> str:
             await self._check_public_dns(url)
-            async with self.client.stream("GET", url, follow_redirects=False,
+            async with self.client.stream(method, url, follow_redirects=False,
                                           timeout=self.config.timeout_seconds,
-                                          headers={"User-Agent": self.config.user_agent}, **kwargs) as response:
+                                          headers={"User-Agent": self.config.user_agent, **(headers or {})}, **kwargs) as response:
                 response.raise_for_status()
                 if not 200 <= response.status_code < 300:
                     raise ValueError("Redirect responses are not followed")
@@ -314,6 +359,40 @@ class DiscourseCollector:
                     chunks.append(chunk)
                 return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
         return await asyncio.wait_for(read(), timeout=self.config.timeout_seconds)
+
+    async def _reddit_bearer(self, now: datetime) -> str:
+        if self.config.reddit_access_token:
+            return self.config.reddit_access_token
+        if self._reddit_token and self._reddit_token_expires_at and now < self._reddit_token_expires_at:
+            return self._reddit_token
+        if not self.config.reddit_client_id:
+            return ""
+        data = {"grant_type": "refresh_token", "refresh_token": self.config.reddit_refresh_token} if self.config.reddit_refresh_token else {
+            "grant_type": "client_credentials", "scope": "read",
+        }
+        response = json.loads(await self._request("POST", "https://www.reddit.com/api/v1/access_token",
+            data=data, auth=httpx.BasicAuth(self.config.reddit_client_id, self.config.reddit_client_secret)))
+        if not isinstance(response, dict):
+            raise ValueError("Reddit OAuth token response is invalid")
+        token = response.get("access_token")
+        scope = str(response.get("scope") or "").split()
+        if not isinstance(token, str) or not token or any(character.isspace() for character in token):
+            raise ValueError("Reddit OAuth did not return a valid access token")
+        if str(response.get("token_type", "")).casefold() != "bearer" or scope and not {"read", "*"}.intersection(scope):
+            raise ValueError("Reddit OAuth token lacks read permission")
+        try:
+            seconds = float(response.get("expires_in", 3600))
+        except (ValueError, TypeError):
+            raise ValueError("Reddit OAuth token expiry is invalid") from None
+        if not math.isfinite(seconds) or not 0 < seconds <= 86400:
+            raise ValueError("Reddit OAuth token expiry is invalid")
+        self._reddit_token, self._reddit_token_expires_at = token, now + timedelta(seconds=max(0, seconds - 60))
+        return token
+
+    async def _reddit_get(self, path: str, token: str, *, params: dict) -> str:
+        host = "https://oauth.reddit.com" if token else "https://www.reddit.com"
+        headers = {"Authorization": "bearer " + token} if token else None
+        return await self._get(host + path, params=params, headers=headers)
 
     def _evidence(self, *, kind: str, url: str, origin: str, title: str, text: str,
                   text_kind: str, companies: Sequence[CompanyWatch], now: datetime,
@@ -358,10 +437,11 @@ class DiscourseCollector:
         records = self._completed_records
         coverage = self._completed_coverage
         now = datetime.now(UTC)
+        query_suffix = " IPO" if self.config.news_query_mode == "ipo" else ""
         feeds = list(dict.fromkeys(self.config.feed_urls))
         if self.config.company_news_enabled:
             feeds.extend("https://news.google.com/rss/search?" + urlencode({
-                "q": f'"{company.query_name}" IPO when:{self.config.lookback_days}d',
+                "q": f'"{company.query_name}"{query_suffix} when:{self.config.lookback_days}d',
                 "hl": "en-US", "gl": "US", "ceid": "US:en",
             }) for company in companies)
         for feed in dict.fromkeys(feeds):
@@ -379,23 +459,31 @@ class DiscourseCollector:
                 coverage.append(SourceCoverage("news_rss", feed, now, "error", error=_error(exc)))
             self._checkpoint(records, coverage)
             self._active_source = None
-        if self.config.reddit_enabled:
-            for company in companies:
-                url = "https://www.reddit.com/search.json?" + urlencode({
-                    "q": f'"{company.query_name}"', "sort": "new", "t": "month",
-                    "limit": self.config.max_items_per_source,
-                })
-                self._active_source = ("reddit", url, now)
+        if self.config.forums_enabled:
+            if not self.config.forum_feed_urls:
+                coverage.append(SourceCoverage("forum_rss", "", now, "disabled", limitations=(
+                    "No forum feed URLs configured; Hacker News and Reddit have separate coverage",)))
+                self._checkpoint(records, coverage)
+            for feed in dict.fromkeys(self.config.forum_feed_urls):
+                self._active_source = ("forum_rss", feed, now)
                 try:
-                    items = self._parse_reddit(json.loads(await self._get(url)), companies, now)
+                    content = await self._get(feed)
+                    items = self._parse_feed(content, feed, companies, now, forum=True)
                     records.extend(items)
-                    coverage.append(SourceCoverage("reddit", url, now, "ok", len(items), limitations=(
-                        "Public search posts only; comments and private communities are not sampled",
-                        "Self-selected communities; engagement counts are ignored",)))
+                    root = _xml(content)
+                    available = len(root.findall(".//item") or root.findall("{http://www.w3.org/2005/Atom}entry"))
+                    coverage.append(SourceCoverage("forum_rss", feed, now, "ok", len(items), limitations=(
+                        f"Inspected at most {self.config.max_items_per_source} of {available} configured forum feed entries; no complete thread traversal",
+                        "Forum/community and author self-selection bias; quoted text can be misattributed; popularity ignored",)))
                 except Exception as exc:
-                    coverage.append(SourceCoverage("reddit", url, now, "error", error=_error(exc)))
+                    coverage.append(SourceCoverage("forum_rss", feed, now, "error", error=_error(exc)))
                 self._checkpoint(records, coverage)
                 self._active_source = None
+        else:
+            coverage.append(SourceCoverage("forum_rss", "", now, "disabled"))
+            self._checkpoint(records, coverage)
+        if self.config.reddit_enabled:
+            await self._collect_reddit(companies, records, coverage, now)
         else:
             coverage.append(SourceCoverage("reddit", "https://www.reddit.com", now, "disabled"))
             self._checkpoint(records, coverage)
@@ -434,13 +522,13 @@ class DiscourseCollector:
                     "YouTube discovery is capped per run and rotates companies by UTC hour to limit API quota use",)))
                 self._checkpoint(records, coverage)
             for company in search_companies:
-                search_url = "https://www.youtube.com/results?" + urlencode({"search_query": company.query_name + " IPO"})
+                search_url = "https://www.youtube.com/results?" + urlencode({"search_query": company.query_name + query_suffix})
                 self._active_source = ("youtube_search", search_url, now)
                 try:
                     # Publish time is explicitly bounded; ranking is not representative sampling.
                     since = now.replace(microsecond=0) - timedelta(days=self.config.lookback_days)
                     result = json.loads(await self._get("https://www.googleapis.com/youtube/v3/search", params={
-                        "part": "snippet", "type": "video", "q": company.query_name + " IPO",
+                        "part": "snippet", "type": "video", "q": company.query_name + query_suffix,
                         "order": "date", "publishedAfter": since.isoformat().replace("+00:00", "Z"),
                         "maxResults": self.config.youtube_search_per_company,
                         "key": self.config.youtube_api_key,
@@ -485,8 +573,71 @@ class DiscourseCollector:
         self.partial_batch = DiscourseBatch(tuple(unique.values()), tuple(coverage))
         return self.partial_batch
 
+    async def _collect_reddit(self, companies: Sequence[CompanyWatch], records: list[DiscourseEvidence],
+                              coverage: list[SourceCoverage], now: datetime) -> None:
+        self._active_source = ("reddit_oauth", "https://www.reddit.com/api/v1/access_token", now)
+        try:
+            token = await self._reddit_bearer(now)
+        except Exception as exc:
+            coverage.append(SourceCoverage("reddit_oauth", "https://www.reddit.com/api/v1/access_token", now,
+                "error", error=_error(exc), limitations=("OAuth failed; anonymous fallback and permission bypass are not attempted",)))
+            self._checkpoint(records, coverage)
+            self._active_source = None
+            return
+        host = "https://oauth.reddit.com" if token else "https://www.reddit.com"
+        comment_budget = self.config.reddit_max_comments_per_run
+        seen_posts: set[str] = set()
+        for company in companies:
+            params = {"q": f'"{company.query_name}"', "sort": "new", "t": "month",
+                      "limit": self.config.max_items_per_source, "raw_json": 1}
+            url = host + "/search.json?" + urlencode(params)
+            self._active_source = ("reddit", url, now)
+            try:
+                items = self._parse_reddit(json.loads(await self._reddit_get("/search.json", token, params=params)), companies, now)
+                records.extend(items)
+                coverage.append(SourceCoverage("reddit", url, now, "ok", len(items), limitations=(
+                    "Approved OAuth read endpoint" if token else "Approved OAuth is not configured; only public JSON access is attempted and may be blocked",
+                    f"One date-sorted public post page; comments sampled for at most {self.config.reddit_posts_per_company} matched posts per company",
+                    "Community/author self-selection and topic selection bias; votes and popularity are ignored",)))
+            except Exception as exc:
+                coverage.append(SourceCoverage("reddit", url, now, "error", error=_error(exc), limitations=(
+                    "Approved OAuth credentials are needed when public JSON access is denied; no bypass is attempted",)))
+                self._checkpoint(records, coverage)
+                self._active_source = None
+                continue
+            self._checkpoint(records, coverage)
+            for post in items[:self.config.reddit_posts_per_company]:
+                match = re.search(r"/comments/([A-Za-z0-9]+)(?:/|$)", urlsplit(post.source_url).path)
+                if not match or match.group(1) in seen_posts:
+                    continue
+                identifier = match.group(1)
+                seen_posts.add(identifier)
+                limit = min(self.config.reddit_comments_per_post, comment_budget)
+                if not limit:
+                    continue
+                # Failed reads consume the same budget, keeping total work bounded.
+                comment_budget -= limit
+                path = "/comments/" + identifier + ".json"
+                comment_params = {"limit": limit, "depth": 2, "sort": "new", "raw_json": 1}
+                comment_url = host + path + "?" + urlencode(comment_params)
+                self._active_source = ("reddit_comments", comment_url, now)
+                try:
+                    payload = json.loads(await self._reddit_get(path, token, params=comment_params))
+                    comments = self._parse_reddit_comments(payload, post, companies, now, limit=limit)
+                    records.extend(comments)
+                    coverage.append(SourceCoverage("reddit_comments", comment_url, now, "ok", len(comments), limitations=(
+                        f"At most {limit} comments inspected, depth at most 2; morechildren and private threads are not fetched",
+                        "Newest-comment, community and author selection bias; quoted opinions may be misattributed",)))
+                except Exception as exc:
+                    coverage.append(SourceCoverage("reddit_comments", comment_url, now, "error", error=_error(exc)))
+                self._checkpoint(records, coverage)
+            self._active_source = None
+        coverage.append(SourceCoverage("reddit_comment_budget", "https://www.reddit.com", now, "ok", limitations=(
+            f"Comment reads requested up to {self.config.reddit_max_comments_per_run - comment_budget} of {self.config.reddit_max_comments_per_run} allowed comments; unselected posts/threads are not sampled",)))
+        self._checkpoint(records, coverage)
+
     def _parse_feed(self, content: str, feed_url: str, companies: Sequence[CompanyWatch],
-                    now: datetime) -> list[DiscourseEvidence]:
+                    now: datetime, *, forum: bool = False) -> list[DiscourseEvidence]:
         root = _xml(content)
         items = root.findall(".//item")
         if not items:
@@ -505,11 +656,19 @@ class DiscourseCollector:
                 source = fields.get("source")
                 publisher_url = source.get("url", "") if source is not None else ""
                 origin = urlsplit(publisher_url or url).hostname or urlsplit(feed_url).hostname or "unknown"
-                record = self._evidence(kind="news", url=url, origin="news:" + origin.lower(),
+                author = get("creator") or get("author")
+                if "author" in fields and list(fields["author"]):
+                    author = " ".join(node.text or "" for node in fields["author"] if node.tag.split("}")[-1] == "name")
+                author = plain_text(author, 100) if author and "@" not in author else None
+                origin_key = ("forum:" if forum else "news:") + origin.lower()
+                if forum and author:
+                    origin_key += ":author:" + author.casefold()
+                record = self._evidence(kind="forum" if forum else "news", url=url, origin=origin_key,
                     title=title, text=get("description") or get("summary") or get("content"),
-                    text_kind="publisher_summary", companies=companies, now=now,
+                    text_kind="forum_post" if forum else "publisher_summary", companies=companies, now=now,
                     published_at=_date(get("pubDate") or get("published") or get("updated")),
-                    flags=("editorial_selection", "summary_only"))
+                    author=author if forum else None, language=None if forum else "en",
+                    flags=("community_selection", "author_self_selection", "quoted_opinions_possible", "feed_summary_only", "unverified_claims") if forum else ("editorial_selection", "summary_only"))
                 if record:
                     results.append(record)
             except ValueError:
@@ -518,29 +677,95 @@ class DiscourseCollector:
 
     def _parse_reddit(self, content: dict, companies: Sequence[CompanyWatch],
                       now: datetime) -> list[DiscourseEvidence]:
-        children = content.get("data", {}).get("children")
+        if not isinstance(content, dict) or not isinstance(content.get("data"), dict):
+            raise ValueError("Expected a Reddit search listing")
+        children = content["data"].get("children")
         if not isinstance(children, list):
             raise ValueError("Expected a Reddit search listing")
         results = []
         for child in children[:self.config.max_items_per_source]:
+            if not isinstance(child, dict):
+                continue
+            if child.get("kind") not in {None, "t3"}:
+                continue
             row = child.get("data", {})
+            if not isinstance(row, dict) or row.get("subreddit_type") == "private":
+                continue
             permalink = row.get("permalink", "")
-            if not permalink.startswith("/r/") or row.get("removed_by_category"):
+            if not isinstance(permalink, str) or not permalink.startswith("/r/") or row.get("removed_by_category"):
                 continue
             text = row.get("selftext") or ""
             if text in {"[removed]", "[deleted]"}:
                 continue
             try:
                 published = datetime.fromtimestamp(float(row["created_utc"]), UTC) if row.get("created_utc") else None
+                author = row.get("author")
+                author = author if isinstance(author, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", author) else None
                 record = self._evidence(kind="reddit", url="https://www.reddit.com" + permalink,
-                    origin="reddit:" + str(row.get("subreddit", "unknown")).casefold(),
+                    origin="reddit:author:" + author.casefold() if author else "reddit:" + str(row.get("subreddit", "unknown")).casefold(),
                     title=str(row.get("title", "")), text=str(text), text_kind="public_post",
                     companies=companies, now=now, published_at=published,
-                    author=None, language=None, flags=("self_selection", "unverified_claims"))
+                    author=author, language=None, flags=("self_selection", "community_selection", "unverified_claims"))
                 if record:
                     results.append(record)
             except (TypeError, ValueError, OverflowError, OSError):
                 continue
+        return results
+
+    def _parse_reddit_comments(self, content: list, post: DiscourseEvidence,
+                               companies: Sequence[CompanyWatch], now: datetime,
+                               *, limit: int) -> list[DiscourseEvidence]:
+        if not isinstance(content, list) or len(content) < 2 or not isinstance(content[1], dict):
+            raise ValueError("Expected a Reddit public comment listing")
+        if isinstance(content[0], dict):
+            posts = content[0].get("data", {}).get("children", [])
+            if isinstance(posts, list) and any(isinstance(item, dict) and isinstance(item.get("data"), dict)
+                and item["data"].get("subreddit_type") == "private" for item in posts):
+                raise ValueError("Private Reddit threads are excluded")
+        children = content[1].get("data", {}).get("children")
+        if not isinstance(children, list):
+            raise ValueError("Expected Reddit comment children")
+        results: list[DiscourseEvidence] = []
+        pending = [(child, 0) for child in reversed(children[:limit])]
+        inspected = 0
+        while pending and inspected < limit:
+            child, depth = pending.pop()
+            if not isinstance(child, dict) or child.get("kind") != "t1":
+                continue
+            inspected += 1
+            row = child.get("data", {})
+            if not isinstance(row, dict) or row.get("subreddit_type") == "private":
+                continue
+            body = row.get("body") or ""
+            if not isinstance(body, str):
+                continue
+            identifier = str(row.get("id", ""))
+            if body in {"[deleted]", "[removed]"} or row.get("removed_by_category") or not re.fullmatch(r"[A-Za-z0-9]{1,20}", identifier):
+                continue
+            replies = row.get("replies")
+            if depth < 2 and isinstance(replies, dict):
+                nested = replies.get("data", {}).get("children", [])
+                if isinstance(nested, list):
+                    pending.extend((reply, depth + 1) for reply in reversed(nested[:limit]))
+            author = row.get("author")
+            author = author if isinstance(author, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", author) else None
+            try:
+                published = datetime.fromtimestamp(float(row["created_utc"]), UTC) if row.get("created_utc") else None
+            except (TypeError, ValueError, OverflowError, OSError):
+                published = None
+            # Require company mention in comment itself. Thread headlines alone
+            # must not attribute unrelated replies to a company's sentiment.
+            names = matching_companies(plain_text(str(body)), companies)
+            if not names:
+                continue
+            url = post.source_url.rstrip("/") + "/" + identifier + "/"
+            record = self._evidence(kind="reddit", url=url,
+                origin="reddit:author:" + author.casefold() if author else post.origin_key,
+                title="Reddit company discussion: " + ", ".join(names), text=str(body), text_kind="public_comment", companies=companies,
+                now=now, published_at=published, author=author, language=None,
+                flags=("community_selection", "author_self_selection", "quoted_opinions_possible", "unverified_claims"))
+            if record:
+                results.append(record)
         return results
 
     def _parse_hackernews(self, content: dict, companies: Sequence[CompanyWatch],
