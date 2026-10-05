@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import math
 from urllib.parse import urlparse
 
 from .models import ContractEvidence, ListingRoute, ListingSignal, MarketSnapshot, ValidationResult
@@ -10,7 +11,16 @@ class ContractValidator:
     REJECTED_STATUSES = {"solicitation", "presolicitation", "sources_sought", "rfi", "rfq", "rfp", "cancelled", "rescinded", "deleted"}
     REJECTED_TYPES = {"grant", "loan", "subsidy", "vendor_registration", "forecast"}
 
+    def __init__(self, *, now: datetime | None = None):
+        self.now = now or datetime.now(UTC)
+
     def validate(self, evidence: ContractEvidence) -> ValidationResult:
+        if evidence.retrieved_at.tzinfo is None or (evidence.published_at is not None and evidence.published_at.tzinfo is None):
+            return ValidationResult(passed=False, code="invalid_contract_timestamp", reason="Contract evidence timestamps require a timezone.")
+        if evidence.award_date > self.now.date() or evidence.retrieved_at > self.now + timedelta(minutes=5) or (evidence.published_at is not None and evidence.published_at > self.now + timedelta(minutes=5)):
+            return ValidationResult(passed=False, code="future_contract_evidence", reason="Contract evidence is dated in the future.")
+        if any(value is not None and not math.isfinite(value) for value in (evidence.obligated_amount, evidence.current_value, evidence.ceiling_amount)):
+            return ValidationResult(passed=False, code="invalid_contract_amount", reason="Contract amounts must be finite numbers.")
         status = evidence.status.strip().lower().replace(" ", "_")
         award_type = evidence.award_type.strip().lower().replace(" ", "_")
         if evidence.cancelled or evidence.deleted or status in self.REJECTED_STATUSES:
@@ -19,10 +29,10 @@ class ContractValidator:
             return ValidationResult(passed=False, code="excluded_award_type", reason=f"{award_type} is outside the contract-only scope.")
         if not evidence.award_id or not evidence.recipient_name or not evidence.agency:
             return ValidationResult(passed=False, code="missing_contract_identity", reason="Official award identifier, recipient, and agency are required.")
-        if evidence.evidence_class.value == "B":
-            host = (urlparse(evidence.source_url).hostname or "").lower()
-            if not evidence.source_url.lower().startswith("https://") or not (host.endswith(".gov") or host.endswith(".us")):
-                return ValidationResult(passed=False, code="weak_documentary_source", reason="Class B evidence must be hosted on an official HTTPS government domain.")
+        source = urlparse(evidence.source_url)
+        host = (source.hostname or "").lower()
+        if source.scheme != "https" or source.username or source.password or not host.endswith(".gov"):
+            return ValidationResult(passed=False, code="weak_documentary_source", reason="Contract evidence must be hosted on an official HTTPS government domain.")
         if "idv" in award_type and (evidence.obligated_amount or 0) <= 0 and (evidence.current_value or 0) <= 0:
             return ValidationResult(passed=False, code="unfunded_idv", reason="An IDV requires a funded task/order before alerting.")
         if not evidence.prime:
@@ -40,6 +50,10 @@ class ListingValidator:
         self.now = now or datetime.now(UTC)
 
     def validate(self, signal: ListingSignal) -> ValidationResult:
+        if signal.filed_at.tzinfo is None:
+            return ValidationResult(passed=False, code="invalid_listing_timestamp", reason="Listing filing timestamp requires a timezone.")
+        if signal.filed_at > self.now + timedelta(minutes=5):
+            return ValidationResult(passed=False, code="future_listing_signal", reason="Listing signal is dated in the future.")
         if not signal.active or signal.status.lower() in {"withdrawn", "terminated", "abandoned", "rejected", "closed"}:
             return ValidationResult(passed=False, code="inactive_listing_signal", reason=f"Listing signal is {signal.status}.")
         if self.now - signal.filed_at > timedelta(days=365):
@@ -51,7 +65,7 @@ class ListingValidator:
             return ValidationResult(passed=True, code="primary_sec_registration", reason="Active initial-listing registration statement.")
 
         if signal.route == ListingRoute.REG_A:
-            if signal.form_type != "1-A" or not signal.intends_public_trading:
+            if signal.form_type not in {"1-A", "1-A/A"} or not signal.intends_public_trading:
                 return ValidationResult(passed=False, code="reg_a_not_public_listing", reason="Form 1-A does not state an intended publicly traded security.")
             return ValidationResult(passed=True, code="primary_reg_a", reason="Active Regulation A public-listing offering statement.")
 
@@ -65,7 +79,7 @@ class ListingValidator:
                 bool(signal.named_underwriter),
                 bool(signal.expected_exchange),
                 bool(signal.listing_application_announced),
-                bool(signal.expected_window_end and signal.expected_window_end <= (self.now + timedelta(days=180)).date()),
+                bool(signal.expected_window_end and self.now.date() <= signal.expected_window_end <= (self.now + timedelta(days=180)).date()),
                 bool(signal.executed_listing_or_underwriting_agreement),
             ]
             if sum(factors) < 2:
@@ -88,19 +102,52 @@ class SmallCompanyValidator:
         if signal.ticker:
             if market is None:
                 return ValidationResult(passed=False, code="missing_market_data", reason="Public candidate requires lawful current price and market-cap evidence.")
+            if market.symbol.strip().upper() != signal.ticker.strip().upper():
+                return ValidationResult(passed=False, code="market_symbol_mismatch", reason="Market quote belongs to a different ticker.")
+            if market.quote_at.tzinfo is None or market.quote_at > self.now + timedelta(minutes=5):
+                return ValidationResult(passed=False, code="invalid_market_timestamp", reason="Market quote must have a timezone and cannot be in the future.")
+            if not math.isfinite(market.price) or market.price <= 0 or (market.market_cap is not None and (not math.isfinite(market.market_cap) or market.market_cap <= 0)):
+                return ValidationResult(passed=False, code="invalid_market_numbers", reason="Price and market capitalization must be finite positive numbers.")
             if self.now - market.quote_at > self.max_quote_age:
                 return ValidationResult(passed=False, code="stale_market_data", reason="Market quote is older than the configured maximum staleness.")
             if market.price >= self.max_price:
                 return ValidationResult(passed=False, code="price_too_high", reason=f"Share price ${market.price:.2f} is not below ${self.max_price:.2f}.")
             if market.market_cap is None or market.market_cap >= self.max_market_cap:
-                return ValidationResult(passed=False, code="market_cap_too_high_or_missing", reason="Market capitalization is missing or not below $300 million.")
-            return ValidationResult(passed=True, code="public_small_company", reason="Fresh quote is below both price and market-cap thresholds.")
+                return ValidationResult(
+                    passed=False,
+                    code="market_cap_too_high_or_missing",
+                    reason=f"Market capitalization is missing or not below ${self.max_market_cap:,.0f}.",
+                )
+            return ValidationResult(passed=True, code="public_small_company", reason="Fresh quote is below both configured price and market-cap thresholds.")
 
-        proxies = [value for value in (signal.proposed_valuation, signal.max_offering_size, signal.transaction_value) if value is not None]
-        if not proxies:
-            return ValidationResult(passed=False, code="missing_private_valuation", reason="Private candidate lacks a primary-source valuation or offering-size proxy.")
-        if min(proxies) >= self.max_market_cap:
-            return ValidationResult(passed=False, code="private_valuation_too_high", reason="Available valuation/offering proxy is not below $300 million.")
+        proxy_name: str | None = None
+        proxy_value: float | None = None
+        if any(value is not None and (not math.isfinite(value) or value <= 0) for value in (signal.proposed_valuation, signal.max_offering_size, signal.transaction_value, signal.proposed_price)):
+            return ValidationResult(passed=False, code="invalid_private_numbers", reason="Disclosed valuation, offering size, and proposed price must be finite positive numbers.")
+        if signal.proposed_valuation is not None:
+            proxy_name, proxy_value = "proposed valuation", signal.proposed_valuation
+        elif signal.transaction_value is not None:
+            proxy_name, proxy_value = "transaction value", signal.transaction_value
+        elif signal.max_offering_size is not None:
+            proxy_name, proxy_value = "maximum offering size", signal.max_offering_size
+
+        if proxy_value is None:
+            return ValidationResult(passed=False, code="missing_private_valuation", reason="Private candidate lacks a primary-source valuation, transaction value, or offering-size proxy.")
+        if proxy_value >= self.max_market_cap:
+            return ValidationResult(
+                passed=False,
+                code="private_valuation_too_high",
+                reason=f"Primary-source {proxy_name} of ${proxy_value:,.0f} is not below ${self.max_market_cap:,.0f}.",
+            )
         if signal.proposed_price is not None and signal.proposed_price >= self.max_price:
-            return ValidationResult(passed=False, code="proposed_price_too_high", reason="Disclosed proposed share price is not below $5.")
-        return ValidationResult(passed=True, code="private_small_company", reason="Primary filing supports a sub-$300 million valuation/offering proxy.")
+            return ValidationResult(
+                passed=False,
+                code="proposed_price_too_high",
+                reason=f"Disclosed proposed share price ${signal.proposed_price:.2f} is not below ${self.max_price:.2f}.",
+            )
+        return ValidationResult(
+            passed=True,
+            code="private_small_company",
+            reason=f"Primary filing {proxy_name} is below the configured ${self.max_market_cap:,.0f} threshold.",
+            details={"proxy_name": proxy_name, "proxy_value": proxy_value},
+        )

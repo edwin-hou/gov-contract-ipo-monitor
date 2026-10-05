@@ -7,11 +7,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 jobs:
   publish:
+    concurrency:
+      group: container-publication
+      cancel-in-progress: false
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
@@ -60,9 +63,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin main
-          git checkout main
-          git pull --ff-only origin main
           mkdir -p deployments
           python - <<'PY'
           import json
@@ -81,8 +81,9 @@ jobs:
               json.dumps(record, indent=2) + "\n", encoding="utf-8"
           )
           PY
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deployments/container.json
-          git commit -m "chore: record container deployment"
-          git push origin main
+      - name: Save publication receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-publication
+          path: deployments/container.json
+          retention-days: 90

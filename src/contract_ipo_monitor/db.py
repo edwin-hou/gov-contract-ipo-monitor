@@ -6,6 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -55,12 +56,22 @@ class InsertResult:
     row_id: int | None
 
 
+class ClosingConnection(sqlite3.Connection):
+    """SQLite's normal context manager commits but does not close its handle."""
+
+    def __exit__(self, *args: Any) -> bool:
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 class Database:
     def __init__(self, path: str | Path):
         self.path = str(path)
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None, factory=ClosingConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
@@ -70,7 +81,13 @@ class Database:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(outbox_messages)")}
+            for name in ("pending_recipients_json", "accepted_recipients_json", "correction_key"):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE outbox_messages ADD COLUMN {name} TEXT")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS outbox_correction_key ON outbox_messages(correction_key) WHERE correction_key IS NOT NULL")
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)", (datetime.now(UTC).isoformat(),))
+            conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?)", (datetime.now(UTC).isoformat(),))
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -80,7 +97,8 @@ class Database:
             yield conn
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -114,10 +132,15 @@ class Database:
 
     def save_evaluation(self, candidate: Candidate, decisions: Sequence[GateDecision], payload: AlertPayload | None, *, created_at: datetime) -> tuple[bool, bool]:
         with self.transaction() as conn:
+            if payload is not None and conn.execute("SELECT 1 FROM alerts WHERE fingerprint=?", (payload.fingerprint,)).fetchone():
+                return False, True
+            trace_fingerprint = payload.fingerprint if payload else self._candidate_trace_fingerprint(candidate, decisions)
+            if conn.execute("SELECT 1 FROM candidate_matches WHERE fingerprint=?", (trace_fingerprint,)).fetchone():
+                return False, False
             cursor = conn.execute(
                 "INSERT INTO candidate_matches(fingerprint, contract_json, listing_json, market_json, created_at) VALUES(?,?,?,?,?)",
                 (
-                    payload.fingerprint if payload else self._candidate_trace_fingerprint(candidate, created_at),
+                    trace_fingerprint,
                     _json(candidate.contract), _json(candidate.listing), _json(candidate.market) if candidate.market else None,
                     created_at.isoformat(),
                 ),
@@ -143,8 +166,11 @@ class Database:
             return True, False
 
     @staticmethod
-    def _candidate_trace_fingerprint(candidate: Candidate, created_at: datetime) -> str:
-        raw = f"rejected|{candidate.contract.award_id}|{candidate.listing.signal_id}|{created_at.isoformat()}"
+    def _candidate_trace_fingerprint(candidate: Candidate, decisions: Sequence[GateDecision]) -> str:
+        normalized = candidate.model_dump(mode="json")
+        normalized["contract"].pop("retrieved_at", None)
+        normalized["contract"].pop("published_at", None)
+        raw = _json({"candidate": normalized, "decisions": [item.model_dump(mode="json") for item in decisions]})
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def lease_outbox(self, *, now: datetime, lease_for: Any = None) -> dict[str, Any] | None:
@@ -156,8 +182,8 @@ class Database:
                 """
                 SELECT * FROM outbox_messages
                 WHERE status IN ('pending','leased')
-                  AND next_attempt_at <= ?
-                  AND (lease_until IS NULL OR lease_until <= ?)
+                  AND julianday(next_attempt_at) <= julianday(?)
+                  AND (lease_until IS NULL OR julianday(lease_until) <= julianday(?))
                 ORDER BY id LIMIT 1
                 """,
                 (now.isoformat(), now.isoformat()),
@@ -173,21 +199,24 @@ class Database:
             result["lease_until"] = lease_until.isoformat()
             return result
 
-    def mark_outbox_sent(self, message_id: int, *, sent_at: datetime, smtp_message_id: str | None) -> None:
-        with self.connect() as conn:
+    def mark_outbox_sent(self, message_id: int, *, sent_at: datetime, smtp_message_id: str | None, lease_until: str | None = None) -> None:
+        with self.transaction() as conn:
+            row = conn.execute("SELECT status, lease_until FROM outbox_messages WHERE id=?", (message_id,)).fetchone()
+            if row is None or row["status"] != "leased" or (lease_until is not None and row["lease_until"] != lease_until):
+                raise RuntimeError("outbox lease is no longer owned by this worker")
             conn.execute(
                 "UPDATE outbox_messages SET status='sent', sent_at=?, smtp_message_id=?, lease_until=NULL, last_error=NULL WHERE id=?",
                 (sent_at.isoformat(), smtp_message_id, message_id),
             )
             conn.execute(
-                "UPDATE alerts SET status='sent' WHERE id=(SELECT alert_id FROM outbox_messages WHERE id=?)",
+                "UPDATE alerts SET status='sent' WHERE status != 'corrected' AND id=(SELECT alert_id FROM outbox_messages WHERE id=?)",
                 (message_id,),
             )
 
-    def mark_outbox_failure(self, message_id: int, *, failed_at: datetime, error: str, max_attempts: int, next_attempt_at: datetime) -> bool:
+    def mark_outbox_failure(self, message_id: int, *, failed_at: datetime, error: str, max_attempts: int, next_attempt_at: datetime, lease_until: str | None = None, refused_recipients: Sequence[str] | None = None, accepted_recipients: Sequence[str] = ()) -> bool:
         with self.transaction() as conn:
-            row = conn.execute("SELECT attempts, subject, text_body FROM outbox_messages WHERE id=?", (message_id,)).fetchone()
-            if row is None:
+            row = conn.execute("SELECT * FROM outbox_messages WHERE id=?", (message_id,)).fetchone()
+            if row is None or row["status"] != "leased" or (lease_until is not None and row["lease_until"] != lease_until):
                 return False
             attempts = int(row["attempts"]) + 1
             dead = attempts >= max_attempts
@@ -196,6 +225,9 @@ class Database:
                 "UPDATE outbox_messages SET status=?, attempts=?, next_attempt_at=?, lease_until=NULL, last_error=? WHERE id=?",
                 (status, attempts, next_attempt_at.isoformat(), error[:2000], message_id),
             )
+            if refused_recipients is not None:
+                accepted = set(json.loads(row["accepted_recipients_json"] or "[]")) | set(accepted_recipients)
+                conn.execute("UPDATE outbox_messages SET pending_recipients_json=?, accepted_recipients_json=? WHERE id=?", (_json(list(refused_recipients)), _json(sorted(accepted)), message_id))
             if dead:
                 conn.execute(
                     "INSERT INTO dead_letters(component, source, external_id, payload_json, error, created_at) VALUES(?,?,?,?,?,?)",
@@ -203,19 +235,35 @@ class Database:
                 )
             return dead
 
-    def store_contract_evidence(self, evidence: Any, *, source_record_id: int | None = None, created_at: datetime) -> int:
+    def evidence_record_exists(self, table: str, source_record_id: int | None) -> bool:
+        if table not in {"contract_evidence", "listing_signals"}:
+            raise ValueError("unsupported evidence table")
         with self.connect() as conn:
+            return conn.execute(f"SELECT 1 FROM {table} WHERE source_record_id=?", (source_record_id,)).fetchone() is not None
+
+    def store_contract_evidence(self, evidence: Any, *, source_record_id: int | None = None, created_at: datetime) -> int:
+        with self.transaction() as conn:
+            if source_record_id is not None:
+                existing = conn.execute("SELECT id FROM contract_evidence WHERE source_record_id=?", (source_record_id,)).fetchone()
+                if existing:
+                    return int(existing["id"])
+            previous = conn.execute("SELECT id FROM contract_evidence WHERE json_extract(version_json, '$.source')=? AND json_extract(version_json, '$.source_record_id')=? ORDER BY id DESC LIMIT 1", (evidence.source, evidence.source_record_id)).fetchone()
             cursor = conn.execute(
-                "INSERT INTO contract_evidence(source_record_id, award_id, version_json, created_at) VALUES(?,?,?,?)",
-                (source_record_id, evidence.award_id, _json(evidence), created_at.isoformat()),
+                "INSERT INTO contract_evidence(source_record_id, award_id, version_json, created_at, supersedes_id) VALUES(?,?,?,?,?)",
+                (source_record_id, evidence.award_id, _json(evidence), created_at.isoformat(), previous["id"] if previous else None),
             )
             return int(cursor.lastrowid)
 
     def store_listing_signal(self, signal: Any, *, source_record_id: int | None = None, created_at: datetime) -> int:
-        with self.connect() as conn:
+        with self.transaction() as conn:
+            if source_record_id is not None:
+                existing = conn.execute("SELECT id FROM listing_signals WHERE source_record_id=?", (source_record_id,)).fetchone()
+                if existing:
+                    return int(existing["id"])
+            previous = conn.execute("SELECT id FROM listing_signals WHERE signal_id=? AND json_extract(version_json, '$.source')=? ORDER BY id DESC LIMIT 1", (signal.signal_id, signal.source)).fetchone()
             cursor = conn.execute(
-                "INSERT INTO listing_signals(source_record_id, signal_id, version_json, created_at) VALUES(?,?,?,?)",
-                (source_record_id, signal.signal_id, _json(signal), created_at.isoformat()),
+                "INSERT INTO listing_signals(source_record_id, signal_id, version_json, created_at, supersedes_id) VALUES(?,?,?,?,?)",
+                (source_record_id, signal.signal_id, _json(signal), created_at.isoformat(), previous["id"] if previous else None),
             )
             return int(cursor.lastrowid)
 
@@ -227,13 +275,23 @@ class Database:
         result: list[Any] = []
         for row in rows:
             item = ContractEvidence.model_validate_json(row["version_json"])
-            key = (item.award_id, item.modification_number)
+            key = (item.source, item.source_record_id)
             if key not in seen:
                 seen.add(key)
                 result.append(item)
-        return result
+        latest: dict[str, Any] = {}
+        for item in result:
+            previous = latest.get(item.award_id)
+            if previous is None or (item.published_at or item.retrieved_at) > (previous.published_at or previous.retrieved_at):
+                latest[item.award_id] = item
+        cancelled_awards = {key for key, item in latest.items() if item.cancelled or item.status.strip().lower() in {"cancelled", "rescinded"}}
+        return [item for item in result if item.award_id not in cancelled_awards or item.cancelled or item.deleted or item.status.strip().lower() in {"cancelled", "deleted", "rescinded"}]
 
     def load_listing_signals(self) -> list[Any]:
+        result = self.all_listing_signals()
+        return [item for item in result if not any(self.listing_is_superseded(item, other) for other in result)]
+
+    def all_listing_signals(self) -> list[Any]:
         from .models import ListingSignal
         with self.connect() as conn:
             rows = conn.execute("SELECT version_json FROM listing_signals ORDER BY id DESC").fetchall()
@@ -246,8 +304,17 @@ class Database:
                 result.append(item)
         return result
 
-    def enqueue_correction(self, *, signal_id: str | None = None, award_id: str | None = None, company_name: str | None = None, reason: str, source_url: str, created_at: datetime) -> int:
-        if not signal_id and not award_id and not company_name:
+    @staticmethod
+    def listing_is_superseded(item: Any, other: Any) -> bool:
+        inactive = not other.active or other.status.strip().lower() in {"withdrawn", "terminated", "abandoned", "rejected", "closed"}
+        if not inactive or not item.active or other.filed_at < item.filed_at:
+            return False
+        if other.related_signal_id == item.signal_id:
+            return True
+        return bool(other.cik and item.cik and other.cik.lstrip("0") == item.cik.lstrip("0") and other.registration_id and other.registration_id == item.registration_id)
+
+    def enqueue_correction(self, *, signal_id: str | None = None, award_id: str | None = None, company_name: str | None = None, contract_record_id: str | None = None, contract_source: str | None = None, reason: str, source_url: str, created_at: datetime) -> int:
+        if not signal_id and not award_id:
             return 0
         with self.transaction() as conn:
             clauses: list[str] = []
@@ -261,11 +328,14 @@ class Database:
             if company_name:
                 clauses.append("company_name=?")
                 params.append(company_name)
-            rows = conn.execute(f"SELECT * FROM alerts WHERE {' OR '.join(clauses)}", params).fetchall()
+            if contract_record_id is not None:
+                clauses.append("EXISTS (SELECT 1 FROM candidate_matches AS cm WHERE cm.fingerprint=alerts.fingerprint AND json_extract(cm.contract_json, '$.source_record_id')=? AND json_extract(cm.contract_json, '$.source')=?)")
+                params.extend((contract_record_id, contract_source))
+            rows = conn.execute(f"SELECT * FROM alerts WHERE {' AND '.join(clauses)}", params).fetchall()
             inserted = 0
             for row in rows:
-                marker = f"correction:{row['id']}:{reason}:{source_url}"
-                duplicate = conn.execute("SELECT 1 FROM outbox_messages WHERE text_body LIKE ?", (f"%{marker}%",)).fetchone()
+                marker = hashlib.sha256(_json([row["id"], reason, source_url]).encode()).hexdigest()
+                duplicate = conn.execute("SELECT 1 FROM outbox_messages WHERE correction_key=?", (marker,)).fetchone()
                 if duplicate:
                     continue
                 subject = f"[CORRECTION] {row['subject']}"
@@ -276,9 +346,10 @@ class Database:
                     f"Internal marker: {marker}"
                 )
                 conn.execute(
-                    "INSERT INTO outbox_messages(alert_id, subject, text_body, html_body, next_attempt_at, created_at) VALUES(?,?,?,?,?,?)",
-                    (row["id"], subject, body, f"<html><body><pre>{body}</pre></body></html>", created_at.isoformat(), created_at.isoformat()),
+                    "INSERT INTO outbox_messages(alert_id, subject, text_body, html_body, next_attempt_at, created_at, correction_key) VALUES(?,?,?,?,?,?,?)",
+                    (row["id"], subject, body, f"<html><body><pre>{escape(body)}</pre></body></html>", created_at.isoformat(), created_at.isoformat(), marker),
                 )
+                conn.execute("UPDATE outbox_messages SET status='cancelled', lease_until=NULL WHERE alert_id=? AND correction_key IS NULL AND status='pending'", (row["id"],))
                 conn.execute("UPDATE alerts SET status='corrected' WHERE id=?", (row["id"],))
                 inserted += 1
             return inserted

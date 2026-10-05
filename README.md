@@ -1,163 +1,86 @@
-# Government Contract + Near-Term IPO Monitor
+# IPO and Online Sentiment Monitor
 
-A fail-closed Python service that sends an email only when it can substantiate **both**:
+Tracks company IPO evidence across company sizes, samples public internet commentary, and includes government contracts as supplementary evidence. Government awards and penny-stock thresholds are **not required** for the broad IPO tracker.
 
-1. a small company received an actual government contract, and
-2. that same legal entity has a high-confidence near-term U.S. public-listing path.
+The original contract-qualified email route is retained as an optional feature. No trading or automatic investment decisions are implemented.
 
-The monitor is designed for speed without treating solicitations, corporate press releases, rumors, fuzzy-name matches, or unfunded contract vehicles as investable events.
+## What it tracks
 
-> Research tool only. This project does not place trades, recommend securities, or predict returns. Penny stocks, shells, SPAC transactions, and pre-IPO offerings can be illiquid, highly dilutive, manipulated, or lost entirely.
+- **SEC IPO evidence:** S-1/F-1/S-11 registrations and amendments, relevant Reg A and transaction filings, EFFECT notices, final prospectuses, and withdrawals. A registration alone is not an IPO. Resale registrations and historical IPO references are rejected. Lifecycle changes are scoped to CIK plus SEC registration file number; effectiveness/prospectus filing never means trading has begun.
+- **Online discourse:** company IPO news RSS summaries, public Reddit search posts, configured YouTube videos, and optional API-based YouTube discovery. Accessible English caption text is analyzed when available. Video title/description alone is excluded from sentiment.
+- **Government contracts:** USAspending awards and optional SAM.gov reconciliation. Unsupported procurement sources and missing keys are disclosed, not presented as nationwide coverage.
+- **Sentiment and bias:** an auditable English lexicon, negation handling, content deduplication, equal weighting by origin and then platform, and flags for sponsorship, financial interests, hype, speculation, sparse evidence, and selection bias. Engagement counts do not increase credibility. Insufficient evidence is `unknown`.
 
-## What triggers an email
+Default research watchlist: Anduril, SpaceX, OpenAI, Anthropic, Databricks, and Stripe, plus recent active IPO issuers discovered from filings. Inclusion on the watchlist does not assert an IPO is planned. Configure `WATCH_COMPANIES` to change it.
 
-All four gates must pass in one durable database transaction:
+The supplied Anduril video, https://youtu.be/0BE2AAOlYWI, is a default seed. If captions cannot be retrieved, the report explicitly states that its spoken content was not analyzed. Optional `YOUTUBE_API_KEY` enables bounded discovery; official captions downloads for arbitrary third-party videos cannot be assumed available.
 
-- **Actual contract:** structured USAspending/SAM award evidence or qualifying official government award documentation.
-- **Deterministic entity match:** UEI, CAGE, exact official legal name plus address, or a primary-source corporate relationship. Fuzzy names alone never pass.
-- **Near-term listing:** active initial S-1/F-1, qualifying Form 1-A, definitive de-SPAC/reverse-merger agreement, or the approved Option B two-factor route with independent official corroboration.
-- **Small company:** public price under `$5` and market cap under `$300M`, or a private primary-filing valuation/offering proxy below `$300M`.
+## Run locally
 
-Withdrawals, terminations, cancelled contracts, and material corrections generate correction emails tied to the original alert.
-
-## Included collectors
-
-- SEC EDGAR current-filings Atom feeds and filing documents
-- SEC submissions API for official issuer business addresses
-- USAspending award search
-- SAM.gov Contract Awards, including deleted-contract reconciliation when a key is configured
-- Twelve Data quote/statistics enrichment when a free API key is configured
-- Explicit state/local adapter inventory and extension interface
-
-State and local procurement is fragmented. The first release does **not** claim nationwide-complete local coverage. Add only official, tested adapters and expose their status through the inventory command.
-
-## Install
-
-Python 3.12 or newer is required.
-
-```bash
-python -m venv .venv
-# Linux/macOS
-source .venv/bin/activate
-# Windows PowerShell
-# .venv\Scripts\Activate.ps1
-
-pip install -e ".[dev]"
-cp .env.example .env
-```
-
-Configure `.env`, then validate it:
-
-```bash
-gov-contract-ipo-monitor check-config
-gov-contract-ipo-monitor init-db
-gov-contract-ipo-monitor run-once
-gov-contract-ipo-monitor run
-```
-
-Health endpoints are available by default:
-
-- `GET /healthz` for liveness and component status
-- `GET /readyz` for readiness after the database, SEC, and USAspending collectors succeed
-
-## Required environment variables
-
-```dotenv
-SEC_USER_AGENT=GovContractIPOMonitor/0.1 contact@example.com
-SMTP_HOST=smtp.example.com
-SMTP_PORT=587
-SMTP_SECURITY=starttls
-SMTP_USERNAME=alerts@example.com
-SMTP_PASSWORD=app-password-or-token
-SMTP_SENDER=alerts@example.com
-SMTP_RECIPIENTS=investor@example.com
-```
-
-Optional:
-
-```dotenv
-SAM_API_KEY=
-TWELVE_DATA_API_KEY=
-DATABASE_PATH=data/monitor.db
-EVIDENCE_ARCHIVE_PATH=data/evidence
-SEC_INTERVAL_SECONDS=30
-USASPENDING_INTERVAL_SECONDS=300
-SAM_INTERVAL_SECONDS=21600
-SMTP_POLL_SECONDS=5
-MAX_PRICE=5
-MAX_MARKET_CAP=300000000
-QUOTE_MAX_AGE_HOURS=24
-HEALTH_HOST=0.0.0.0
-HEALTH_PORT=8080
-```
-
-The SEC user agent must include a real contact email. Never commit API keys or SMTP credentials.
-
-## Docker
-
-```bash
-cp .env.example .env
-# edit .env
-docker compose up --build -d
-docker compose logs -f monitor
-```
-
-SQLite and the evidence archive live in the persistent `monitor-data` volume.
-
-## Email contents
-
-Every confirmed alert includes:
-
-- company, CIK, ticker/venue, route, filing/accession, expected exchange and timing;
-- agency, award identifier, date, scope, obligation, current value, ceiling, term, and prime/subcontract status;
-- price and market-cap or private valuation evidence with timestamps;
-- obligation and ceiling relative to valuation and available revenue;
-- cancellation, IDIQ/option, concentration, execution, dilution, warrant, convertible, reverse-split, cash, debt, going-concern, auditor, reporting, liquidity, OTC, SPAC-redemption, and manipulation risks when available;
-- direct primary-source URLs and evidence timestamps;
-- an explicit research-only disclaimer.
-
-## Commands
-
-```bash
-gov-contract-ipo-monitor --help
-gov-contract-ipo-monitor check-config
-gov-contract-ipo-monitor init-db --database data/monitor.db
-gov-contract-ipo-monitor run-once
-gov-contract-ipo-monitor run
-gov-contract-ipo-monitor adapters
-```
-
-## Testing
-
-```bash
-pytest
-python -m compileall -q src
-```
-
-The test suite covers the four-gate invariant, adversarial near misses, deterministic resolution, stale quotes, resale registrations, withdrawals, corrections, deduplication, SQLite restart recovery, SMTP retries, official-source normalization, HTTP retry behavior, archive immutability, health checks, and CLI behavior.
-
-## Architecture
+Python 3.12+:
 
 ```text
-official contract sources --> immutable source records --> contract validation --+
-                                                                              |
-SEC/listing sources ------> immutable source records --> listing validation ---+--> deterministic entity match
-                                                                              |
-market data / filing facts ----------------------------------------------------+
-                                                                              v
-                                                               qualification + risk report
-                                                                              |
-                                                                         alert gate
-                                                                              |
-                                                                  durable SMTP outbox
+python -m venv .venv
+.venv\Scripts\python -m pip install -e ".[dev]"
 ```
 
-SQLite uses WAL mode. Raw source records are append-only and content-addressed evidence files are never overwritten. Derived records are versioned. SMTP acceptance is recorded separately from recipient inbox delivery.
+Copy `.env.example` to `.env`, identify a monitored SEC contact, and configure optional sources. SMTP is disabled by default; no email password is required to collect and review reports.
 
-## State/local adapters
+```text
+gov-contract-ipo-monitor check-config
+gov-contract-ipo-monitor run-once --report-dir data/reports --checkpoint data/checkpoint/monitor.db
+gov-contract-ipo-monitor status
+gov-contract-ipo-monitor report --output data/reports
+gov-contract-ipo-monitor run
+```
 
-See [`docs/state-local/README.md`](docs/state-local/README.md). An adapter must use an official source, identify an awarded contract rather than a solicitation, retain primary-source evidence, and pass the same validation gates as federal records.
+`run-once` writes `latest.md` and `latest.json`, saves a durable run receipt, and returns exit code 3 if the required SEC or USAspending collector is incomplete. Optional source gaps remain visible in a degraded report. A SQLite backup captures committed WAL data for recovery.
 
-## Design specification
+`run` polls configured sources continuously, publishes a report every minute, and serves:
 
-The approved design is in [`docs/superpowers/specs/2026-07-24-government-contract-ipo-monitor-design.md`](docs/superpowers/specs/2026-07-24-government-contract-ipo-monitor-design.md).
+- `/dashboard`: IPO evidence, sentiment samples, coverage, contract evaluations, and collection status.
+- `/api/ipos`, `/api/research`, `/api/collectors`, `/api/candidates`, `/api/rejections`, `/api/alerts`.
+- `/healthz`: liveness and component status; `/readyz`: required collectors have succeeded and remain fresh.
+
+The dashboard is intended for a trusted local/private environment. Bind `HEALTH_HOST=127.0.0.1` for local-only access. Do not expose the unauthenticated operational API publicly.
+
+## Hourly hosted job
+
+`.github/workflows/monitor.yml` runs at minute 17 of every hour, on relevant updates to `main`, and through **Run workflow**. GitHub scheduling can be delayed; this is not a real-time guarantee.
+
+Each job:
+
+1. Restores the newest retained `ipo-monitor-state` artifact from this workflow on `main`.
+2. Validates and restores only the expected SQLite file; corrupt checkpoints fail visibly.
+3. Collects evidence, records errors without erasing previous verified evidence, and writes a research report.
+4. Publishes the report to the Actions run summary and `ipo-monitor-report` artifact.
+5. Saves a consistent SQLite checkpoint as `ipo-monitor-state` for the next run, including runs with collection gaps.
+
+Jobs are serialized. Reports are retained for 30 days and checkpoints for 90 days. If all checkpoints expire or are deleted, collection history starts afresh and the restore step states this. Download a checkpoint for longer-term archival. GitHub may disable scheduled workflows after 60 days of repository inactivity; inspect the Actions workflow status if collection stops.
+
+Configure repository **Variables** for `SEC_USER_AGENT`, `WATCH_COMPANIES`, `YOUTUBE_VIDEO_URLS`, and `NEWS_FEED_URLS`. Configure optional **Secrets** for `YOUTUBE_API_KEY`, `SAM_API_KEY`, and `TWELVE_DATA_API_KEY`. The hosted job intentionally leaves SMTP disabled. No secrets are committed or written into reports.
+
+## Important limits
+
+SEC discovery currently samples bounded current-feed pages, with durable processed-accession receipts and explicit truncation errors. It covers U.S. public filings, not confidential submissions or every international exchange. A page-limit gap is not proof there are no other IPOs.
+
+News feeds are publisher summaries, Reddit communities are self-selected, and YouTube creators may have sponsorships or financial incentives. Blocked requests, missing English captions, source limits, stale items, and missing API keys are reported. This sample cannot represent all internet sentiment or validate an investment claim.
+
+USAspending is periodically refreshed with overlap and pagination protection; its award search does not expose every cancellation or older modification. SAM reconciliation requires a key. State/local coverage remains incomplete; see `docs/state-local/README.md`.
+
+## Optional contract-qualified email alerts
+
+Set `SMTP_ENABLED=true` and configure the SMTP fields to enable the existing durable outbox. This route requires actual award evidence, deterministic legal-entity identity, substantiated listing evidence, and the configured small-company thresholds (`MAX_PRICE`, `MAX_MARKET_CAP`, `QUOTE_MAX_AGE_HOURS`). These thresholds affect only contract-qualified emails, not the independent IPO tracker.
+
+Corrections cancel unsent originals and are tied to exact identity/evidence. Partial recipient acceptance is retained so only refused recipients are retried. SMTP acceptance is recorded separately from inbox delivery; SMTP cannot guarantee exactly-once delivery across a process crash after remote acceptance.
+
+## Verification
+
+```text
+python -m pytest
+python -m compileall -q src scripts
+```
+
+Tests cover IPO/resale discrimination, scoped lifecycle, large issuers, withdrawal suppression, API normalization/pagination, durable receipts/checkpoints, biased and duplicate discourse, unavailable captions, unsafe source URLs, retries, corrections, SMTP partial acceptance, dashboard/report status, and restart recovery.
+
+Container builds are published after CI. Publication receipts are saved as Actions artifacts rather than committing back to `main`, preventing recursive build workflows. `deployments/container.json` is a historical receipt, not proof of a running service.

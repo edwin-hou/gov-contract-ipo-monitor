@@ -38,11 +38,18 @@ class EntityResolver:
         if exact_name and exact_address:
             return EntityMatch(matched=True, method="name_address", explanation="Exact normalized legal name and address match.")
 
+        if exact_name and listing.linked_ueis:
+            return EntityMatch(
+                matched=True,
+                method="official_recipient_identity",
+                explanation="Exact normalized award-recipient/issuer legal name is independently anchored to a unique official USAspending UEI.",
+            )
+
         if listing.relationship_verified and contract.recipient_name.upper() in (listing.relationship_description or "").upper():
             return EntityMatch(matched=True, method="documented_relationship", explanation="Primary listing evidence documents the contractor-to-issuer relationship.")
 
         return EntityMatch(
             matched=False,
             method="none",
-            explanation="No deterministic identifier, exact name-and-address match, or documented corporate relationship.",
+            explanation="No deterministic identifier, exact official identity bridge, exact name-and-address match, or documented corporate relationship.",
         )

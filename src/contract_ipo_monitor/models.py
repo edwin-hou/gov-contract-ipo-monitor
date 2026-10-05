@@ -98,6 +98,7 @@ class ListingSignal(BaseModel):
     relationship_verified: bool = False
     relationship_description: str | None = None
     related_signal_id: str | None = None
+    registration_id: str | None = None
     risk_findings: tuple[str, ...] = ()
     raw_payload_hash: str | None = None
 

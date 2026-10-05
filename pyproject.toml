@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gov-contract-ipo-monitor"
-version = "0.1.0"
-description = "Evidence-gated government contract and near-term IPO email monitor"
+version = "0.3.0"
+description = "Company IPO evidence, bias-aware online sentiment, and government contract monitor"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
