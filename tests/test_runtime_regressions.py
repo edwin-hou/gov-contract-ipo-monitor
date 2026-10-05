@@ -167,6 +167,40 @@ def test_evidence_retry_is_idempotent_and_versions_link_to_previous(tmp_path):
         assert row["supersedes_id"] == first_version
 
 
+def test_evidence_lookup_queries_use_indexes_and_keep_version_links(tmp_path):
+    db = database(tmp_path)
+    with db.connect() as conn:
+        contracts = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM contract_evidence WHERE json_extract(version_json, '$.source')=? AND json_extract(version_json, '$.source_record_id')=? ORDER BY id DESC LIMIT 1",
+            ("usaspending", "a"),
+        ).fetchall()
+        by_record = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM contract_evidence WHERE source_record_id=?",
+            (1,),
+        ).fetchall()
+        listings = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM listing_signals WHERE signal_id=? AND json_extract(version_json, '$.source')=? ORDER BY id DESC LIMIT 1",
+            ("S1-1", "sec"),
+        ).fetchall()
+        listing_record = conn.execute("EXPLAIN QUERY PLAN SELECT id FROM listing_signals WHERE source_record_id=?", (1,)).fetchall()
+        fingerprints = conn.execute("EXPLAIN QUERY PLAN SELECT 1 FROM candidate_matches WHERE fingerprint=?", ("fingerprint",)).fetchall()
+    for rows, index in ((contracts, "contract_evidence_source_identity_version"), (by_record, "contract_evidence_source_record"),
+                        (listings, "listing_signals_source_identity_version"), (listing_record, "listing_signals_source_record"),
+                        (fingerprints, "candidate_matches_fingerprint")):
+        details = [row["detail"] for row in rows]
+        assert any(index in detail and "SEARCH" in detail for detail in details)
+        assert not any("TEMP B-TREE" in detail or detail.startswith("SCAN") for detail in details)
+    processor = EvidenceProcessor(db, now=lambda: NOW)
+    processor.ingest_contract(contract())
+    processor.ingest_contract(contract().model_copy(update={"raw_payload_hash": "next", "obligated_amount": 20}))
+    processor.ingest_listing(listing())
+    processor.ingest_listing(listing().model_copy(update={"raw_payload_hash": "next", "proposed_price": 3}))
+    with db.connect() as conn:
+        for table in ("contract_evidence", "listing_signals"):
+            rows = conn.execute(f"SELECT id,supersedes_id FROM {table} ORDER BY id").fetchall()
+            assert len(rows) == 2 and rows[1]["supersedes_id"] == rows[0]["id"]
+
+
 def test_partial_smtp_retries_only_refused_recipients_and_ignores_quit_error(tmp_path, monkeypatch):
     db = database(tmp_path)
     processor = EvidenceProcessor(db, now=lambda: NOW)

@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS outbox_messages(
  lease_until TEXT, last_error TEXT, sent_at TEXT, smtp_message_id TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS collector_state(name TEXT PRIMARY KEY, cursor TEXT, last_success_at TEXT, last_error TEXT, disabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS dead_letters(id INTEGER PRIMARY KEY, component TEXT NOT NULL, source TEXT, external_id TEXT, payload_json TEXT, error TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS contract_evidence_source_record ON contract_evidence(source_record_id);
+CREATE INDEX IF NOT EXISTS contract_evidence_source_identity_version ON contract_evidence(
+ json_extract(version_json, '$.source'), json_extract(version_json, '$.source_record_id'), id DESC);
+CREATE INDEX IF NOT EXISTS listing_signals_source_record ON listing_signals(source_record_id);
+CREATE INDEX IF NOT EXISTS listing_signals_source_identity_version ON listing_signals(
+ signal_id, json_extract(version_json, '$.source'), id DESC);
+CREATE INDEX IF NOT EXISTS candidate_matches_fingerprint ON candidate_matches(fingerprint);
 """
 
 TABLES = {
