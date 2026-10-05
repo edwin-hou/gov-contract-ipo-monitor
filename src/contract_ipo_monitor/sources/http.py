@@ -4,6 +4,7 @@ import asyncio
 import random
 import ipaddress
 import socket
+import zlib
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from collections.abc import Awaitable, Callable
@@ -43,7 +44,7 @@ class ResilientClient:
         self.max_response_bytes = max_response_bytes
         if max_attempts < 1 or timeout <= 0 or base_delay < 0 or max_response_bytes < 1:
             raise ValueError("HTTP retry and timeout settings must be positive")
-        self.client = httpx.AsyncClient(headers=headers, timeout=timeout, transport=transport, follow_redirects=False)
+        self.client = httpx.AsyncClient(headers={"Accept-Encoding": "gzip, deflate", **(headers or {})}, timeout=timeout, transport=transport, follow_redirects=False)
 
     async def _check_url(self, url: str | httpx.URL) -> None:
         parsed = httpx.URL(url)
@@ -82,12 +83,31 @@ class ResilientClient:
                     raise PermanentHTTPError(413, "source response exceeds configured byte limit")
                 chunks = []
                 total = 0
-                async for chunk in response.aiter_bytes():
+                wire_total = 0
+                encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+                decoder = None
+                if not response.is_stream_consumed:
+                    if encoding in {"gzip", "deflate"}:
+                        decoder = zlib.decompressobj(31 if encoding == "gzip" else zlib.MAX_WBITS)
+                    elif encoding != "identity":
+                        raise PermanentHTTPError(415, "unsupported source response encoding")
+                iterator = response.aiter_bytes() if response.is_stream_consumed else response.aiter_raw()
+                async for chunk in iterator:
+                    wire_total += len(chunk)
+                    if wire_total > self.max_response_bytes:
+                        raise PermanentHTTPError(413, "source response exceeds configured byte limit")
+                    if decoder is not None:
+                        try:
+                            chunk = decoder.decompress(chunk, self.max_response_bytes - total + 1)
+                        except zlib.error as exc:
+                            raise PermanentHTTPError(415, "invalid compressed source response") from exc
                     total += len(chunk)
                     if total > self.max_response_bytes:
                         raise PermanentHTTPError(413, "source response exceeds configured byte limit")
                     chunks.append(chunk)
-                # aiter_bytes decompresses the stream. Do not decode it twice.
+                if decoder is not None and (not decoder.eof or decoder.unused_data):
+                    raise PermanentHTTPError(415, "incomplete or concatenated compressed source response")
+                # Content is already decompressed. Do not decode it twice.
                 headers = dict(response.headers)
                 headers.pop("content-encoding", None)
                 headers["content-length"] = str(total)

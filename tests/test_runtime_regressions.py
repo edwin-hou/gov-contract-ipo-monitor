@@ -364,3 +364,16 @@ async def test_http_caps_decoded_gzip_body():
             await client.request_text("GET", "https://public.example/compressed")
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_decodes_small_gzip_and_deflate_responses():
+    import gzip
+    import zlib
+
+    for encoding, body in (("gzip", gzip.compress(b'{"ok":true}')), ("deflate", zlib.compress(b'{"ok":true}'))):
+        client = ResilientClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, headers={"Content-Encoding": encoding}, stream=httpx.ByteStream(body))), max_response_bytes=100)
+        try:
+            assert await client.request_json("GET", "https://public.example/compressed") == {"ok": True}
+        finally:
+            await client.aclose()
