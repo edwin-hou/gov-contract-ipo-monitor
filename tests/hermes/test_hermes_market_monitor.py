@@ -281,7 +281,8 @@ def test_helper_never_exposes_credential_traces_and_uses_hidden_no_shell_python(
     with pytest.raises(monitor.CheckError) as error:
         monitor.GitHubHelper(monitor.Config(tmp_path))("main")
     assert "SECRET" not in str(error.value)
-    assert calls[0][1]["shell"] is False and calls[0][0][0].endswith("monitor-venv\\Scripts\\python.exe")
+    assert calls[0][1]["shell"] is False
+    assert Path(calls[0][0][0]) == tmp_path / "work" / "monitor-venv" / "Scripts" / "python.exe"
 
 
 def test_untrusted_digest_text_and_evidence_links_are_escaped():
