@@ -167,6 +167,59 @@ def _company_evidence(instrument, records, *, now: datetime) -> tuple[list, list
     return news, commentary
 
 
+def _commentary_links(instrument, records, tones, *, now: datetime) -> list[str]:
+    """Join accepted aggregate-tone IDs without applying the catalyst filter.
+
+    A product/user discussion can supply measured lexical tone while providing
+    no issuer investment thesis. These links document the sample, not a catalyst.
+    """
+    from .sentiment import score_evidence
+    from .sources.discourse import CompanyWatch, matching_companies
+    watch = CompanyWatch(instrument.name, (*instrument.aliases, "$" + instrument.symbol))
+    accepted = {row["evidence_id"]: row["score"] for row in tones
+        if isinstance(row, dict) and isinstance(row.get("evidence_id"), str)
+        and isinstance(row.get("score"), (int, float)) and not isinstance(row["score"], bool)
+        and math.isfinite(row["score"]) and -1 <= row["score"] <= 1 and not row.get("excluded_reason")}
+    eligible, seen_urls, seen_ids = [], set(), set()
+    for record in records:
+        if (record.evidence_id not in accepted or record.evidence_id in seen_ids
+                or instrument.name not in record.company_names or len(set(record.company_names)) != 1
+                or not _source_host(record.source_url)
+                or not isinstance(record.retrieved_at, datetime) or record.retrieved_at.utcoffset() is None
+                or not timedelta(0) <= now-record.retrieved_at <= timedelta(days=30)):
+            continue
+        published = record.published_at
+        if published is not None and (not isinstance(published, datetime) or published.utcoffset() is None
+                or not timedelta(0) <= now-published <= timedelta(days=30)):
+            continue
+        if not matching_companies(record.title + " " + record.text, (watch,)):
+            continue
+        tone = score_evidence(record, instrument.name)
+        # Excluded metadata, ambiguous targets/languages, and a changed latest
+        # version cannot be cited as the accepted scored observation.
+        if tone.score is None or tone.excluded_reason or tone.score != accepted[record.evidence_id]:
+            continue
+        if record.source_url in seen_urls:
+            continue
+        seen_urls.add(record.source_url)
+        seen_ids.add(record.evidence_id)
+        eligible.append(record)
+    eligible.sort(key=lambda record: record.published_at or record.retrieved_at, reverse=True)
+    selected, platforms, origins = [], set(), set()
+    for diversify in ("platform", "origin"):
+        for record in eligible:
+            origin = (record.source_kind, record.origin_key)
+            if (record in selected or diversify == "platform" and record.source_kind in platforms
+                    or diversify == "origin" and origin in origins):
+                continue
+            selected.append(record)
+            platforms.add(record.source_kind)
+            origins.add(origin)
+            if len(selected) == 2:
+                return [item.source_url for item in selected]
+    return [item.source_url for item in selected]
+
+
 def _evidence_briefs(result, instrument, fact, history, company_evidence, now, fundamental_max_age_days, source_summary=None) -> list[dict]:
     briefs = []
     if (fact is not None and fact.symbol == instrument.symbol and _financial_source_reviewed(instrument, fact)
@@ -207,8 +260,6 @@ def _evidence_briefs(result, instrument, fact, history, company_evidence, now, f
     sources = source_summary.get("by_source", ())
     tones = tones if isinstance(tones, (tuple, list)) else ()
     sources = sources if isinstance(sources, (tuple, list)) else ()
-    measured = {row.get("evidence_id") for row in tones
-                if isinstance(row, dict) and row.get("score") is not None and not row.get("excluded_reason")}
     basis = []
     for row in sources:
         if (isinstance(row, dict) and isinstance(row.get("source_kind"), str)
@@ -216,14 +267,21 @@ def _evidence_briefs(result, instrument, fact, history, company_evidence, now, f
                 and row["scored_count"] > 0):
             basis.append(f"{row['scored_count']} {row['source_kind']}")
     source_note = " (" + ", ".join(basis[:5]) + ")" if basis else ""
-    supporting_links = [row[0].source_url for row in [*commentary, *news] if row[0].evidence_id in measured][:2]
+    supporting_links = _commentary_links(instrument, company_evidence, tones, now=now) if sampled["scored_count"] else []
+    meanings = {"positive": "Measured sample tone is positive; it does not establish a positive issuer outlook or predict returns.",
+        "negative": "Measured sample tone is negative; it does not establish issuer downside or justify selling.",
+        "neutral": "Measured sample tone is neutral under the lexicon; it provides no directional investment confirmation.",
+        "unknown": "Insufficient measured tone for an aggregate conclusion; no positive or negative investment confirmation."}
     meaning = ("The sample contains conflicting views; aggregate tone is not consensus." if "conflicting_views" in sampled["bias_flags"]
-               else "Unknown tone provides no positive confirmation; measured tone is supporting context only.")
-    briefs.append(_brief("commentary", "sampled_commentary",
+               else meanings[sampled["label"]])
+    limitation = "Tone may concern a named product, user or discussion topic rather than issuer prospects. Lexicon attribution, selection, sarcasm and quoted opinions can bias the result; popularity is not truth."
+    if not supporting_links:
+        limitation += " No eligible accepted scored-source URL could be joined; counts are coverage context only, not linked investment evidence."
+    briefs.append(_brief("commentary", "sampled_commentary" if supporting_links else "sampled_commentary_coverage",
         f"Collected English-language tone: {sampled['label']}; {sampled['scored_count']} scored items{source_note} across {sampled['independent_origins']} sampled origins.",
         meaning,
         "Company-matched source sample, not an internet-wide opinion poll.", "unknown",
-        "Lexicon attribution, publisher/community selection, sarcasm and quoted opinions can bias the result; popularity is not truth.", supporting_links))
+        limitation, supporting_links))
     return briefs[:5]
 
 

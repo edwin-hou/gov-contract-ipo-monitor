@@ -96,7 +96,7 @@ def report_message(report: dict, *, sender: str, recipient: str, event_key: str,
             for brief in briefs[:5]:
                 sources = "; ".join(str(x) for x in brief.get("source_urls", [])[:2])
                 lines += [f"- {brief.get('claim')} {brief.get('meaning')}" + (f" Limitation: {brief.get('limitation')}" if brief.get("limitation") else ""),
-                          f"  Source: {sources}"]
+                          f"  Source: {sources}" if sources else "  Coverage only: no linked source supports this summary."]
             lines += ["Material risks: " + "; ".join(str(x) for x in idea.get("risks", [])[:3]), ""]
         else:
             lines += ["Reasons: " + "; ".join(str(x) for x in idea.get("reasons", [])),

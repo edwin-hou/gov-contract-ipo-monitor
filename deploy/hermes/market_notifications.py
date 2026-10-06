@@ -185,6 +185,8 @@ def delivery_config(path: Path, work: Path) -> dict:
         raise ValueError("delivery_config_invalid")
     if not value["enabled"]:
         return {"enabled": False}
+    if value.get("notification_policy") != "ai_approved_only":
+        raise ValueError("delivery_policy_not_authorized")
     if value.get("sender") != TARGET or value.get("recipient") != TARGET or value.get("holdings") != []:
         raise ValueError("confirmed_delivery_scope_mismatch")
     for name in ("hermes_home", "outbox_path"):

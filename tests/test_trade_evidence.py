@@ -1,11 +1,12 @@
 """Relevant, sourced explanations and conditional session dates, not forecasts."""
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
 from contract_ipo_monitor.quotes import CurrentQuote
 from contract_ipo_monitor.sources.discourse import DiscourseEvidence, DiscourseBatch
+from contract_ipo_monitor.sentiment import score_evidence, summarize_sentiment
 from contract_ipo_monitor.trades import next_session_window, session_window
 from contract_ipo_monitor.universe import default_universe
 from contract_ipo_monitor.worldnews import WorldEvent, relevant_world_events
@@ -102,11 +103,67 @@ def test_commentary_links_support_scored_items_and_conflicts_are_explicit():
                        text="Test issuer earnings are weak and growth is risky; wait for demand data.")
     summary = {"label": "positive", "score": .2, "scored_count": 4, "independent_origins": 4,
                "bias_flags": ["conflicting_views"], "by_source": [{"source_kind": "news", "scored_count": 3}, {"source_kind": "hackernews", "scored_count": 1}],
-               "evidence_tones": [{"evidence_id": "not-scored", "score": None}, {"evidence_id": "scored", "score": -.3, "excluded_reason": None}]}
+               "evidence_tones": [{"evidence_id": "not-scored", "score": None}, {"evidence_id": "scored", "score": score_evidence(measured, "Test issuer").score, "excluded_reason": None}]}
     brief = by_id(assess(company_evidence=(unscored, measured), sentiment=summary))["commentary"]
     assert brief["source_urls"] == [measured.source_url]
     assert "3 news, 1 hackernews" in brief["claim"]
     assert "conflicting views" in brief["meaning"]
+
+
+def test_aggregate_links_use_accepted_thirty_day_tone_not_seven_day_business_catalysts():
+    product = article("Test issuer GPU review", "Test issuer makes excellent innovative devices; this detailed product experience impressed the author.",
+                      source_kind="hackernews", text_kind="public_comment", published_at=NOW-timedelta(days=8))
+    summary = asdict(summarize_sentiment("Test issuer", (product,), now=NOW))
+    briefs = by_id(assess(company_evidence=(product,), sentiment=summary))
+    assert not any(item["evidence_type"] == "publisher_company_news" for item in briefs.values())
+    assert briefs["commentary"]["source_urls"] == [product.source_url]
+    assert briefs["commentary"]["evidence_type"] == "sampled_commentary"
+    assert "product, user or discussion topic rather than issuer prospects" in briefs["commentary"]["limitation"]
+
+
+def test_aggregate_commentary_links_diversify_platform_then_origin():
+    records = tuple(article("Test issuer product discussion " + str(index),
+                    "Test issuer has excellent impressive products, according to this detailed experience number " + str(index),
+                    evidence_id=str(index), source_url="https://example.org/"+str(index),
+                    source_kind=kind, text_kind="public_comment", origin_key=origin,
+                    published_at=NOW-timedelta(hours=index+1))
+                    for index, (kind, origin) in enumerate((("hackernews", "author:a"), ("hackernews", "author:a"), ("news", "publisher:b"))))
+    summary = asdict(summarize_sentiment("Test issuer", records, now=NOW))
+    brief = by_id(assess(company_evidence=records, sentiment=summary))["commentary"]
+    assert brief["source_urls"] == [records[0].source_url, records[2].source_url]
+
+
+@pytest.mark.parametrize("label, expected", [("positive", "tone is positive"), ("negative", "tone is negative"),
+    ("neutral", "tone is neutral"), ("unknown", "Insufficient measured tone")])
+def test_nonconflicting_aggregate_meaning_matches_measured_label(label, expected):
+    brief = by_id(assess(sentiment={"label": label, "scored_count": 3, "independent_origins": 3}))["commentary"]
+    assert expected in brief["meaning"]
+    assert brief["source_urls"] == []
+    assert brief["evidence_type"] == "sampled_commentary_coverage"
+    assert "coverage context only" in brief["limitation"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"text_kind": "video_metadata"}, {"company_names": ("Test issuer", "Other")},
+    {"published_at": NOW-timedelta(days=31)}, {"published_at": NOW+timedelta(seconds=1)},
+    {"retrieved_at": NOW-timedelta(days=31)}, {"language": "fr"}, {"source_url": "https://localhost/private"},
+])
+def test_aggregate_links_never_override_tone_exclusions_or_unsafe_dates(changes):
+    record = article(**changes)
+    summary = {"label": "positive", "scored_count": 3, "independent_origins": 3,
+               "evidence_tones": [{"evidence_id": record.evidence_id, "score": .5, "excluded_reason": None}]}
+    brief = by_id(assess(company_evidence=(record,), sentiment=summary))["commentary"]
+    assert brief["source_urls"] == [] and brief["evidence_type"] == "sampled_commentary_coverage"
+
+
+def test_changed_source_version_and_excluded_duplicate_cannot_support_old_tone():
+    record = article()
+    score = score_evidence(record, "Test issuer").score
+    for tone in ({"evidence_id": record.evidence_id, "score": score, "excluded_reason": "Duplicate URL"},
+                 {"evidence_id": record.evidence_id, "score": -.5, "excluded_reason": None}):
+        brief = by_id(assess(company_evidence=(record,), sentiment={"label": "negative", "scored_count": 3,
+                      "independent_origins": 3, "evidence_tones": [tone]}))["commentary"]
+        assert brief["source_urls"] == []
 
 
 def test_micron_world_evidence_excludes_crashes_and_unconnected_geopolitics_but_keeps_sector_policy():

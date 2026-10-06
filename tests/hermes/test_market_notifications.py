@@ -24,6 +24,7 @@ def configured(tmp_path):
                                       "report_sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
     delivery = {"enabled": True, "sender": mail.TARGET, "recipient": mail.TARGET, "holdings": [],
                 "outbox_path": str(config.work / "mail.sqlite3"), "hermes_home": str(tmp_path / "hermes"),
+                "notification_policy": "ai_approved_only",
                 "initial_report_requested": True, "initial_event_key": "first-authorized-report"}
     monitor.write_json(config.work / "market-delivery.json", delivery)
     return config, delivery, data
@@ -52,17 +53,60 @@ def test_disabled_is_quiet_and_never_starts_worker_or_changes_baseline(tmp_path)
     assert not (config.work / "mail.sqlite3").exists()
 
 
-def test_initial_authorized_report_is_immutable_and_retry_is_checked_even_on_quiet_poll(tmp_path):
+def test_legacy_pending_report_is_retained_but_not_delivered_under_ai_only_policy(tmp_path):
     config, delivery, data = configured(tmp_path)
-    worker = Worker()
-    assert mail.process_notifications(config, now=NOW, worker=worker) == ""
     box = EmailOutbox(Path(delivery["outbox_path"]))
+    assert len(mail.stage_notifications(delivery, box, {}, data, {}, NOW, outputs_root=config.outputs)) == 1
     first = box.event(delivery["initial_event_key"])
     assert first["status"] == "pending" and box.states() == {"pending": 1}
+    worker = Worker()
+    assert mail.process_notifications(config, now=NOW, worker=worker) == ""
+    assert box.event(delivery["initial_event_key"])["status"] == "cancelled"
     assert mail.process_notifications(config, now=NOW + timedelta(minutes=1), worker=worker) == ""
     assert box.event(delivery["initial_event_key"])["raw_message"] == first["raw_message"]
-    assert worker.calls == [False, False]
+    assert worker.calls == [True, True]
     assert monitor.read_json(config.receipt)["email_queued"] == []
+
+
+@pytest.mark.parametrize("policy", [None, "", "ai_approved_onyl", "routine_reports", False])
+def test_missing_or_unknown_enabled_policy_cannot_send_or_mutate_durable_history(tmp_path, policy):
+    config, delivery, data = configured(tmp_path)
+    box = EmailOutbox(Path(delivery["outbox_path"]))
+    assert len(mail.stage_notifications(delivery, box, {}, data, {}, NOW, outputs_root=config.outputs)) == 1
+    original = box.event(delivery["initial_event_key"])
+    ledger = config.ledger.read_bytes()
+    if policy is None:
+        delivery.pop("notification_policy")
+    else:
+        delivery["notification_policy"] = policy
+    monitor.write_json(config.work / "market-delivery.json", delivery)
+    with pytest.raises(ValueError, match="delivery_policy_not_authorized"):
+        mail.delivery_config(config.work / "market-delivery.json", config.work)
+    worker = Worker()
+    assert "needs review" in mail.process_notifications(config, now=NOW, worker=worker)
+    assert worker.calls == [] and box.event(delivery["initial_event_key"]) == original
+    assert config.ledger.read_bytes() == ledger
+    assert mail.process_notifications(config, now=NOW, worker=worker) == ""
+    assert worker.calls == [] and box.event(delivery["initial_event_key"]) == original
+
+
+@pytest.mark.parametrize("policy", [None, "ai_approved_onyl"])
+def test_disabled_configuration_needs_no_policy_and_preserves_pending_history(tmp_path, policy):
+    config, delivery, data = configured(tmp_path)
+    box = EmailOutbox(Path(delivery["outbox_path"]))
+    assert len(mail.stage_notifications(delivery, box, {}, data, {}, NOW, outputs_root=config.outputs)) == 1
+    original = box.event(delivery["initial_event_key"])
+    delivery["enabled"] = False
+    if policy is None:
+        delivery.pop("notification_policy")
+    else:
+        delivery["notification_policy"] = policy
+    monitor.write_json(config.work / "market-delivery.json", delivery)
+    worker = Worker()
+    assert mail.delivery_config(config.work / "market-delivery.json", config.work) == {"enabled": False}
+    assert mail.process_notifications(config, now=NOW, worker=worker) == ""
+    assert worker.calls == [] and box.event(delivery["initial_event_key"]) == original
+    assert monitor.read_json(config.receipt)["email_outcome"] == "disabled"
 
 
 def test_changed_recipient_or_nonempty_holdings_requires_review_not_a_send(tmp_path):
