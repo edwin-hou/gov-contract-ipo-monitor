@@ -10,6 +10,7 @@ import pytest
 
 from contract_ipo_monitor.gmail_delivery import (
     DefinitiveDeliveryFailure, GmailOAuthTransport, UnknownDelivery, message_content_sha256,
+    _message_id,
 )
 
 SENDER = "sender@example.com"
@@ -280,9 +281,10 @@ def test_own_post_acknowledgement_allows_provider_identity_rewrite_only_with_exa
     assert sender.deliver(raw, RECIPIENT, IDENTITY) == receipt and len(posts) == 1
 
 
-def test_persisted_acknowledgement_can_reconcile_rewritten_identity_readonly():
+@pytest.mark.parametrize("provider_identity", ["<provider-rewrite@mail.gmail.com>", "<CAP0eM+r=qeU6D2_hDn=UTP9ttSXegRN8J+3iGchBegxtowAhEQ@mail.gmail.com>"])
+def test_persisted_acknowledgement_can_reconcile_rewritten_identity_readonly(provider_identity):
     raw = mime()
-    rewritten = raw.replace(IDENTITY.encode(), b"<provider-rewrite@mail.gmail.com>")
+    rewritten = raw.replace(IDENTITY.encode(), provider_identity.encode())
     paths = []
     def handler(request):
         paths.append(request.url.path)
@@ -311,3 +313,16 @@ def test_search_candidate_with_rewritten_identity_cannot_be_bound_or_trigger_ano
     sender = transport(handler)
     with pytest.raises(UnknownDelivery, match="readback_mismatch"):
         sender.deliver(raw, RECIPIENT, IDENTITY)
+
+
+@pytest.mark.parametrize("local", ["valid=identity", "valid/identity", "valid?identity", "valid%identity", "valid~identity"])
+def test_rfc_dot_atom_id_accepts_supported_provider_punctuation(local):
+    assert _message_id(f"<{local}@mail.gmail.com>") == f"{local}@mail.gmail.com"
+
+
+@pytest.mark.parametrize("identity", ["<bad..dots@mail.gmail.com>", "<.leading@mail.gmail.com>", "<trailing.@mail.gmail.com>",
+                                      "<bad@mail..gmail.com>", "<bad\r\n@mail.gmail.com>", "\n<bad@mail.gmail.com>",
+                                      "<bad\x00@mail.gmail.com>", "<bad name@mail.gmail.com>"])
+def test_message_identity_rejects_invalid_dot_placement_whitespace_and_controls(identity):
+    with pytest.raises(DefinitiveDeliveryFailure):
+        _message_id(identity)

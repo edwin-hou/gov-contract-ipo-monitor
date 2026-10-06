@@ -114,6 +114,8 @@ The deployed delivery policy records no holdings. A reduce/exit reference is con
 
 ## Verification
 
+Checkpoint-selection tests execute the production helper with Node.js; install Node alongside Python when running the full development suite. Hosted checkpoint selection uses verified upload and workflow creation times rather than assuming artifact IDs are chronological.
+
 ```text
 python -m pytest
 python -m compileall -q src scripts

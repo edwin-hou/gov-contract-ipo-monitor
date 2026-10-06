@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ['src/**', 'pyproject.toml', '.github/workflows/monitor.yml', 'scripts/restore_checkpoint.py']
+    paths: ['src/**', 'pyproject.toml', '.github/workflows/monitor.yml', 'scripts/restore_checkpoint.py', 'scripts/select_checkpoint.cjs']
 
 permissions:
   contents: read
@@ -54,18 +54,21 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            const {selectCheckpoint} = require(process.env.GITHUB_WORKSPACE + '/scripts/select_checkpoint.cjs');
             const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
               ...context.repo, name: 'ipo-monitor-state', per_page: 100
             });
-            const eligible = artifacts.filter(a => !a.expired && a.workflow_run?.head_branch === 'main');
-            eligible.sort((a,b) => b.id-a.id);
-            for (const artifact of eligible) {
-              const run = await github.rest.actions.getWorkflowRun({...context.repo, run_id: artifact.workflow_run.id});
-              if (run.data.path !== '.github/workflows/monitor.yml') continue;
+            const selected = await selectCheckpoint(artifacts,
+              async id => (await github.rest.actions.getWorkflowRun({...context.repo, run_id:id})).data,
+              {repository: `${context.repo.owner}/${context.repo.repo}`, currentRunId:context.runId});
+            if (selected) {
+              const {artifact, run} = selected;
               const download = await github.rest.actions.downloadArtifact({...context.repo, artifact_id: artifact.id, archive_format:'zip'});
+              const data = Buffer.from(download.data);
+              if (!data.length || data.length > 250000000) throw new Error('Checkpoint archive exceeds download bounds');
               fs.mkdirSync('work', {recursive:true});
-              fs.writeFileSync('work/checkpoint.zip', Buffer.from(download.data));
-              core.info(`Restoring checkpoint from run ${run.data.id}, artifact ${artifact.id}`);
+              fs.writeFileSync('work/checkpoint.zip', data);
+              core.info(`Restoring checkpoint from run ${run.id}, artifact ${artifact.id}; artifact created ${artifact.created_at}, run created ${run.created_at}`);
               return;
             }
             core.info('No retained checkpoint exists. Starting a new collection history.');

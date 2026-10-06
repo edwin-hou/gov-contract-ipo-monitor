@@ -23,6 +23,9 @@ SEND_SCOPES = {"https://mail.google.com/", "https://www.googleapis.com/auth/gmai
                "https://www.googleapis.com/auth/gmail.modify"}
 READ_SCOPES = {"https://mail.google.com/", "https://www.googleapis.com/auth/gmail.readonly",
                "https://www.googleapis.com/auth/gmail.modify"}
+# RFC 5322 section 3.2.3: Gmail-generated IDs can include '=' and other atext.
+_ATOM = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+RFC822_ID_PATTERN = rf"{_ATOM}(?:\.{_ATOM})*@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*"
 
 
 class DefinitiveDeliveryFailure(RuntimeError):
@@ -51,10 +54,12 @@ def _address(value: str) -> str:
 
 
 def _message_id(value: str) -> str:
+    if not isinstance(value, str) or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise DefinitiveDeliveryFailure("invalid_rfc822_message_id")
     text = str(value).strip()
     if text.startswith("<") and text.endswith(">"):
         text = text[1:-1]
-    if not re.fullmatch(r"[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+", text) or len(text) > 250:
+    if not re.fullmatch(RFC822_ID_PATTERN, text) or len(text) > 250:
         raise DefinitiveDeliveryFailure("invalid_rfc822_message_id")
     return text
 
