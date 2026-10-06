@@ -26,7 +26,7 @@ CONFIRMED_RECIPIENT = deployment_settings()["confirmed_recipient"]
 RECEIPT_KEYS = {
     "gmail_message_id", "thread_id", "provider_accepted_at", "verified_at", "delivered_label",
     "content_sha256", "raw_content_sha256", "recipient", "sender", "rfc822_id", "readback_raw_sha256",
-    "provider_rfc822_id", "rfc822_identity_status",
+    "provider_rfc822_id", "rfc822_identity_status", "content_sha256_version",
 }
 
 
@@ -133,8 +133,10 @@ def public_receipt(value: object) -> dict:
     if any(not isinstance(item, str) or len(item) > 500 for item in result.values()):
         raise ValueError("provider_receipt_exceeds_bound")
     required = {"gmail_message_id", "thread_id", "provider_accepted_at", "verified_at", "delivered_label",
-                "content_sha256", "raw_content_sha256", "recipient", "sender", "rfc822_id", "readback_raw_sha256"}
+                "content_sha256", "content_sha256_version", "raw_content_sha256", "recipient", "sender", "rfc822_id", "readback_raw_sha256"}
     if not required.issubset(result) or result["recipient"] != CONFIRMED_RECIPIENT or result["sender"] != CONFIRMED_RECIPIENT:
+        raise ValueError("verified_provider_receipt_invalid")
+    if result["content_sha256_version"] != "mime-tree-v2":
         raise ValueError("verified_provider_receipt_invalid")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", result["gmail_message_id"]) or result["delivered_label"] not in {"SENT", "INBOX"}:
         raise ValueError("verified_provider_receipt_invalid")

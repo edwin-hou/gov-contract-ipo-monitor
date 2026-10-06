@@ -59,7 +59,7 @@ class Outbox:
             "gmail_message_id": "gmail" + str(identifier), "thread_id": "thread" + str(identifier),
             "recipient": worker.CONFIRMED_RECIPIENT, "sender": worker.CONFIRMED_RECIPIENT,
             "verified_at": NOW.isoformat(), "provider_accepted_at": NOW.isoformat(),
-            "content_sha256": "a" * 64, "raw_content_sha256": "b" * 64, "readback_raw_sha256": "c" * 64,
+            "content_sha256": "a" * 64, "content_sha256_version": "mime-tree-v2", "raw_content_sha256": "b" * 64, "readback_raw_sha256": "c" * 64,
             "delivered_label": "INBOX", "rfc822_id": "<exact@monitor.local>",
             "unwanted_secret": "private-access-token"})}
 
@@ -182,7 +182,8 @@ def test_unverified_or_unbounded_receipt_cannot_be_published_as_delivery():
     receipt = json.loads(Outbox().get(1)["receipt_json"])
     for field, value in (("content_sha256", "not-a-sha"), ("recipient", "other@example.com"),
                          ("verified_at", "2026-10-06T00:00:00"), ("delivered_label", "DRAFT"),
-                         ("gmail_message_id", "too-long" * 100)):
+                         ("gmail_message_id", "too-long" * 100), ("content_sha256_version", "leaf-v1"),
+                         ("content_sha256_version", "unknown-v3"), ("content_sha256_version", None)):
         malformed = {**receipt, field: value}
         with pytest.raises(ValueError):
             worker.public_receipt(malformed)

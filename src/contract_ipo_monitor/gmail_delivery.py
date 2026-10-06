@@ -26,6 +26,9 @@ READ_SCOPES = {"https://mail.google.com/", "https://www.googleapis.com/auth/gmai
 # RFC 5322 section 3.2.3: Gmail-generated IDs can include '=' and other atext.
 _ATOM = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
 RFC822_ID_PATTERN = rf"{_ATOM}(?:\.{_ATOM})*@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*"
+MIME_TREE_VERSION = "mime-tree-v2"
+LEGACY_LEAF_VERSION = "leaf-v1"
+CONTENT_DIGEST_VERSIONS = frozenset({MIME_TREE_VERSION, LEGACY_LEAF_VERSION})
 
 
 class DefinitiveDeliveryFailure(RuntimeError):
@@ -100,21 +103,40 @@ def _semantic(raw: bytes) -> dict:
             parts.append(item)
         if not parts:
             raise ValueError("MIME has no payload")
+        leaf_index = 0
+
+        def mime_tree(part):
+            nonlocal leaf_index
+            node = {"type": part.get_content_type(), "disposition": part.get_content_disposition(),
+                    "filename": part.get_filename(), "content_id": str(part.get("Content-ID", ""))}
+            if part.is_multipart():
+                node["children"] = [mime_tree(child) for child in part.get_payload()]
+            else:
+                node["part_index"] = leaf_index
+                leaf_index += 1
+            return node
+
         return {**addresses, "subject": str(message["Subject"]),
-                "message_id": _message_id(str(message["Message-ID"])), "parts": parts}
+                "message_id": _message_id(str(message["Message-ID"])), "parts": parts,
+                "mime_tree": mime_tree(message)}
     except DefinitiveDeliveryFailure:
         raise
     except (ValueError, UnicodeError, LookupError, TypeError):
         raise DefinitiveDeliveryFailure("invalid_message_payload") from None
 
 
-def message_content_sha256(raw: bytes) -> str:
+def message_content_sha256(raw: bytes, *, version: str = MIME_TREE_VERSION) -> str:
     """Hash sender/recipient/subject/identity plus decoded bodies and attachments.
 
     Delivery-added headers, MIME boundary strings and transfer encodings are ignored.
-    Attachment bytes and names, displayed body text, and recipients remain exact.
+    Attachment bytes and names, displayed body text, recipients, and the ordered
+    MIME structure remain exact. ``leaf-v1`` exists only to verify old receipts.
     """
+    if not isinstance(version, str) or version not in CONTENT_DIGEST_VERSIONS:
+        raise DefinitiveDeliveryFailure("unsupported_content_digest_version")
     value = _semantic(raw)
+    if version == LEGACY_LEAF_VERSION:
+        value.pop("mime_tree")
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -249,7 +271,8 @@ class GmailOAuthTransport:
             return {"gmail_message_id": provider_id, "thread_id": str(data.get("threadId", "")),
                     "provider_accepted_at": accepted_at, "verified_at": verified_at,
                     "delivered_label": "INBOX" if "INBOX" in labels and expected["to"] == self.expected_sender else "SENT",
-                    "content_sha256": message_content_sha256(raw), "raw_content_sha256": hashlib.sha256(raw).hexdigest(),
+                    "content_sha256": message_content_sha256(raw), "content_sha256_version": MIME_TREE_VERSION,
+                    "raw_content_sha256": hashlib.sha256(raw).hexdigest(),
                     "recipient": expected["to"], "sender": self.expected_sender,
                     "rfc822_id": "<" + expected["message_id"] + ">",
                     "provider_rfc822_id": "<" + provider_identity + ">",
@@ -323,7 +346,7 @@ class GmailOAuthTransport:
         provider_id = str(sent.get("id", ""))
         partial = {"gmail_message_id": provider_id, "thread_id": str(sent.get("threadId", "")),
                    "provider_accepted_at": accepted_at, "recipient": expected["to"],
-                   "content_sha256": message_content_sha256(raw_message)}
+                   "content_sha256": message_content_sha256(raw_message), "content_sha256_version": MIME_TREE_VERSION}
         try:
             receipt = self._readback(provider_id, token, expected, raw_message, accepted_at=accepted_at, acknowledged_id=True)
         except UnknownDelivery as exc:

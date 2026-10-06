@@ -127,7 +127,7 @@ class SimulatedTransport:
         return {"gmail_message_id": "simulated-message", "thread_id": "simulated-thread", "delivered_label": "INBOX",
             "recipient": recipient, "sender": notifications.TARGET, "rfc822_id": rfc822_id,
             "provider_accepted_at": NOW.isoformat(), "verified_at": NOW.isoformat(),
-            "content_sha256": message_content_sha256(raw), "raw_content_sha256": hashlib.sha256(raw).hexdigest(),
+            "content_sha256": message_content_sha256(raw), "content_sha256_version": "mime-tree-v2", "raw_content_sha256": hashlib.sha256(raw).hexdigest(),
             "readback_raw_sha256": hashlib.sha256(raw).hexdigest()}
 
     def deliver(self, raw, recipient, rfc822_id):

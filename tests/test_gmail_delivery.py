@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from contract_ipo_monitor.gmail_delivery import (
-    DefinitiveDeliveryFailure, GmailOAuthTransport, UnknownDelivery, message_content_sha256,
+    DefinitiveDeliveryFailure, GmailOAuthTransport, MIME_TREE_VERSION, UnknownDelivery, message_content_sha256,
     _message_id,
 )
 
@@ -27,6 +27,19 @@ def mime(*, recipient=RECIPIENT, subject="Research — verified", body="One line
     message["Message-ID"] = IDENTITY
     message.set_content(body)
     message.add_attachment(attachment, maintype="application", subtype="octet-stream", filename="report.bin")
+    return message.as_bytes()
+
+
+def presentation_mime():
+    message = EmailMessage(policy=policy.SMTP)
+    message["From"], message["To"] = SENDER, RECIPIENT
+    message["Subject"], message["Message-ID"] = "Conditional research", IDENTITY
+    message.set_content("Entry reference 100. No fill assumed.\n")
+    message.add_alternative("<html><body><p>Entry reference 100.</p></body></html>\n", subtype="html")
+    # Transport integrity tests treat the PDF as opaque bytes; rendering has
+    # separate document tests and must not be inferred from this fixture.
+    message.add_attachment(b"%PDF-1.4\nopaque offline PDF fixture\n", maintype="application", subtype="pdf", filename="research-report.pdf")
+    message.add_attachment(b'{"holdings":[],"trade_ideas":[]}', maintype="application", subtype="json", filename="research-report.json")
     return message.as_bytes()
 
 
@@ -72,6 +85,7 @@ def test_verified_send_preserves_semantic_content_despite_delivery_headers_and_i
     result = sender.deliver(raw, RECIPIENT, IDENTITY)
     assert result["gmail_message_id"] == "gmail123"
     assert result["content_sha256"] == message_content_sha256(raw)
+    assert result["content_sha256_version"] == MIME_TREE_VERSION
     assert result["recipient"] == RECIPIENT and result["delivered_label"] == "SENT"
     assert sender.deliver(raw, RECIPIENT, IDENTITY) == result
     assert calls.count("POST") == 1
@@ -193,6 +207,84 @@ def test_semantic_hash_accepts_transfer_encoding_and_line_endings_but_preserves_
     reencoded = message.as_bytes().replace(b"\r\n", b"\n")
     assert message_content_sha256(reencoded) == message_content_sha256(raw)
     assert message_content_sha256(mime(attachment=b"altered")) != message_content_sha256(raw)
+
+
+def test_mime_tree_digest_preserves_container_semantics_and_legacy_hash_is_explicit():
+    raw = presentation_mime()
+    retyped = raw.replace(b"multipart/alternative", b"multipart/mixed")
+    assert retyped != raw and message_content_sha256(retyped) != message_content_sha256(raw)
+    assert message_content_sha256(retyped, version="leaf-v1") == message_content_sha256(raw, version="leaf-v1")
+    assert message_content_sha256(raw, version="mime-tree-v2") == message_content_sha256(raw)
+
+
+@pytest.mark.parametrize("version", ["unknown", "", None, False, []])
+def test_unrecognized_digest_versions_fail_closed(version):
+    with pytest.raises(DefinitiveDeliveryFailure, match="unsupported_content_digest_version"):
+        message_content_sha256(presentation_mime(), version=version)
+
+
+@pytest.mark.parametrize("changed", ["html", "pdf", "container_type", "container_removed"])
+def test_html_pdf_or_container_tampering_is_unknown_and_never_reposts(changed):
+    raw = presentation_mime()
+    message = BytesParser(policy=policy.SMTP).parsebytes(raw)
+    if changed == "html":
+        html = message.get_body(preferencelist=("html",))
+        html.set_content(html.get_content().replace("100", "999"), subtype="html")
+    elif changed == "pdf":
+        pdf = next(part for part in message.iter_attachments() if part.get_filename() == "research-report.pdf")
+        pdf.set_payload(base64.b64encode(pdf.get_payload(decode=True) + b"TAMPER").decode())
+    elif changed == "container_removed":
+        alternative, *attachments = message.get_payload()
+        message.set_payload([*alternative.get_payload(), *attachments])
+    altered = (raw.replace(b"multipart/alternative", b"multipart/mixed") if changed == "container_type"
+               else message.as_bytes())
+    posts = []
+
+    def handler(request):
+        result = common(request)
+        if result:
+            return result
+        if request.method == "POST":
+            posts.append(request)
+            return httpx.Response(200, json={"id": "gmail123", "threadId": "thread456"})
+        return httpx.Response(200, json=received(altered))
+
+    sender = transport(handler)
+    with pytest.raises(UnknownDelivery, match="gmail_exact_readback_mismatch"):
+        sender.deliver(raw, RECIPIENT, IDENTITY)
+    with pytest.raises(UnknownDelivery):
+        sender.deliver(raw, RECIPIENT, IDENTITY)
+    assert len(posts) == 1
+
+
+def test_html_pdf_transfer_encoding_boundary_and_line_ending_changes_allow_exact_readback():
+    raw = presentation_mime()
+    message = BytesParser(policy=policy.SMTP).parsebytes(raw)
+    plain = message.get_body(preferencelist=("plain",))
+    plain.set_content(plain.get_content(), cte="quoted-printable")
+    html = message.get_body(preferencelist=("html",))
+    html.set_content(html.get_content(), subtype="html", cte="base64")
+    pdf = next(part for part in message.iter_attachments() if part.get_filename() == "research-report.pdf")
+    pdf.set_content(pdf.get_payload(decode=True), maintype="application", subtype="pdf", filename="research-report.pdf", cte="quoted-printable")
+    for index, part in enumerate(message.walk()):
+        if part.is_multipart():
+            part.set_boundary(f"normalized-boundary-{index}")
+    normalized = message.as_bytes().replace(b"\r\n", b"\n")
+    assert message_content_sha256(normalized) == message_content_sha256(raw)
+    posts = []
+
+    def handler(request):
+        result = common(request)
+        if result:
+            return result
+        if request.method == "POST":
+            posts.append(request)
+            return httpx.Response(200, json={"id": "gmail123", "threadId": "thread456"})
+        return httpx.Response(200, json=received(normalized))
+
+    receipt = transport(handler).deliver(raw, RECIPIENT, IDENTITY)
+    assert receipt["content_sha256_version"] == MIME_TREE_VERSION
+    assert receipt["content_sha256"] == message_content_sha256(raw) and len(posts) == 1
 
 
 @pytest.mark.parametrize("result", [{"messages": [None]}, {"messages": [{"id": "one"}, {"id": "two"}]},

@@ -13,7 +13,8 @@ from email.utils import format_datetime, parseaddr
 from pathlib import Path
 from typing import Any
 
-from .research import report_markdown, serializable
+from .email_html import report_email_html
+from .research import serializable
 
 
 def _address(value: str) -> str:
@@ -103,10 +104,17 @@ def report_message(report: dict, *, sender: str, recipient: str, event_key: str,
                       "Conditions: " + "; ".join(str(x) for x in idea.get("conditions", [])),
                       "Material risks: " + "; ".join(str(x) for x in idea.get("risks", [])),
                       "Evidence: " + "\n".join(str(x) for x in idea.get("evidence_urls", [])), ""]
-    lines += ["The attached Markdown and JSON retain world-news context, financial periods/currencies, source dates, commentary coverage and waits. Collection counters describe the source run; delivery is recorded separately.",
+    lines += ["Open the attached PDF for the readable report. The JSON audit copy retains exact source data, financial periods/currencies, dates, commentary coverage and waits. Collection counters describe the source run; delivery is recorded separately.",
               "This is a bounded configured screen, with selection and source-access gaps. Sentiment and headline rules do not establish predictive probabilities. Stops cannot guarantee an exit price; gaps, currency exposure and costs can exceed a planned loss."]
     message.set_content("\n".join(lines))
-    message.add_attachment(report_markdown(report).encode("utf-8"), maintype="text", subtype="markdown", filename="research-report.md")
+    message.add_alternative(report_email_html(report, notice=notice, test=test), subtype="html")
+    # The plain/HTML alternative is part of the immutable message, not a newly
+    # randomized MIME body every time an event is rendered.
+    message.set_boundary("ipo-alternative-" + identity)
+    # The owning native mail runtime only reads immutable bytes; it does not
+    # need to import the PDF renderer or its dependencies to deliver a message.
+    from .report_pdf import report_pdf
+    message.add_attachment(report_pdf(report, notice=notice, test=test), maintype="application", subtype="pdf", filename="research-report.pdf")
     message.add_attachment(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8"), maintype="application", subtype="json", filename="research-report.json")
     message.set_boundary("ipo-report-" + identity)
     result = message.as_bytes()
@@ -264,11 +272,20 @@ class EmailOutbox:
         return {key: value[key] for key in ("id", "event_key", "status", "attempts", "error_code", "receipt_json")}
 
     @staticmethod
-    def _receipt_matches(row: dict, receipt: dict) -> bool:
-        from .gmail_delivery import message_content_sha256
+    def historical_receipt_matches(row: dict, receipt: dict) -> bool:
+        """Verify saved history without renewing or rewriting its receipt."""
+        return EmailOutbox._receipt_matches(row, receipt, historical=True)
+
+    @staticmethod
+    def _receipt_matches(row: dict, receipt: dict, *, historical: bool = False) -> bool:
+        from .gmail_delivery import CONTENT_DIGEST_VERSIONS, LEGACY_LEAF_VERSION, MIME_TREE_VERSION, message_content_sha256
         from email.parser import BytesParser
         try:
             if not isinstance(receipt, dict):
+                return False
+            version = receipt.get("content_sha256_version", LEGACY_LEAF_VERSION if historical else None)
+            if (not isinstance(version, str) or version not in CONTENT_DIGEST_VERSIONS
+                    or (not historical and version != MIME_TREE_VERSION)):
                 return False
             raw = bytes(row["raw_message"])
             sender = parseaddr(str(BytesParser(policy=policy.default).parsebytes(raw)["From"]))[1].casefold()
@@ -280,7 +297,7 @@ class EmailOutbox:
                         and receipt.get("delivered_label") in {"SENT", "INBOX"}
                         and receipt.get("recipient") == row["recipient"] and receipt.get("sender") == sender
                         and receipt.get("rfc822_id") == row["rfc822_id"]
-                        and receipt.get("content_sha256") == message_content_sha256(raw)
+                        and receipt.get("content_sha256") == message_content_sha256(raw, version=version)
                         and receipt.get("raw_content_sha256") == row["raw_sha256"] == hashlib.sha256(raw).hexdigest()
                         and re.fullmatch(r"[a-f0-9]{64}", receipt.get("readback_raw_sha256", "")))
         except (KeyError, ValueError, TypeError, AttributeError):
