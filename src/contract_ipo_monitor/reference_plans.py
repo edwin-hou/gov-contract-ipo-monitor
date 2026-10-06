@@ -13,7 +13,7 @@ def _number(value):
 
 
 def advance_reference_plans(previous: dict[str, dict], report: dict) -> tuple[dict, list[dict]]:
-    from .trades import session_count
+    from .trades import session_count, sessions_after, session_window
     plans, events = copy.deepcopy(previous), []
     ideas = {idea["symbol"]: idea for idea in report.get("trade_ideas", [])}
     for symbol, plan in plans.items():
@@ -47,6 +47,12 @@ def advance_reference_plans(previous: dict[str, dict], report: dict) -> tuple[di
             elif close >= plan["entry"]:
                 kind, message = "entry_reference_reached", "A completed close reached the frozen entry reference. Verify a fresh quote and the strategy before considering a buy; this is not a recorded fill."
                 plan.update(state="reference_triggered", reference_trigger_date=priced)
+                try:
+                    plan["reference_review"] = session_window(plan["exchange"], sessions_after(current, 5, plan["exchange"]))
+                    plan["reference_time_exit"] = session_window(plan["exchange"], sessions_after(current, 15, plan["exchange"]))
+                    message += f" Paper-reference review: {plan['reference_review']['session_date']}; time exit: {plan['reference_time_exit']['session_date']}. Real position dates require the actual fill."
+                except ValueError:
+                    plan["reference_review"], plan["reference_time_exit"] = None, None
         else:
             try:
                 age = session_count(date.fromisoformat(plan["reference_trigger_date"]), current, plan["exchange"])
@@ -65,7 +71,9 @@ def advance_reference_plans(previous: dict[str, dict], report: dict) -> tuple[di
                     plan["five_session_review"] = True
         if kind:
             events.append({"symbol": symbol, "plan_id": plan["id"], "kind": kind, "price_date": priced,
-                           "close": close, "currency": plan["currency"], "message": message})
+                           "close": close, "currency": plan["currency"], "message": message,
+                           "reference_review": plan.get("reference_review"), "reference_time_exit": plan.get("reference_time_exit"),
+                           "scope": "paper_reference_only", "assumed_position": False})
             if kind not in {"entry_reference_reached", "five_session_review"}:
                 plan["state"] = "closed"
     for symbol, idea in ideas.items():

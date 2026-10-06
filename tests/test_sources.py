@@ -122,12 +122,14 @@ def test_twelve_data_normalizer_fails_closed_without_market_cap():
 
 def test_twelve_data_normalizer_builds_snapshot_from_quote_and_shares():
     snapshot = TwelveDataNormalizer().normalize(
-        symbol="ACME", quote={"close": "4.50", "datetime": "2026-07-24 17:45:00", "volume": "1000", "exchange": "NASDAQ"},
+        symbol="ACME", quote={"close": "4.50", "datetime": "2026-07-24 00:00:00", "last_quote_at": int(NOW.timestamp())-900, "volume": "1000", "exchange": "NASDAQ"},
         statistics={"shares_outstanding": "50000000"}, observed_at=NOW,
     )
     assert snapshot is not None
     assert snapshot.market_cap == 225_000_000
     assert snapshot.price == 4.5
+    assert snapshot.quote_at.timestamp() == NOW.timestamp()-900
+    assert snapshot.timestamp_basis == "last_minute_candle"
 
 
 def test_state_local_inventory_never_claims_unconfigured_nationwide_coverage():

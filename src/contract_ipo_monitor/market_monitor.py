@@ -10,6 +10,7 @@ from .db import Database
 from .fundamentals import financial_fact_from_dict
 from .market import price_history_from_dict
 from .market_research import MarketResearchStore, payload
+from .research import ResearchStore
 from .trades import assess_trade, rank_ideas
 from .universe import Instrument, benchmark_instruments, default_fundamentals, default_universe, rank_universe, universe_metadata
 from .worldnews import world_event_from_dict
@@ -26,6 +27,8 @@ class MarketMonitor:
         self.benchmarks = benchmark_instruments() if benchmarks is None else tuple(benchmarks)
         self.store = MarketResearchStore(db)
         self.store.initialize()
+        self.research = ResearchStore(db)
+        self.research.initialize()
         if settings.markets_enabled:
             existing = self.store.latest("financials")
             # A new reviewed bundle may update an old checkpoint, while a
@@ -51,6 +54,7 @@ class MarketMonitor:
         counts = {"price_histories": 0, "financial_updates": 0}
         self.last_counts = counts
         coverage = []
+        quote_coverage = []
         observed = self.now()
         instruments = (*self.instruments, *self.benchmarks)
         previous_facts = self.store.latest("financials")
@@ -93,6 +97,23 @@ class MarketMonitor:
                 except Exception as exc:
                     coverage.append({"source": "daily_prices", "symbol": instrument.symbol, "status": "error",
                                      "observed_at": observed.isoformat(), "error": f"{type(exc).__name__}: {exc}"})
+                if instrument in self.instruments and hasattr(self.price_source, "collect_quote"):
+                    try:
+                        from .quotes import quote_freshness
+                        quote_observed = self.now()
+                        quote = await self.price_source.collect_quote(instrument, observed_at=quote_observed)
+                        self.store.record("current_quote", instrument.symbol, quote, observed_at=quote.observed_at)
+                        state = quote_freshness(quote, at=self.now())
+                        quote_coverage.append({"source": quote.source, "symbol": instrument.symbol,
+                            "status": state["status"], "observed_at": quote.observed_at.isoformat(),
+                            "quote_at": quote.quote_at.isoformat() if quote.quote_at else None,
+                            "session_date": quote.session_date.isoformat() if quote.session_date else None,
+                            "source_url": quote.source_url, "currency": quote.currency,
+                            "error": state.get("reason") if state["status"] != "fresh" else None})
+                    except Exception as exc:
+                        quote_coverage.append({"source": "current_quote", "symbol": instrument.symbol,
+                            "status": "error", "observed_at": self.now().isoformat(),
+                            "error": f"Current quote collection failed ({type(exc).__name__}); no executable quote is inferred."})
         except asyncio.CancelledError:
             completed = {item["symbol"] for item in coverage if item["source"] != "sec_companyfacts"}
             for instrument in instruments:
@@ -102,6 +123,14 @@ class MarketMonitor:
             raise
         finally:
             self.store.record_coverage("markets", coverage, observed_at=observed)
+            if hasattr(self.price_source, "collect_quote"):
+                completed_quotes = {item["symbol"] for item in quote_coverage}
+                for instrument in self.instruments:
+                    if instrument.symbol not in completed_quotes:
+                        quote_coverage.append({"source": "current_quote", "symbol": instrument.symbol,
+                            "status": "not_attempted", "observed_at": observed.isoformat(),
+                            "error": "The collection deadline ended before this quote completed; no cached quote is substituted."})
+            self.store.record_coverage("quotes", quote_coverage, observed_at=observed)
         return counts
 
     def save_world_batch(self, batch) -> int:
@@ -191,8 +220,8 @@ class MarketMonitor:
     def report(self, sentiment: list[dict]) -> dict[str, Any]:
         now = self.now()
         if not self.settings.markets_enabled:
-            return {"listed_companies": [], "listed_discovery": [], "listed_discovery_coverage": [], "trade_ideas": [], "world_news": [], "world_coverage": [], "price_coverage": [], "universe": {"limitations": ["Public-market research is disabled."]}}
-        facts, histories, events, restore_errors = {}, {}, [], []
+            return {"listed_companies": [], "listed_discovery": [], "listed_discovery_coverage": [], "trade_ideas": [], "world_news": [], "world_coverage": [], "price_coverage": [], "quote_coverage": [], "universe": {"limitations": ["Public-market research is disabled."]}}
+        facts, histories, quotes, events, restore_errors = {}, {}, {}, [], []
         for symbol, data in self.store.latest("financials").items():
             try:
                 facts[symbol] = financial_fact_from_dict(data)
@@ -203,6 +232,13 @@ class MarketMonitor:
                 histories[symbol] = price_history_from_dict(data)
             except (TypeError, ValueError, KeyError) as exc:
                 restore_errors.append(f"{symbol} prices could not be validated: {exc}")
+        for symbol, data in self.store.latest("current_quote").items():
+            try:
+                from .quotes import quote_from_dict
+                quotes[symbol] = quote_from_dict({key: value for key, value in data.items()
+                    if key not in {"archive_hash", "source_observed_at"}})
+            except (TypeError, ValueError, KeyError) as exc:
+                restore_errors.append(f"{symbol} current quote could not be validated ({type(exc).__name__})")
         for data in self.store.latest("world").values():
             try:
                 event = world_event_from_dict(data)
@@ -222,11 +258,13 @@ class MarketMonitor:
                 continue
         fresh_publishers.intersection_update(event.publisher for event in events)
         sentiment_map = {item["company_name"]: item for item in sentiment}
+        company_evidence = self.research.records(limit=10000)
         ideas = [assess_trade(instrument, facts.get(instrument.symbol), histories.get(instrument.symbol),
                              histories.get(instrument.benchmark_symbol), sentiment_map.get(instrument.name), events,
                              now=now, world_coverage_ok=len(fresh_publishers) >= 2,
                              max_price_age_business_days=self.settings.price_max_age_business_days,
-                             fundamental_max_age_days=self.settings.fundamental_max_age_days)
+                             fundamental_max_age_days=self.settings.fundamental_max_age_days,
+                             company_evidence=company_evidence, current_quote=quotes.get(instrument.symbol))
                  for instrument in self.instruments]
         return {"listed_companies": [item.to_dict() for item in rank_universe(facts, now=now, instruments=self.instruments, max_age_days=self.settings.fundamental_max_age_days)],
                 "listed_discovery": self.discovery_candidates(),
@@ -238,7 +276,7 @@ class MarketMonitor:
                                              "scope": "Bounded current SEC 10-Q/10-K issuers with SEC ticker/exchange directory and entity-wide comparable reported quarters; incomplete US-filing sample, not an exhaustive global equity screen."},
                 "trade_ideas": rank_ideas(ideas), "world_news": [payload(item) for item in events[:120]],
                 "world_coverage": world_coverage, "world_coverage_ready": len(fresh_publishers) >= 2,
-                "price_coverage": self.store.coverage("markets"), "universe": universe_metadata(),
+                "price_coverage": self.store.coverage("markets"), "quote_coverage": self.store.coverage("quotes"), "universe": universe_metadata(),
                 "market_restore_errors": restore_errors}
 
     async def aclose(self) -> None:

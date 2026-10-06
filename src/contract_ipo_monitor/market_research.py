@@ -43,6 +43,16 @@ class MarketResearchStore:
 
     def record(self, kind: str, identity: str, value: Any, *, observed_at: datetime) -> bool:
         data = payload(value)
+        # Quote freshness must retain the actual request observation. Reopening
+        # an archive or recording the same quote later is not a fresh request.
+        if kind == "current_quote":
+            data.setdefault("source_observed_at", data.get("observed_at"))
+            try:
+                original = datetime.fromisoformat(data["source_observed_at"])
+                if original.utcoffset() is None or original > observed_at:
+                    raise ValueError("Invalid original quote observation")
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ValueError("Quote archive requires the original aware request observation") from exc
         # Retrieval does not create a new financial observation or headline.
         stable = {k: v for k, v in data.items() if k not in {"observed_at", "retrieved_at", "generated_at"}}
         raw = json.dumps(stable, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -79,6 +89,10 @@ class MarketResearchStore:
                 raise ValueError("Market evidence hash mismatch")
             item = json.loads(raw)
             item["observed_at"] = row["last_seen_at"]
+            if kind == "current_quote":
+                if not item.get("source_observed_at"):
+                    raise ValueError("Quote archive has no original request observation")
+                item["observed_at"] = item["source_observed_at"]
             item["archive_hash"] = row["payload_hash"]
             result[row["identity"]] = item
         return result

@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -176,7 +176,7 @@ def price_history_from_dict(value: dict[str, Any]) -> PriceHistory:
 class DailyPriceCollector:
     def __init__(self, client: ResilientClient | None = None, *, api_key: str = "", target_bars: int = 100,
                  min_bars: int = 60, provider_order: tuple[str, ...] | None = None,
-                 min_request_interval: float = 0.5):
+                 min_request_interval: float = 0.5, quote_clock: Callable[[], datetime] | None = None):
         if not 60 <= min_bars <= target_bars <= 500 or not 0 <= min_request_interval <= 10:
             raise ValueError("Daily history bounds or request interval are invalid")
         self.client = client or ResilientClient(timeout=20, max_attempts=2, max_response_bytes=2_000_000,
@@ -191,6 +191,8 @@ class DailyPriceCollector:
         self.min_request_interval = min_request_interval
         self._request_lock = asyncio.Lock()
         self._last_request = 0.0
+        self._quote_collector = None
+        self._quote_clock = quote_clock or (lambda: datetime.now(UTC))
 
     async def _pace(self) -> None:
         async with self._request_lock:
@@ -202,6 +204,14 @@ class DailyPriceCollector:
     async def _json(self, url: str, params: dict[str, Any]) -> Any:
         await self._pace()
         return await self.client.request_json("GET", url, params=params)
+
+    async def collect_quote(self, instrument: InstrumentLike, *, observed_at: datetime):
+        """Collect separately timestamped current data; never reuse daily closes."""
+        from .quotes import CurrentQuoteCollector
+        if self._quote_collector is None:
+            self._quote_collector = CurrentQuoteCollector(self.client, api_key=self.api_key,
+                min_request_interval=self.min_request_interval, clock=self._quote_clock)
+        return await self._quote_collector.collect(instrument, observed_at=observed_at)
 
     async def collect(self, instrument: InstrumentLike, *, observed_at: datetime) -> PriceHistory:
         _aware(observed_at)

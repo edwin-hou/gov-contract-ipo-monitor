@@ -127,7 +127,7 @@ def test_downtrend_reduces_only_if_owned_even_with_negative_commentary():
 
 def risk_news(publisher, *, age=timedelta(hours=1)):
     stamp = NOW-age
-    return WorldEvent(event_id=publisher, title="New export restrictions announced", text="New export restrictions create policy uncertainty", source_url=f"https://www.bbc.com/news/{publisher}", publisher=publisher, published_at=stamp, observed_at=max(NOW,stamp), themes=("export_controls",), bias_flags=())
+    return WorldEvent(event_id=publisher, title="New export restrictions announced for Test issuer", text=f"{publisher} reports new export restrictions for Test issuer with policy uncertainty", source_url=f"https://www.bbc.com/news/{publisher}", publisher=publisher, published_at=stamp, observed_at=max(NOW,stamp), themes=("export_controls",), bias_flags=())
 
 
 def test_two_exposed_risk_publishers_tighten_entry_and_can_change_buy_to_wait():

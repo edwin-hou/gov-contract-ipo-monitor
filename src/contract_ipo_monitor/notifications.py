@@ -37,7 +37,9 @@ def report_message(report: dict, *, sender: str, recipient: str, event_key: str,
     message["To"] = recipient
     message["Date"] = format_datetime(created_at.astimezone(UTC))
     message["Message-ID"] = f"<{identity}@ipo-monitor.local>"
-    message["Subject"] = ("[PIPELINE TEST]" if test else "[Investment research]") + " Company, IPO and trade report"
+    selected = report.get("notification_scope") == "ai_approved_only"
+    subject = "AI-reviewed opportunity: " + ", ".join(str(x.get("symbol")) for x in report.get("trade_ideas", [])) if selected else "Company, IPO and trade report"
+    message["Subject"] = ("[PIPELINE TEST]" if test else "[Investment research]") + " " + subject
     lines = ["Investment monitor report", "", f"Report collected: {report.get('completed_at', 'Unavailable')}",
              "Holdings on file: none. No purchase, fill, position or order is assumed.",
              "Horizon: approximately 5–15 trading sessions. These are conditional research plans, not execution instructions.", ""]
@@ -47,13 +49,31 @@ def report_message(report: dict, *, sender: str, recipient: str, event_key: str,
         lines += [notice, ""]
     for idea in report.get("trade_ideas", []):
         symbol, action = idea.get("symbol", "Unknown"), idea.get("action", "wait")
-        lines += [f"{symbol} | {idea.get('exchange')} | {idea.get('currency')} | {action}",
+        label = {"conditional_buy": "Conditional buy", "reduce_if_owned": "Reduce only if already owned", "wait": "Wait"}.get(action, action)
+        lines += [f"{symbol} | {idea.get('exchange')} | {idea.get('currency')} | {label}",
                   f"Completed price date: {idea.get('price_as_of') or 'Unavailable'}",
                   f"Entry trigger: {idea.get('entry')}; invalidation: {idea.get('invalidation')}; target reference: {idea.get('target')}."]
         strategy = idea.get("strategy")
+        current = idea.get("current_quote") or {}
+        if current:
+            lines += [f"Latest price reference: {current.get('price')} {idea.get('currency')}; as of {current.get('quote_at') or current.get('session_date') or 'timestamp unavailable'}; {current.get('quote_type', 'unknown')}, {current.get('market_phase', 'unknown')} market.",
+                      f"Provider checked: {current.get('observed_at')}. This informational quote is not an executable broker price."]
+        review = idea.get("ai_review") or {}
+        if selected and review.get("decision") != "notify":
+            raise ValueError("AI-only mail contains an unapproved candidate")
+        if review:
+            lines += [f"AI view ({review.get('model')}, {review.get('reasoning_effort')}): {review.get('rationale')}",
+                      f"Counterargument: {review.get('counterargument')}"]
         if action == "conditional_buy" and isinstance(strategy, dict):
             trigger, stop, target = (strategy.get(key) or {} for key in ("entry_trigger", "stop", "target"))
             timing, risk = strategy.get("time_exit") or {}, strategy.get("risk_budget") or {}
+            schedule = strategy.get("timing") or {}
+            window = schedule.get("entry_window") or {}
+            if window:
+                lines += [f"Approximate buy-check window in Nashville: {_window_text(window, 'local')}. Only enter if the price trigger and cap below are satisfied; this is not a predicted profitable time."]
+            review_window, exit_window = schedule.get("illustrative_review") or {}, schedule.get("illustrative_time_exit") or {}
+            if review_window and exit_window:
+                lines += [f"If first filled on {schedule.get('illustrative_entry_date')}, illustrative review: {_window_text(review_window, 'local')}; time exit: {_window_text(exit_window, 'local')}. Recalculate from your real fill; no holding is assumed."]
             lines += ["Approximate strategy:",
                       f"- Entry: {trigger.get('verification') or 'Confirm a fresh quote and the entry trigger.'}",
                       f"- Maximum entry reference: {strategy.get('maximum_entry')}; setup valid through {strategy.get('setup_valid_through') or 'the next five sessions'}.",
@@ -61,16 +81,28 @@ def report_message(report: dict, *, sender: str, recipient: str, event_key: str,
                       f"- Target reference: {target.get('price', idea.get('target'))}; confirm a fresh price before reviewing an exit.",
                       f"- Time review: after {timing.get('review_after_sessions', 5)} sessions; close or reassess by {timing.get('exit_after_sessions', 15)} sessions from an actual verified fill. None is assumed.",
                       f"- Risk per share at the entry reference: {risk.get('planned_risk_per_share')} {risk.get('currency', idea.get('currency'))}. For sizing, recompute actual entry minus stop plus estimated round-trip costs, divide your chosen loss budget by that amount, round down to the broker lot size and cap to available cash. No quantity is assumed; gaps and currency moves can increase losses."]
+            if selected:
+                # Keep the alert readable; the detailed audit retains formulas.
+                lines[-1] = f"- Planned risk per share: {risk.get('planned_risk_per_share')} {risk.get('currency', idea.get('currency'))}, plus costs. Choose size from your cash/loss budget; gaps can exceed it."
         elif action == "conditional_buy":
             lines += ["Approximate strategy: verify a fresh quote and breakout through the entry reference; skip a large gap or deteriorated evidence. The invalidation and target are risk references. Review after 5 sessions from a verified fill and close/reassess by 15; no fill is assumed. Position size requires your chosen loss budget and a same-currency quote."]
         elif action == "reduce_if_owned":
             lines += ["You report no holdings. This is a review reference for an owner; it is not a sell or short instruction for your current account."]
         else:
             lines += ["Wait: required evidence or trading conditions are incomplete. No entry is suggested."]
-        lines += ["Reasons: " + "; ".join(str(x) for x in idea.get("reasons", [])),
-                  "Conditions: " + "; ".join(str(x) for x in idea.get("conditions", [])),
-                  "Material risks: " + "; ".join(str(x) for x in idea.get("risks", [])),
-                  "Evidence: " + "\n".join(str(x) for x in idea.get("evidence_urls", [])), ""]
+        briefs = idea.get("evidence_briefs") or []
+        if briefs:
+            lines += ["Evidence in plain language:"]
+            for brief in briefs[:5]:
+                sources = "; ".join(str(x) for x in brief.get("source_urls", [])[:2])
+                lines += [f"- {brief.get('claim')} {brief.get('meaning')}" + (f" Limitation: {brief.get('limitation')}" if brief.get("limitation") else ""),
+                          f"  Source: {sources}"]
+            lines += ["Material risks: " + "; ".join(str(x) for x in idea.get("risks", [])[:3]), ""]
+        else:
+            lines += ["Reasons: " + "; ".join(str(x) for x in idea.get("reasons", [])),
+                      "Conditions: " + "; ".join(str(x) for x in idea.get("conditions", [])),
+                      "Material risks: " + "; ".join(str(x) for x in idea.get("risks", [])),
+                      "Evidence: " + "\n".join(str(x) for x in idea.get("evidence_urls", [])), ""]
     lines += ["The attached Markdown and JSON retain world-news context, financial periods/currencies, source dates, commentary coverage and waits. Collection counters describe the source run; delivery is recorded separately.",
               "This is a bounded configured screen, with selection and source-access gaps. Sentiment and headline rules do not establish predictive probabilities. Stops cannot guarantee an exit price; gaps, currency exposure and costs can exceed a planned loss."]
     message.set_content("\n".join(lines))
@@ -81,6 +113,17 @@ def report_message(report: dict, *, sender: str, recipient: str, event_key: str,
     if len(result) > 5_000_000:
         raise ValueError("Email report exceeds the supported message bound")
     return result
+
+
+def _window_text(window, prefix):
+    from zoneinfo import ZoneInfo
+    try:
+        zone = ZoneInfo(window[prefix + "_timezone"])
+        start = datetime.fromisoformat(window[prefix + "_open"]).astimezone(zone)
+        end = datetime.fromisoformat(window[prefix + "_close"]).astimezone(zone)
+        return start.strftime("%a %b %d, %Y %I:%M %p") + "–" + end.strftime("%I:%M %p %Z")
+    except (ValueError, KeyError, TypeError):
+        return "calendar unavailable; verify exchange hours with your broker"
 
 
 class EmailOutbox:

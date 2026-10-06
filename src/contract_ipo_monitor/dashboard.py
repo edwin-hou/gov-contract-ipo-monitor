@@ -134,6 +134,25 @@ def market_sections_html(report: dict[str, Any], *, limit: int = 50) -> str:
             + "".join(f"<td>{level}</td>" for level in levels) + "</tr>"
         )
         sources = " · ".join(_link(url, "Evidence") for url in _texts(idea.get("evidence_urls")))
+        briefs = _rows(idea.get("evidence_briefs"))
+        if briefs:
+            sources = "<p>Evidence in plain language:</p><ul>" + "".join(
+                f"<li>{_text(brief.get('claim'))} <strong>{_text(brief.get('meaning'))}</strong> "
+                f"Limitation: {_text(brief.get('limitation'))}. " + " · ".join(_link(url, "Source") for url in _texts(brief.get("source_urls"))[:2]) + "</li>"
+                for brief in briefs[:5]) + "</ul>"
+        current = idea.get("current_quote") or {}
+        quote_note = ""
+        if isinstance(current, dict) and current:
+            freshness = current.get("freshness") or {}
+            quote_note = (f"<p>Latest price reference: <strong>{display_number(current.get('price'))} {currency}</strong>; "
+                          f"as of {_text(current.get('quote_at') or current.get('session_date'))}, {_text(current.get('quote_type'))}. "
+                          f"Checked {_text(current.get('observed_at'))}; freshness {_text(freshness.get('status', current.get('status')))}. "
+                          f"{_link(current.get('source_url'), 'Quote source')}. Not an executable broker quote.</p>")
+        schedule = (idea.get("strategy") or {}).get("timing") or {}
+        window = schedule.get("entry_window") or {}
+        if window:
+            from .notifications import _window_text
+            quote_note += f"<p>Conditional buy-check window in Nashville: {_text(_window_text(window, 'local'))}. Enter only if the price trigger, entry cap and fresh broker checks pass.</p>"
         context = "".join(
             f"<li>{_link(event.get('source_url'), event.get('title'))} — {_text(event.get('publisher'))}, {_text(event.get('published_at'))}; "
             f"{_text(', '.join(_texts(event.get('themes'))))}. {_text(event.get('interpretation'), 'Exposure interpretation is unverified; price direction is unknown.')}</li>"
@@ -142,6 +161,7 @@ def market_sections_html(report: dict[str, Any], *, limit: int = 50) -> str:
         idea_details.append(
             f"<details><summary>{_text(idea.get('symbol'))}: {action_label(action)} — checks and evidence</summary>"
             f"<p>Horizon: {_text(idea.get('horizon'))}. Generated: {_text(idea.get('generated_at'))}. Confidence: {_text(idea.get('confidence'))}.</p>"
+            f"{quote_note}"
             f"<p>{'Why wait' if action not in {'conditional_buy', 'reduce_if_owned'} else 'Conditions to review'}:</p>{_list(checks)}"
             f"<p>Research reasons:</p>{_list(reasons, empty='No supporting reason recorded.')}"
             f"<p>Risks and limitations:</p>{_list(_texts(idea.get('risks')) + _texts(idea.get('limitations')))}"
@@ -152,7 +172,7 @@ def market_sections_html(report: dict[str, Any], *, limit: int = 50) -> str:
     sections.append(
         '<div class="card"><h2>Conditional trade ideas</h2>'
         '<p>Conditional buy means review the entry trigger and all checks before considering a purchase. Reduce if already owned is a review for an existing holding. Wait means the required evidence or setup is missing. No orders are placed.</p>'
-        '<p>Prices are latest completed daily observations, not executable live quotes. Screening rules have no validated return forecast. Invalidation is a risk reference, not a guaranteed exit; gaps and costs can increase losses. For reduce-if-owned, the holding review level is the recent low to check against a fresh quote. Levels use the displayed trading currency.</p>'
+        '<p>Trend calculations use completed daily observations, not executable live quotes. Separately collected quote references show their timestamp, type and freshness; none guarantees a broker execution price. Screening rules and AI reviews have no validated return forecast. Invalidation is a risk reference, not a guaranteed exit; gaps and costs can increase losses. Levels use the displayed trading currency.</p>'
         '<table><thead><tr><th>Company / listing</th><th>Research state</th><th>Last completed close / date</th><th>Conditional entry</th><th>Invalidation / holding review level</th><th>Target reference</th><th>Risk / reward reference</th></tr></thead>'
         f"<tbody>{idea_body}</tbody></table>{''.join(idea_details)}</div>"
     )

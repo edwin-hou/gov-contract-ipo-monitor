@@ -189,7 +189,7 @@ def report_markdown(report: dict[str, Any]) -> str:
                 lines.append(f"| {link(receipt.get('source_url'), receipt.get('source'))} | {clean(receipt.get('status'))} | {clean(receipt.get('observed_at'))} | {clean(receipt.get('collected_count', 0))} | {clean(receipt.get('error') or '; '.join(items(receipt.get('limitations'))))} |")
         lines += ["", "## Conditional trade ideas", "",
                   "Conditional buy means review the entry trigger and all checks before considering a purchase. Reduce if already owned is a review for an existing holding. Wait means the required evidence or setup is missing. No orders are placed.", "",
-                  "Prices are latest completed daily observations, not executable live quotes. Screening rules have no validated return forecast. Invalidation is a risk reference, not a guaranteed exit; gaps and costs can increase losses. For reduce-if-owned, the holding review level is the recent low to check against a fresh quote. Levels use the displayed trading currency.", "",
+                  "Trend calculations use completed daily observations. Current quote references below are collected separately and labelled live, delayed, session-close or unavailable; none proves a broker execution price. Screening rules and AI reviews have no validated return forecast. Invalidation is a risk reference, not a guaranteed exit; gaps and costs can increase losses. Levels use the displayed trading currency.", "",
                   "| Company / listing / currency | Research state | Last completed close / date | Conditional entry | Invalidation / holding review level | Target reference | Risk / reward reference | Main check / why wait |",
                   "|---|---|---|---|---|---|---|---|"]
         ideas = rows(report.get("trade_ideas"))
@@ -220,10 +220,29 @@ def report_markdown(report: dict[str, Any]) -> str:
                       *[f"- {clean(item)}" for item in checks], "", "Research reasons:", "",
                       *[f"- {clean(item)}" for item in reasons], "", "Risks and limitations:", "",
                       *[f"- {clean(item)}" for item in items(idea.get("risks")) + items(idea.get("limitations"))]]
+            current = idea.get("current_quote") or {}
+            if isinstance(current, dict) and current:
+                freshness = current.get("freshness") or {}
+                lines += ["", f"Latest price reference: **{display_number(current.get('price'))} {clean(idea.get('currency'))}**; as of {clean(current.get('quote_at') or current.get('session_date'))}, {clean(current.get('quote_type'))}. Checked {clean(current.get('observed_at'))}. Freshness: {clean(freshness.get('status', current.get('status')))} — {clean(freshness.get('reason'))}. {link(current.get('source_url'), 'Quote source')}."]
+            schedule = (idea.get("strategy") or {}).get("timing") or {}
+            window = schedule.get("entry_window") or {}
+            if window:
+                from .notifications import _window_text
+                lines += ["", f"Conditional buy-check window in Nashville: **{clean(_window_text(window, 'local'))}**. A purchase still requires the price trigger, entry cap and fresh broker confirmation; this is not a predicted profitable time."]
+                review_window, exit_window = schedule.get("illustrative_review") or {}, schedule.get("illustrative_time_exit") or {}
+                if review_window and exit_window:
+                    lines += [f"If actually filled on {clean(schedule.get('illustrative_entry_date'))}, illustrative review: {clean(_window_text(review_window, 'local'))}; time exit: {clean(_window_text(exit_window, 'local'))}. Recalculate from the real fill."]
+            briefs = rows(idea.get("evidence_briefs"))
+            if briefs:
+                lines += ["", "Evidence in plain language:", ""]
+                for brief in briefs[:5]:
+                    sources = " · ".join(link(url, "Source") for url in items(brief.get("source_urls"))[:2])
+                    lines.append(f"- {clean(brief.get('claim'))} **{clean(brief.get('meaning'))}** Limitation: {clean(brief.get('limitation'))}. {sources}")
             for event in rows(idea.get("world_context")):
                 lines += ["", f"Related publisher report: {link(event.get('source_url'), event.get('title'))} — {clean(event.get('publisher'))}, {clean(event.get('published_at'))}; {clean(', '.join(items(event.get('themes'))))}. {clean(event.get('interpretation') or 'Exposure interpretation is unverified; price direction is unknown.')}"]
             urls = items(idea.get("evidence_urls"))
-            lines += ["", "Evidence: " + (" · ".join(link(url) for url in urls) or "No linked evidence is available.")]
+            if not briefs:
+                lines += ["", "Evidence: " + (" · ".join(link(url) for url in urls) or "No linked evidence is available.")]
         lines += ["", "## Price coverage", "", "| Symbol | Provider | Status | Completed price date | Error / limitation |", "|---|---|---|---|---|"]
         for receipt in rows(report.get("price_coverage")):
             detail = "; ".join(items([receipt.get("error"), *items(receipt.get("limitations"))]))

@@ -35,6 +35,10 @@ def test_entry_reference_uses_frozen_levels_not_latest_moving_signal():
     assert not updated["TEST"]["assumed_position"]
     assert "not a recorded fill" in events[0]["message"]
     assert plans == seed()  # input state remains immutable
+    assert updated["TEST"]["reference_review"]["session_date"] == "2026-10-13"
+    assert updated["TEST"]["reference_time_exit"]["session_date"] == "2026-10-27"
+    assert updated["TEST"]["reference_review"]["local_open"] == "2026-10-13T08:30:00-05:00"
+    assert "Real position dates require the actual fill" in events[0]["message"]
 
 
 def test_entry_gap_is_not_chased_and_the_same_bar_does_not_reseed():

@@ -115,6 +115,12 @@ class MarketSnapshot(BaseModel):
     volume: float | None = None
     source: str
     delayed: bool = True
+    observed_at: datetime | None = None
+    currency: str | None = None
+    exchange_timezone: str | None = None
+    timestamp_precision: str = "unknown"
+    timestamp_basis: str = "unknown"
+    provider_timestamp: str | None = None
 
 
 class EntityMatch(BaseModel):

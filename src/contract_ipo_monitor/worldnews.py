@@ -176,6 +176,79 @@ def associate_events(exposure_keys: Iterable[str], events: Iterable[WorldEvent],
     return tuple(sorted(matched, key=lambda item: item.published_at, reverse=True))
 
 
+# These are relevance bridges, not extra news themes or forecasts. A broad
+# geopolitical/energy label alone cannot connect every headline to every stock.
+_SECTOR_BRIDGES = {
+    "semiconductors": ("semiconductor", "semiconductors", "chipmaker", "chipmakers", "memory chips", "dram", "nand"),
+    "memory": ("memory chips", "dram", "nand", "high bandwidth memory", "high-bandwidth memory"),
+    "ai_compute": ("ai chips", "ai chip", "ai infrastructure", "data center", "data centers", "data centre", "data centres"),
+    "enterprise_ai": ("enterprise software", "enterprise ai", "artificial intelligence software"),
+    "cloud": ("cloud computing", "cloud infrastructure", "cloud services"),
+    "ecommerce": ("ecommerce", "e-commerce", "online retail"),
+    "payments": ("digital payments", "payment processing", "fintech"),
+    "advertising": ("digital advertising", "online advertising", "social media advertising"),
+    "defense_spending": ("defense spending", "defence spending", "defense procurement", "defence procurement"),
+}
+
+
+def _phrase_matches(text: str, terms: Iterable[str]) -> list[str]:
+    return [term for term in terms if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text, re.I)]
+
+
+def relevant_world_events(instrument, events: Iterable[WorldEvent], *, now: datetime,
+                          max_age: timedelta = timedelta(days=2)) -> tuple[tuple[WorldEvent, dict], ...]:
+    """Require an explainable issuer/sector or U.S./global monetary connection.
+
+    Publisher prose supplies the connection, never verified economic impact.
+    Equal URLs or normalized headline/summary text count once across publishers.
+    """
+    from .sources.discourse import CompanyWatch, matching_companies
+    from .market import _venue_group
+    if now.utcoffset() is None or max_age <= timedelta(0):
+        raise ValueError("World relevance requires aware time and a positive window")
+    exposures = set(instrument.macro_exposures)
+    watch = CompanyWatch(instrument.name, tuple(instrument.aliases))
+    us_listing = _venue_group(instrument.exchange) in {"NASDAQ", "NYSE", "NYSE_ARCA", "NYSE_AMERICAN"}
+    bridges = tuple(dict.fromkeys(term for key in exposures for term in _SECTOR_BRIDGES.get(key, ())))
+    candidates, seen_urls, seen_text = [], set(), set()
+    for event in sorted(events, key=lambda item: item.published_at or datetime.min.replace(tzinfo=UTC), reverse=True):
+        if (event.published_at is None or event.observed_at > now
+                or not timedelta(0) <= now-event.published_at <= max_age):
+            continue
+        themes = sorted(exposures.intersection(event.themes))
+        if not themes:
+            continue
+        text = plain_text(event.title + ". " + event.text, 2500)
+        terms = _phrase_matches(text, bridges)
+        if matching_companies(text, (watch,)):
+            relevance = "The publisher text explicitly mentions " + instrument.name + "."
+            connection = "company_mention"
+        elif terms:
+            relevance = "The publisher text mentions " + ", ".join(terms[:3]) + "; these connect to the issuer's reviewed sector/exposures."
+            connection = "sector_mention"
+        elif ("rates" in themes and (_phrase_matches(text, ("global interest rates", "global central banks"))
+                or us_listing and _phrase_matches(text, ("federal reserve", "u.s. interest rates", "us interest rates")))):
+            relevance = "The explicitly U.S./global monetary-policy report connects to equity financing and discount-rate exposure."
+            connection = "market_wide_monetary_policy"
+        elif ("inflation" in themes and (_phrase_matches(text, ("global inflation",))
+                or us_listing and _phrase_matches(text, ("u.s. inflation", "us inflation", "u.s. consumer price index", "us consumer price index")))):
+            relevance = "U.S. or global inflation is a broad cost/discount-rate exposure; the issuer-specific effect is not measured."
+            connection = "market_wide_inflation"
+        else:
+            continue
+        url = _public_url(event.source_url)
+        digest = hashlib.sha256(re.sub(r"\W+", " ", text.casefold()).strip().encode()).hexdigest()
+        if url in seen_urls or digest in seen_text:
+            continue
+        seen_urls.add(url)
+        seen_text.add(digest)
+        candidates.append((event, {"title": event.title, "source_url": url, "publisher": event.publisher,
+            "published_at": event.published_at.isoformat(), "themes": themes, "connection": connection,
+            "relevance": relevance, "direction": "unknown",
+            "interpretation": "Publisher-reported connection; direction and material impact are unverified."}))
+    return tuple(candidates)
+
+
 class WorldNewsCollector:
     def __init__(self, client: ResilientClient | None = None, *, feeds: tuple[WorldFeed, ...] = DEFAULT_FEEDS,
                  max_items_per_feed: int = 30):

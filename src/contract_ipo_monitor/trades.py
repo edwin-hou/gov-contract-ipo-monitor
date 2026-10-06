@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import re
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from statistics import mean
@@ -82,6 +84,149 @@ def sessions_after(start: date, count: int, exchange: str) -> date:
     return day
 
 
+def session_window(exchange: str, day: date, *, local_timezone: str = "America/Chicago") -> dict:
+    """Scheduled cash session, with explicit exchange and Nashville clocks."""
+    if not _session_open(exchange, day):
+        raise ValueError("Requested date is not an open regular session")
+    exchange_zone, local_zone = ZoneInfo("America/New_York"), ZoneInfo(local_timezone)
+    close_hour = 13 if day.strftime("%m-%d") in _US_EARLY.get(day.year, set()) else 16
+    opened = datetime.combine(day, time(9, 30), exchange_zone)
+    closed = datetime.combine(day, time(close_hour), exchange_zone)
+    return {"session_date": day.isoformat(), "exchange_timezone": exchange_zone.key,
+            "local_timezone": local_zone.key, "local_location": "Nashville" if local_zone.key == "America/Chicago" else local_zone.key,
+            "exchange_open": opened.isoformat(), "exchange_close": closed.isoformat(),
+            "local_open": opened.astimezone(local_zone).isoformat(), "local_close": closed.astimezone(local_zone).isoformat(),
+            "early_close": close_hour == 13}
+
+
+def next_session_window(exchange: str, at: datetime, *, local_timezone: str = "America/Chicago") -> dict:
+    """Current session when still open, otherwise the next scheduled session."""
+    if at.utcoffset() is None:
+        raise ValueError("Session timing requires an aware timestamp")
+    local = at.astimezone(ZoneInfo("America/New_York"))
+    day = local.date()
+    while True:
+        if _session_open(exchange, day):
+            window = session_window(exchange, day, local_timezone=local_timezone)
+            if at < datetime.fromisoformat(window["exchange_close"]):
+                window["availability"] = "regular_session_now" if at >= datetime.fromisoformat(window["exchange_open"]) else "next_regular_session"
+                return window
+        day += timedelta(days=1)
+
+
+def _timing(exchange: str, now: datetime) -> dict:
+    try:
+        window = next_session_window(exchange, now)
+    except ValueError:
+        return {"status": "unavailable", "limitation": "The venue/year regular-session calendar has not been reviewed; no entry or exit date is inferred."}
+    return {"status": "calendar_only", "entry_window": window, "setup_expiry": None,
+            "illustrative_review": None, "illustrative_time_exit": None,
+            "anchor": "No fill is assumed. Review/exit dates require the actual verified fill date; illustrative dates below assume entry during the stated candidate session.",
+            "limitation": "Scheduled windows are not predicted profitable timestamps. Halts, unscheduled closures, spreads and fresh executable prices require confirmation."}
+
+
+def _brief(identity: str, kind: str, claim: str, meaning: str, relevance: str,
+           direction: str, limitation: str, urls) -> dict:
+    return {"id": identity, "evidence_type": kind, "claim": claim, "meaning": meaning,
+            "relevance": relevance, "direction": direction, "limitation": limitation,
+            "source_urls": list(dict.fromkeys(url for url in urls if _source_host(url)))[:3]}
+
+
+def _company_evidence(instrument, records, *, now: datetime) -> tuple[list, list]:
+    from .sources.discourse import CompanyWatch, matching_companies, plain_text
+    watch = CompanyWatch(instrument.name, tuple(instrument.aliases))
+    business = re.compile(r"\b(?:revenue|earnings|profit|demand|orders|guidance|sales|growth|valuation|shares|stock|investment|investing|buy|sell|bullish|bearish|production|capacity|export|chips|semiconductors|memory)\b", re.I)
+    news, commentary, urls, texts = [], [], set(), set()
+    def dated(item):
+        stamp = item.published_at
+        return stamp if isinstance(stamp, datetime) and stamp.utcoffset() is not None else datetime.min.replace(tzinfo=UTC)
+    for record in sorted(records, key=dated, reverse=True):
+        if (instrument.name not in record.company_names or len(set(record.company_names)) != 1
+                or record.text_kind == "video_metadata" or not isinstance(record.retrieved_at, datetime)
+                or record.retrieved_at.utcoffset() is None or record.retrieved_at > now
+                or not isinstance(record.published_at, datetime) or record.published_at.utcoffset() is None
+                or not timedelta(0) <= now-record.published_at <= timedelta(days=7)
+                or not _source_host(record.source_url)):
+            continue
+        title, text = plain_text(record.title, 250), plain_text(record.text, 2500)
+        # A mention in unrelated prose, navigation or an advertisement cannot
+        # turn the entire article into company research. Require a business
+        # sentence mentioning the issuer; synthetic forum titles are ignored.
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        direct = (record.source_kind == "news" and matching_companies(title, (watch,)) and business.search(title))
+        connected = next((part for part in sentences if matching_companies(part, (watch,)) and business.search(part)), None)
+        if not direct and not connected:
+            continue
+        normalized = re.sub(r"\W+", " ", (title + " " + text).casefold()).strip()
+        digest = hashlib.sha256(normalized.encode()).hexdigest()
+        if record.source_url in urls or digest in texts:
+            continue
+        urls.add(record.source_url)
+        texts.add(digest)
+        (news if record.source_kind == "news" else commentary).append((record, title if direct else connected[:250]))
+    return news, commentary
+
+
+def _evidence_briefs(result, instrument, fact, history, company_evidence, now, fundamental_max_age_days, source_summary=None) -> list[dict]:
+    briefs = []
+    if (fact is not None and fact.symbol == instrument.symbol and _financial_source_reviewed(instrument, fact)
+            and fact.accounting_standard in {"US GAAP", "IFRS", "Taiwan IFRS"}
+            and (not instrument.reporting_currency or fact.currency == instrument.reporting_currency)
+            and fact.is_fresh(now, max_age_days=fundamental_max_age_days)):
+        briefs.append(_brief("financial", "primary_financial",
+            f"{fact.period_type.title()} ended {fact.period_end.isoformat()}: total revenue {fact.currency} {fact.revenue:,.0f}, up {fact.growth*100:.1f}% YoY; reported net income {fact.currency} {fact.net_income:,.0f} ({fact.net_margin*100:.1f}% margin).",
+            "Growth and reported profit meet the financial screen." if fact.growth >= .10 and fact.net_income > 0 and fact.net_margin >= .05 else "These figures do not meet the required growth/profit screen.",
+            "Dated entity-wide issuer results for this security, using comparable reported periods.", "historical_fundamentals",
+            "Reported " + fact.reported_at.isoformat() + "; historical growth is not fair valuation or a forecast. " + " ".join(fact.limitations[:1]), [fact.source_url]))
+    values = result.get("indicators")
+    if values and history:
+        briefs.append(_brief("price_trend", "completed_price_history",
+            f"{result['price_as_of']} completed close {instrument.currency} {values['last_close']:.2f}; 20-session return {values['return20']*100:+.1f}%, {values['relative_return20']*100:+.1f} percentage points versus {instrument.benchmark_symbol}.",
+            "The completed-bar trend supports a conditional breakout watch." if result["action"] == "conditional_buy" else "The historical trend is a screening input; the displayed action remains conditional or WAIT.",
+            "Verified listing/currency and aligned benchmark session dates.", "historical_price_trend",
+            "Daily closes are historical; a fresh quote, spread, valuation and corporate-action review are still required.", [history.source_url, result.get("benchmark_source_url")]))
+    news, commentary = _company_evidence(instrument, company_evidence, now=now)
+    if news:
+        record, excerpt = news[0]
+        briefs.append(_brief("company:" + record.evidence_id[:12], "publisher_company_news",
+            f"{record.published_at.date().isoformat()} publisher headline/summary: {excerpt}",
+            "A current company-business report to verify before entry; it is not a confirmed earnings fact or price forecast.",
+            "Explicit company mention in a business-relevant sentence.", "unknown",
+            "Publisher report and bounded feed summary; underlying claims and market impact are unverified.", [record.source_url]))
+    if result["world_context"]:
+        item = result["world_context"][0]
+        identity = hashlib.sha256(item["source_url"].encode()).hexdigest()[:12]
+        briefs.append(_brief("world:" + identity, "publisher_world_context",
+            item["publisher"] + " (" + item["published_at"][:10] + "): " + item["title"][:250],
+            "Review this connected macro report for possible cost, demand or policy risk before entry; no price direction is established.",
+            item["relevance"], "unknown",
+            "Publisher-reported event, not independent verification; the issuer impact may be absent or already priced in.", [item["source_url"]]))
+    sampled = result["sentiment"]
+    source_summary = source_summary or {}
+    tones = source_summary.get("evidence_tones", ())
+    sources = source_summary.get("by_source", ())
+    tones = tones if isinstance(tones, (tuple, list)) else ()
+    sources = sources if isinstance(sources, (tuple, list)) else ()
+    measured = {row.get("evidence_id") for row in tones
+                if isinstance(row, dict) and row.get("score") is not None and not row.get("excluded_reason")}
+    basis = []
+    for row in sources:
+        if (isinstance(row, dict) and isinstance(row.get("source_kind"), str)
+                and isinstance(row.get("scored_count"), int) and not isinstance(row["scored_count"], bool)
+                and row["scored_count"] > 0):
+            basis.append(f"{row['scored_count']} {row['source_kind']}")
+    source_note = " (" + ", ".join(basis[:5]) + ")" if basis else ""
+    supporting_links = [row[0].source_url for row in [*commentary, *news] if row[0].evidence_id in measured][:2]
+    meaning = ("The sample contains conflicting views; aggregate tone is not consensus." if "conflicting_views" in sampled["bias_flags"]
+               else "Unknown tone provides no positive confirmation; measured tone is supporting context only.")
+    briefs.append(_brief("commentary", "sampled_commentary",
+        f"Collected English-language tone: {sampled['label']}; {sampled['scored_count']} scored items{source_note} across {sampled['independent_origins']} sampled origins.",
+        meaning,
+        "Company-matched source sample, not an internet-wide opinion poll.", "unknown",
+        "Lexicon attribution, publisher/community selection, sarcasm and quoted opinions can bias the result; popularity is not truth.", supporting_links))
+    return briefs[:5]
+
+
 def business_days_since(day: date, today: date) -> int:
     if day > today:
         return -1
@@ -111,7 +256,11 @@ def indicators(bars) -> dict[str, float]:
 
 
 def _source_host(url: str) -> str | None:
+    if not isinstance(url, str):
+        return None
     try:
+        from .worldnews import _public_url
+        _public_url(url)
         parsed = urlparse(url)
         if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.hostname:
             return None
@@ -233,7 +382,7 @@ def _price_constraints(history, expected, *, now: datetime, max_age: int, label:
 def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] | None,
                  events, *, now: datetime, world_coverage_ok: bool,
                  max_price_age_business_days: int = 1, fundamental_max_age_days: int = 120,
-                 benchmark_instrument=None) -> dict:
+                 benchmark_instrument=None, company_evidence=(), current_quote=None) -> dict:
     if now.utcoffset() is None or not 0 <= max_price_age_business_days <= 5 or fundamental_max_age_days < 1:
         raise ValueError("Trade research requires an aware timestamp and valid freshness limits")
     result = {
@@ -243,7 +392,8 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
         "entry": None, "invalidation": None, "target": None, "risk_reward": None,
         "price_as_of": None, "conditions": [], "reasons": [], "risks": [],
         "sentiment": _sentiment_context(sentiment), "strategy": _base_strategy(instrument.currency),
-        "fundamentals": None, "indicators": None, "world_context": [], "evidence_urls": [],
+        "fundamentals": None, "indicators": None, "world_context": [], "evidence_urls": [], "evidence_briefs": [],
+        "current_quote": None,
         "method": "growth_profit_momentum_v2; long setups or reduce-if-owned; unvalidated screening rules",
         "confidence": "insufficient_evidence",
         "limitations": ["No brokerage orders are placed. Prices are daily observations, not executable live quotes.",
@@ -251,11 +401,46 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
                         "Reported profit and growth do not establish fair valuation; valuation and portfolio suitability remain unverified.",
                         "An invalidation price is not a guaranteed exit; gaps and execution costs can worsen losses."],
     }
+    result["strategy"]["timing"] = _timing(instrument.exchange, now)
+    if current_quote is not None:
+        from .quotes import quote_freshness, quote_to_dict
+        from .market import _venue_group
+        quote = quote_to_dict(current_quote)
+        quote["freshness"] = quote_freshness(current_quote, at=now)
+        if (current_quote.symbol != instrument.symbol or current_quote.currency != instrument.currency
+                or _venue_group(current_quote.exchange) != _venue_group(instrument.exchange)):
+            quote["freshness"] = {"status": "unavailable", "reason": "Quote listing or currency does not match this instrument", "executable": False}
+        quote["status"] = quote["freshness"]["status"]
+        result["current_quote"] = quote
+
+    def finish():
+        quote = result["current_quote"]
+        if result["action"] == "conditional_buy":
+            status, reason = "refresh_required", "A fresh regular-session quote and broker spread/fill check are required before considering entry."
+            if quote and quote["freshness"]["status"] == "fresh":
+                if quote["quote_type"] == "session_close" or quote["freshness"].get("market_phase") != "regular":
+                    status, reason = "session_reference_only", "The latest completed close is a reference; wait for the eligible regular session and refresh."
+                elif quote["price"] < result["entry"]:
+                    status, reason = "below_trigger", "The informational quote has not reached the entry trigger; wait."
+                elif quote["price"] > result["strategy"]["maximum_entry"]:
+                    status, reason = "above_entry_cap", "The informational quote exceeds the entry cap; do not chase this setup."
+                else:
+                    status, reason = "informational_trigger_present", "The timestamped informational quote is within the trigger/cap band; broker spread, executable price and risk checks remain required."
+            result["strategy"]["entry_quote_check"] = {"status": status, "reason": reason, "executable": False}
+        result["evidence_briefs"] = _evidence_briefs(result, instrument, fact, history, company_evidence, now, fundamental_max_age_days, sentiment)
+        result["risks"] = list(dict.fromkeys(result["risks"]))
+        result["evidence_urls"] = list(dict.fromkeys(result["evidence_urls"] + [url for brief in result["evidence_briefs"] for url in brief["source_urls"]]))
+        return result
+
     blockers = []
     if fact is None:
         blockers.append("No comparable, sourced company results")
     else:
         result["fundamentals"] = {"period_end": fact.period_end.isoformat(), "reported_at": fact.reported_at.isoformat(),
+             "revenue": fact.revenue, "prior_revenue": fact.prior_revenue,
+             "period_start": fact.period_start.isoformat() if fact.period_start else None,
+             "prior_period_end": fact.prior_period_end.isoformat() if fact.prior_period_end else None,
+             "prior_period_start": fact.prior_period_start.isoformat() if fact.prior_period_start else None,
              "revenue_growth_percent": round(fact.growth*100,2), "net_margin_percent": round(fact.net_margin*100,2),
              "net_income": fact.net_income, "reporting_currency": fact.currency, "period_type": fact.period_type,
              "accounting_standard": fact.accounting_standard, "source_url": fact.source_url}
@@ -281,26 +466,11 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
         result["evidence_urls"].append(history.source_url)
         result["risks"].extend(history.limitations)
         blockers.extend(_price_constraints(history, instrument, now=now, max_age=max_price_age_business_days, label="Price"))
-    related = []
-    for event in events:
-        if not event.published_at:
-            continue
-        stamp = event.published_at
-        if stamp.tzinfo is None:
-            continue
-        if event.observed_at > now or _source_host(event.source_url) is None:
-            continue
-        if not timedelta(0) <= now-stamp <= timedelta(days=2):
-            continue
-        matches = sorted(set(event.themes).intersection(instrument.macro_exposures))
-        if not matches:
-            continue
-        related.append(event)
-        result["world_context"].append({"title": event.title, "source_url": event.source_url,
-            "publisher": event.publisher, "published_at": stamp.isoformat(), "themes": matches,
-            "interpretation": "Relevant exposure to these themes; direction and material impact are unverified."})
-        result["evidence_urls"].append(event.source_url)
-    result["world_context"] = result["world_context"][:8]
+    from .worldnews import relevant_world_events
+    connections = relevant_world_events(instrument, events, now=now)
+    related = [event for event, _ in connections]
+    result["world_context"] = [context for _, context in connections[:8]]
+    result["evidence_urls"].extend(context["source_url"] for context in result["world_context"])
     risk_phrases = ("export ban", "export restrictions", "new sanctions", "supply disruption",
                     "blockade", "emergency rate", "rate hike", "inflation surge")
     risk_publishers = {event.publisher for event in related
@@ -317,9 +487,9 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
     if not world_coverage_ok:
         blockers.append("Fresh world-news coverage from at least two publishers is unavailable")
     if related:
-        result["risks"].append("Current world headlines affect relevant exposures; they can already be priced in and do not establish a trade direction")
+        result["risks"].append("Current world headlines mention relevant company/sector or monetary exposures; impact is unverified and can already be priced in")
     else:
-        result["risks"].append("No relevant theme was matched in the sampled world headlines; this does not establish that macro risk is absent")
+        result["risks"].append("No supported company, sector or relevant monetary connection was found in sampled world headlines; macro risk may still be present")
     negative_commentary = result["sentiment"]["label"] == "negative" and result["sentiment"]["scored_count"] >= 3
     if negative_commentary:
         result["risks"].append("Accessible commentary is negative; a new long entry requires contradictory evidence or a better setup")
@@ -349,32 +519,34 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
         result["conditions"] = list(dict.fromkeys(blockers))
         result["risks"] = list(dict.fromkeys(result["risks"]))
         result["evidence_urls"] = list(dict.fromkeys(result["evidence_urls"]))
-        return result
+        return finish()
     try:
         values = indicators(history.bars)
         market = indicators(benchmark.bars)
     except (ValueError, TypeError, OverflowError) as exc:
         result["conditions"] = [f"Price validation failed: {exc}"]
-        return result
+        return finish()
     relative = values["return20"]-market["return20"]
     values["relative_return20"] = relative
     result["indicators"] = {k: round(v,6) for k,v in values.items()}
+    result["benchmark_source_url"] = benchmark.source_url
     result["confidence"] = "sourced_conditional_setup; predictive_accuracy_unmeasured"
     if any(abs(b.close/a.close-1) > .30 for series in (history.bars, benchmark.bars)
            for a,b in zip(series[-61:], series[-61:][1:])):
         result["conditions"] = ["A daily move exceeds 30%; review corporate actions and the source before using raw-price momentum"]
-        return result
+        return finish()
     strategy = result["strategy"]
     try:
         start = completed_session_date(instrument.exchange, now)
         valid_through = sessions_after(start, 5, instrument.exchange)
     except ValueError as exc:
         result["conditions"] = [f"A reviewed setup expiry could not be established: {exc}"]
-        return result
+        return finish()
     strategy["setup_start_session"] = start.isoformat()
     strategy["setup_valid_through"] = valid_through.isoformat()
     strategy["expiry_rule"] = "The fifth completed regular session ends setup validity; subsequent closes cannot trigger this unchanged reference plan"
     strategy["calendar_source_url"] = "https://www.nasdaq.com/market-activity/stock-market-holiday-schedule"
+    strategy["timing"]["setup_expiry"] = session_window(instrument.exchange, valid_through)
     result["metrics"] = {"close": values["last_close"], "currency": instrument.currency,
                          "price_as_of": history.as_of.isoformat(), "exchange": instrument.exchange,
                          "exchange_timezone": history.exchange_timezone}
@@ -405,6 +577,11 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
                     target={"price": target, "currency": instrument.currency, "verification": "Review taking profit only on an explicitly owned position at an executable quote; a daily high does not prove a fill"})
                 strategy["risk_budget"].update(planned_risk_per_share=round(entry-stop,6), maximum_entry_risk_per_share=round(maximum_entry-stop,6),
                                                reward_risk_at_reference=round(reward_risk,6), reward_risk_at_maximum_entry=round((target-maximum_entry)/(maximum_entry-stop),6))
+                timing = strategy["timing"]
+                possible_entry = date.fromisoformat(timing["entry_window"]["session_date"])
+                timing.update(status="conditional_window", illustrative_entry_date=possible_entry.isoformat(),
+                    illustrative_review=session_window(instrument.exchange, sessions_after(possible_entry, 5, instrument.exchange)),
+                    illustrative_time_exit=session_window(instrument.exchange, sessions_after(possible_entry, 15, instrument.exchange)))
                 result["conditions"] = [f"Consider entry only if a fresh quote confirms a break above {instrument.currency} {entry:.2f}",
                     f"Cancel a new entry above {instrument.currency} {maximum_entry:.2f}; recheck reward/risk after costs and the actual fill",
                     "Review after 5 completed sessions from an actual fill; exit by session 15 or sooner at stop, target, or thesis invalidation",
@@ -415,7 +592,7 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
         result["conditions"] = ["Wait: trend, relative strength, volume, or volatility does not meet the entry screen"]
     result["risks"] = list(dict.fromkeys(result["risks"]))
     result["evidence_urls"] = list(dict.fromkeys(result["evidence_urls"]))
-    return result
+    return finish()
 
 
 def rank_ideas(ideas: list[dict]) -> list[dict]:
