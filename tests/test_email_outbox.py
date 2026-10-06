@@ -3,7 +3,7 @@ from pathlib import Path
 
 from contract_ipo_monitor.db import Database
 from contract_ipo_monitor.gate import AlertGate
-from contract_ipo_monitor.smtp_worker import SMTPWorker
+from contract_ipo_monitor.smtp_worker import DefinitiveSMTPFailure, SMTPWorker
 from test_gate import NOW, make_candidate
 
 
@@ -50,25 +50,27 @@ def test_smtp_worker_retries_temporary_failure(tmp_path: Path):
     AlertGate(db, now=NOW).evaluate(make_candidate())
 
     def broken(_message):
-        raise TimeoutError("temporary")
+        raise DefinitiveSMTPFailure("smtp_preflight_unavailable", safe_to_retry=True)
 
     worker = SMTPWorker(db, transport=broken, now=lambda: NOW, max_attempts=3)
     assert worker.run_once() is False
     row = db.fetch_outbox()[0]
     assert row["status"] == "pending"
     assert row["attempts"] == 1
-    assert "temporary" in row["last_error"]
+    assert row["last_error"] == "DefinitiveSMTPFailure"
     assert datetime.fromisoformat(row["next_attempt_at"]) > NOW
 
 
-def test_expired_lease_can_be_recovered_after_restart(tmp_path: Path):
+def test_expired_lease_is_fenced_after_restart(tmp_path: Path):
     db = Database(tmp_path / "monitor.db")
     db.initialize()
     AlertGate(db, now=NOW).evaluate(make_candidate())
     leased = db.lease_outbox(now=NOW, lease_for=timedelta(seconds=5))
     assert leased is not None
     assert db.lease_outbox(now=NOW + timedelta(seconds=3)) is None
-    assert db.lease_outbox(now=NOW + timedelta(seconds=6)) is not None
+    assert db.lease_outbox(now=NOW + timedelta(seconds=6)) is None
+    assert db.fetch_outbox()[0]["status"] == "unknown"
+    assert db.fetch_outbox()[0]["last_error"] == "smtp_interrupted_send"
 
 
 def test_repeated_failures_move_message_to_dead_letter(tmp_path: Path):
@@ -77,7 +79,7 @@ def test_repeated_failures_move_message_to_dead_letter(tmp_path: Path):
     AlertGate(db, now=NOW).evaluate(make_candidate())
 
     def broken(_message):
-        raise OSError("mail down")
+        raise DefinitiveSMTPFailure("smtp_preflight_unavailable", safe_to_retry=True)
 
     current = [NOW]
     worker = SMTPWorker(db, transport=broken, now=lambda: current[0], max_attempts=2, retry_base=timedelta(seconds=1))

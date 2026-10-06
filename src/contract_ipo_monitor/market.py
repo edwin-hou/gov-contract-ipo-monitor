@@ -266,13 +266,25 @@ class DailyPriceCollector:
             raise ValueError("Nasdaq historical rows are missing")
         values = [DailyBar(datetime.strptime(row["date"], "%m/%d/%Y").date(),
                            *(_number(row.get(key)) for key in ("open", "high", "low", "close", "volume"))) for row in rows]
-        bars = _validated_bars(values, observed_at=observed_at, target=self.target_bars, timezone="America/New_York")
+        from .trades import completed_session_date
+        cutoff = completed_session_date(instrument.exchange, observed_at)
+        today = _local_date(observed_at, "America/New_York")
+        # Calendar close alone is insufficient if the provider still reports
+        # an open session or omits session-state metadata.
+        if cutoff == today and metadata.get("marketStatus") != "Closed":
+            cutoff = completed_session_date(instrument.exchange, observed_at.astimezone(ZoneInfo("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0))
+        # A historical-table row fetched after its regular session completed
+        # can retain that date. The reviewed holiday/early-close calendar and
+        # 15-minute buffer exclude open sessions even across UTC midnight.
+        validated = _validated_bars(values, observed_at=observed_at, target=1000,
+                                    timezone="America/New_York", exclude_today=False)
+        bars = tuple(bar for bar in validated if bar.date <= cutoff)[-self.target_bars:]
         return PriceHistory(instrument.symbol, bars, "nasdaq", symbol, base + "historical?" + urlencode(params),
                             "USD", exchange, observed_at, declared_exchange=instrument.exchange,
                             exchange_timezone="America/New_York", metadata_source_url=base + "info?" + urlencode({"assetclass": assetclass}),
                             limitations=("Public Nasdaq site endpoint is undocumented and has no API SLA.",
                                          "USD unit is declared by the U.S. listing catalogue; the public response may omit currency metadata.",
-                                         "Current-day bars are excluded; these are past daily sessions, not executable intraday quotes.",
+                                         "Historical rows are limited to completed scheduled U.S. regular sessions plus a 15-minute buffer; same-day rows also require provider Closed status. Unscheduled halts/closures and provider finality remain unverified; prices are not executable quotes.",
                                          "Corporate-action and split adjustment status is unknown; raw price moves are not guaranteed total returns."))
 
     async def _yahoo(self, instrument: InstrumentLike, observed_at: datetime) -> PriceHistory | None:

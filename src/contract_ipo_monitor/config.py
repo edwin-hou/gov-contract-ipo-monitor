@@ -38,6 +38,9 @@ class Settings(BaseModel):
     forums_enabled: bool = True
     hacker_news_enabled: bool = True
     markets_enabled: bool = True
+    listed_discovery_enabled: bool = True
+    listed_discovery_max_new_ciks: int = 5
+    listed_discovery_max_candidates: int = 25
     watch_symbols: tuple[str, ...] = ()
     market_interval_seconds: int = 3600
     fundamental_refresh_days: int = 7
@@ -106,6 +109,9 @@ class Settings(BaseModel):
             forums_enabled=boolean("FORUMS_ENABLED", True),
             hacker_news_enabled=boolean("HACKER_NEWS_ENABLED", True),
             markets_enabled=boolean("MARKETS_ENABLED", True),
+            listed_discovery_enabled=boolean("LISTED_DISCOVERY_ENABLED", True),
+            listed_discovery_max_new_ciks=int(os.getenv("LISTED_DISCOVERY_MAX_NEW_CIKS", "5")),
+            listed_discovery_max_candidates=int(os.getenv("LISTED_DISCOVERY_MAX_CANDIDATES", "25")),
             watch_symbols=values("WATCH_SYMBOLS"),
             market_interval_seconds=int(os.getenv("MARKET_INTERVAL_SECONDS", "3600")),
             fundamental_refresh_days=int(os.getenv("FUNDAMENTAL_REFRESH_DAYS", "7")),
@@ -160,6 +166,8 @@ class Settings(BaseModel):
             errors.append("DISCOURSE_MAX_COMPANIES must be between 1 and 50.")
         if not 0 <= self.price_max_age_business_days <= 5:
             errors.append("PRICE_MAX_AGE_BUSINESS_DAYS must be between 0 and 5.")
+        if not 1 <= self.listed_discovery_max_new_ciks <= 5 or not 1 <= self.listed_discovery_max_candidates <= 25:
+            errors.append("Listed discovery bounds must be 1-5 new issuer CIKs and 1-25 active candidates.")
         if not 1 <= self.reddit_posts_per_company <= 10 or not 0 <= self.reddit_comments_per_post <= 50 or not 0 <= self.reddit_max_comments_per_run <= 300:
             errors.append("Reddit collection bounds are invalid (posts 1-10, comments/post 0-50, comments/run 0-300).")
         if (self.reddit_client_secret or self.reddit_refresh_token) and not self.reddit_client_id:

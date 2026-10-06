@@ -17,9 +17,10 @@ from .worldnews import world_event_from_dict
 
 class MarketMonitor:
     def __init__(self, db: Database, settings: Settings, *, now, price_source=None,
-                 world_source=None, fundamentals_source=None, instruments=None, benchmarks=None):
+                 world_source=None, fundamentals_source=None, discovery_source=None, instruments=None, benchmarks=None):
         self.db, self.settings, self.now = db, settings, now
         self.price_source, self.world_source, self.fundamentals_source = price_source, world_source, fundamentals_source
+        self.discovery_source = discovery_source
         universe = default_universe() if instruments is None else instruments
         self.instruments = tuple(item for item in universe if not settings.watch_symbols or item.symbol in settings.watch_symbols)
         self.benchmarks = benchmark_instruments() if benchmarks is None else tuple(benchmarks)
@@ -125,10 +126,72 @@ class MarketMonitor:
         self.last_counts["world_events"] = inserted
         return inserted
 
+    def discovery_candidates(self, *, include_rejected: bool = False) -> list[dict]:
+        candidates = []
+        now = self.now()
+        for data in self.store.latest("listed_discovery").values():
+            value = dict(data)
+            fact_data = value.get("financials")
+            if fact_data:
+                try:
+                    fact = financial_fact_from_dict(fact_data)
+                    value["revenue_growth_percent"] = fact.revenue_growth_percent
+                    value["net_margin_percent"] = fact.net_margin_percent
+                    if not fact.is_fresh(now, max_age_days=self.settings.fundamental_max_age_days):
+                        value["status"], value["financial_eligible"] = "wait", False
+                        value["reasons"] = [*value.get("reasons", []), "Financial source dates have expired; recollection does not renew the financial reporting date."]
+                except (KeyError, TypeError, ValueError):
+                    value["status"], value["financial_eligible"] = "wait", False
+                    value["reasons"] = ["Saved issuer financial evidence could not be validated."]
+            if include_rejected or value.get("status") != "rejected":
+                candidates.append(value)
+        candidates.sort(key=lambda value: value.get("discovered_at", ""), reverse=True)
+        return candidates if include_rejected else candidates[:self.settings.listed_discovery_max_candidates]
+
+    async def collect_discovery(self) -> int:
+        if self.discovery_source is None:
+            return 0
+        observed = self.now()
+        # Repeated service invocations cannot exceed the hourly issuer budget.
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT last_success_at FROM collector_state WHERE name='listed_discovery_budget'").fetchone()
+        if row:
+            try:
+                stamp = datetime.fromisoformat(row[0])
+                if stamp.utcoffset() is not None and timedelta(0) <= observed-stamp < timedelta(hours=1):
+                    self.last_counts["listed_discovery_candidates"] = 0
+                    return 0
+            except (TypeError, ValueError):
+                pass
+        self.db.update_collector_state("listed_discovery_budget", success_at=observed)
+        previous = self.store.latest("listed_discovery")
+        # SEC XBRL extraction can lag a newly disseminated filing. A missing
+        # comparable context is rechecked within the same total hourly request
+        # budget instead of being permanently frozen as a processed failure.
+        pending = {cik for cik, item in previous.items() if item.get("status") == "wait" and not item.get("financials")}
+        pending_accessions = {previous[cik]["accession"] for cik in pending}
+        processed = [accession for accession in self.store.latest("listed_discovery_seen") if accession not in pending_accessions]
+        excluded = [item.cik for item in self.instruments if item.cik]
+        batch = None
+        try:
+            batch = await self.discovery_source.collect(observed_at=observed, processed_accessions=processed, excluded_ciks=excluded,
+                                                       latest_filed_at={cik: item["filed_at"] for cik, item in previous.items() if cik not in pending})
+        finally:
+            batch = batch or self.discovery_source.partial_batch
+            inserted = 0
+            for item in batch.candidates:
+                if item["cik"] in previous and item["accession"] == previous[item["cik"]].get("accession"):
+                    item = dict(item, discovered_at=previous[item["cik"]]["discovered_at"])
+                inserted += int(self.store.record("listed_discovery", item["cik"], item, observed_at=observed))
+                self.store.record("listed_discovery_seen", item["accession"], {"cik": item["cik"], "accession": item["accession"]}, observed_at=observed)
+            self.store.record_coverage("listed_discovery", list(batch.coverage), observed_at=observed)
+            self.last_counts["listed_discovery_candidates"] = inserted
+        return inserted
+
     def report(self, sentiment: list[dict]) -> dict[str, Any]:
         now = self.now()
         if not self.settings.markets_enabled:
-            return {"listed_companies": [], "trade_ideas": [], "world_news": [], "world_coverage": [], "price_coverage": [], "universe": {"limitations": ["Public-market research is disabled."]}}
+            return {"listed_companies": [], "listed_discovery": [], "listed_discovery_coverage": [], "trade_ideas": [], "world_news": [], "world_coverage": [], "price_coverage": [], "universe": {"limitations": ["Public-market research is disabled."]}}
         facts, histories, events, restore_errors = {}, {}, [], []
         for symbol, data in self.store.latest("financials").items():
             try:
@@ -166,6 +229,13 @@ class MarketMonitor:
                              fundamental_max_age_days=self.settings.fundamental_max_age_days)
                  for instrument in self.instruments]
         return {"listed_companies": [item.to_dict() for item in rank_universe(facts, now=now, instruments=self.instruments, max_age_days=self.settings.fundamental_max_age_days)],
+                "listed_discovery": self.discovery_candidates(),
+                "listed_discovery_coverage": self.store.coverage("listed_discovery"),
+                "listed_discovery_summary": {"enabled": self.settings.listed_discovery_enabled,
+                                             "new_ciks_per_hour_limit": self.settings.listed_discovery_max_new_ciks,
+                                             "active_candidate_limit": self.settings.listed_discovery_max_candidates,
+                                             "evaluated_issuer_count": len(self.store.latest("listed_discovery")),
+                                             "scope": "Bounded current SEC 10-Q/10-K issuers with SEC ticker/exchange directory and entity-wide comparable reported quarters; incomplete US-filing sample, not an exhaustive global equity screen."},
                 "trade_ideas": rank_ideas(ideas), "world_news": [payload(item) for item in events[:120]],
                 "world_coverage": world_coverage, "world_coverage_ready": len(fresh_publishers) >= 2,
                 "price_coverage": self.store.coverage("markets"), "universe": universe_metadata(),

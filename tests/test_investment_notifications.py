@@ -1,0 +1,173 @@
+from datetime import UTC, datetime, timedelta
+from email import policy
+from email.parser import BytesParser
+
+import pytest
+
+from contract_ipo_monitor.gmail_delivery import DefinitiveDeliveryFailure, UnknownDelivery, message_content_sha256
+from contract_ipo_monitor.notifications import EmailOutbox, report_message
+
+NOW = datetime(2026, 10, 5, 22, tzinfo=UTC)
+ADDRESS = "recipient@example.com"
+
+
+def make_message(event="event-one", *, test=False):
+    report = {"completed_at": NOW.isoformat(), "status": "degraded", "health": {}, "counts": {},
+              "trade_ideas": [{"symbol": "EXAMPLE", "exchange": "NASDAQ", "currency": "USD", "action": "conditional_buy",
+                               "entry": 101.0, "invalidation": 95.0, "target": 113.0, "price_as_of": "2026-10-02",
+                               "reasons": ["Comparable reported growth"], "risks": ["No predictive probability"],
+                               "evidence_urls": ["https://www.sec.gov/example"]}]}
+    return report_message(report, sender=ADDRESS, recipient=ADDRESS, event_key=event, created_at=NOW, test=test)
+
+
+def enqueue(outbox, raw=None, event="event-one", *, expiry=None):
+    return outbox.enqueue(event, raw or make_message(event), ADDRESS, now=NOW, expires_at=expiry or NOW + timedelta(hours=6))
+
+
+def proof(row):
+    return {"gmail_message_id": "provider-one", "thread_id": "thread-one", "verified_at": NOW.isoformat(),
+            "provider_accepted_at": NOW.isoformat(), "recipient": ADDRESS, "sender": ADDRESS,
+            "delivered_label": "INBOX", "raw_content_sha256": row["raw_sha256"], "readback_raw_sha256": row["raw_sha256"],
+            "rfc822_id": row["rfc822_id"], "content_sha256": message_content_sha256(bytes(row["raw_message"]))}
+
+
+def test_mail_keeps_exact_report_attachments_and_no_assumed_position():
+    message = BytesParser(policy=policy.default).parsebytes(make_message(test=True))
+    assert message["To"] == ADDRESS and "PIPELINE TEST" in message["Subject"]
+    text = message.get_body(preferencelist=("plain",)).get_content()
+    assert "Holdings on file: none" in text and "not execution instructions" in text
+    assert "101.0" in text and "5 sessions" in text and "15" in text
+    attachments = {part.get_filename(): part.get_payload(decode=True) for part in message.iter_attachments()}
+    assert set(attachments) == {"research-report.md", "research-report.json"}
+    assert b'"entry": 101.0' in attachments["research-report.json"]
+
+
+def test_publication_is_idempotent_and_cannot_change_content_or_recipient(tmp_path):
+    outbox = EmailOutbox(tmp_path / "mail.db")
+    first = enqueue(outbox)
+    assert enqueue(outbox) == first
+    with pytest.raises(ValueError, match="conflicting"):
+        enqueue(outbox, make_message("different"))
+    assert outbox.states() == {"pending": 1}
+
+
+def test_only_one_owner_leases_a_message_and_verified_delivery_is_bound(tmp_path):
+    path = tmp_path / "mail.db"
+    first, second = EmailOutbox(path), EmailOutbox(path)
+    identifier = enqueue(first)
+    row = first.lease(NOW)
+    assert second.lease(NOW) is None
+    first._settle(row, status="sent", now=NOW, receipt=proof(row))
+    assert first.get(identifier)["status"] == "sent"
+    with pytest.raises(RuntimeError, match="no longer owned"):
+        second._settle(row, status="sent", now=NOW, receipt=proof(row))
+
+
+def test_crash_after_claim_becomes_unknown_and_never_retries(tmp_path):
+    path = tmp_path / "mail.db"
+    first = EmailOutbox(path)
+    identifier = enqueue(first)
+    first.lease(NOW)
+    restored = EmailOutbox(path)
+    assert restored.lease(NOW + timedelta(minutes=6)) is None
+    assert restored.get(identifier)["status"] == "unknown"
+
+
+def test_uncertain_post_preserves_partial_receipt_and_no_resend(tmp_path):
+    outbox = EmailOutbox(tmp_path / "mail.db")
+    identifier = enqueue(outbox)
+    calls = []
+
+    class Transport:
+        def deliver(self, *args):
+            calls.append(args)
+            raise UnknownDelivery("timeout", partial_receipt={"gmail_message_id": "accepted-but-unread"})
+
+        def reconcile(self, *args):
+            return None
+
+    transport = Transport()
+    assert outbox.deliver_once(transport, now=NOW)["status"] == "unknown"
+    assert "accepted-but-unread" in outbox.get(identifier)["receipt_json"]
+    assert outbox.deliver_once(transport, now=NOW + timedelta(hours=1)) is None
+    assert outbox.reconcile_unknown(transport, now=NOW + timedelta(hours=1)) == []
+    assert len(calls) == 1
+
+
+def test_unknown_recovery_requires_exact_recipient_content_and_identity(tmp_path):
+    outbox = EmailOutbox(tmp_path / "mail.db")
+    identifier = enqueue(outbox)
+    row = outbox.lease(NOW)
+    outbox._settle(row, status="unknown", now=NOW)
+
+    class Transport:
+        result = {**proof(row), "recipient": "another@example.com"}
+
+        def reconcile(self, *args):
+            return self.result
+
+    transport = Transport()
+    assert outbox.reconcile_unknown(transport, now=NOW) == []
+    assert outbox.get(identifier)["status"] == "unknown"
+    transport.result = proof(row)
+    assert outbox.reconcile_unknown(transport, now=NOW) == [{"id": identifier, "status": "sent", "reconciled": True}]
+    assert outbox.get(identifier)["status"] == "sent"
+
+
+def test_known_preflight_failure_can_retry_but_expired_research_cannot_send(tmp_path):
+    outbox = EmailOutbox(tmp_path / "mail.db")
+    identifier = enqueue(outbox)
+
+    class Transport:
+        def deliver(self, *args):
+            raise DefinitiveDeliveryFailure("preflight_unavailable", safe_to_retry=True)
+
+    assert outbox.deliver_once(Transport(), now=NOW)["status"] == "pending"
+    assert outbox.get(identifier)["attempts"] == 1
+    assert outbox.deliver_once(Transport(), now=NOW + timedelta(hours=7)) is None
+    assert outbox.get(identifier)["status"] == "expired"
+
+
+def test_unverified_acceptance_is_not_sent(tmp_path):
+    outbox = EmailOutbox(tmp_path / "mail.db")
+    identifier = enqueue(outbox)
+
+    class Transport:
+        def deliver(self, *args):
+            return {"gmail_message_id": "accepted"}
+
+    assert outbox.deliver_once(Transport(), now=NOW)["status"] == "unknown"
+    assert outbox.get(identifier)["sent_at"] is None
+
+
+def test_header_injection_is_rejected():
+    with pytest.raises(ValueError):
+        report_message({"completed_at": NOW.isoformat(), "status": "ok"}, sender=ADDRESS,
+                       recipient=ADDRESS + "\nBcc: other@example.com", event_key="bad", created_at=NOW)
+
+
+def test_unknown_reconciliation_uses_only_the_persisted_own_post_acknowledgement(tmp_path):
+    outbox = EmailOutbox(tmp_path / "mail.db")
+    identifier = enqueue(outbox)
+    row = outbox.lease(NOW)
+    outbox._settle(row, status="unknown", now=NOW, receipt={"gmail_message_id": "own-post-id"})
+    class Transport:
+        def reconcile(self, identity, recipient, raw, *, provider_message_id):
+            assert provider_message_id == "own-post-id"
+            assert identity == row["rfc822_id"] and raw == bytes(row["raw_message"])
+            return {**proof(row), "gmail_message_id": provider_message_id,
+                    "provider_rfc822_id": "<rewritten@mail.gmail.com>"}
+    assert outbox.reconcile_unknown(Transport(), now=NOW) == [{"id": identifier, "status": "sent", "reconciled": True}]
+
+
+@pytest.mark.parametrize("change", [{"verified_at": "yesterday"}, {"verified_at": "2026-10-05T22:00:00"},
+                                   {"sender": "different@example.org"}, {"delivered_label": "DRAFT"},
+                                   {"raw_content_sha256": "0"*64}, {"readback_raw_sha256": "unverified"}])
+def test_partial_or_contradictory_provider_receipt_never_marks_sent(tmp_path, change):
+    outbox = EmailOutbox(tmp_path / "mail.db")
+    identifier = enqueue(outbox)
+    class Transport:
+        def deliver(self, *args):
+            return {**proof(outbox.get(identifier)), **change}
+    assert outbox.deliver_once(Transport(), now=NOW)["status"] == "unknown"
+    assert outbox.get(identifier)["sent_at"] is None

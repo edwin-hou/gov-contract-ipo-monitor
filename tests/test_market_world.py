@@ -104,6 +104,29 @@ async def test_short_history_excludes_current_session_and_remains_insufficient()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stamp,market_state,expected", [
+    (datetime(2026,10,5,19,59,tzinfo=UTC), "Open", date(2026,10,2)),
+    (datetime(2026,10,5,20,14,tzinfo=UTC), "Closed", date(2026,10,2)),
+    (datetime(2026,10,5,20,15,tzinfo=UTC), "Closed", date(2026,10,5)),
+    (datetime(2026,10,6,0,30,tzinfo=UTC), "Closed", date(2026,10,5)),
+    (datetime(2026,10,6,0,30,tzinfo=UTC), "Open", date(2026,10,2)),
+])
+async def test_nasdaq_retains_completed_same_day_only_after_calendar_and_provider_close(stamp,market_state,expected):
+    rows = nasdaq_rows()
+    rows.insert(0,dict(rows[0],date="10/05/2026"))
+    def handle(request):
+        response = nasdaq_handler(rows)(request)
+        payload = response.json()
+        if request.url.path.endswith("/info"):
+            payload["data"]["marketStatus"] = market_state
+        return httpx.Response(200,json=payload)
+    connection = client(handle)
+    async with connection.client:
+        history = await DailyPriceCollector(connection,provider_order=("nasdaq",),min_request_interval=0).collect(instrument(),observed_at=stamp)
+    assert history.status == "ok" and history.as_of == expected
+
+
+@pytest.mark.asyncio
 async def test_explicit_etf_mapping_selects_etf_route_and_currency_provenance():
     requests = []
     def handle(request):

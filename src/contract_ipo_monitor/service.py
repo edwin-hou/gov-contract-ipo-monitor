@@ -27,6 +27,7 @@ from .sources.discourse import CompanyWatch, DiscourseCollector, DiscourseConfig
 from .smtp_worker import SMTPTransport, SMTPWorker
 from .sources.http import PermanentHTTPError, ResilientClient
 from .sources.market import TwelveDataCollector
+from .sources.listed_discovery import ListedDiscoveryCollector
 from .sources.sam import SAMCollector
 from .sources.sec import SECCollector
 from .sources.usaspending import USAspendingCollector, USAspendingRecipientResolver
@@ -137,6 +138,7 @@ class MonitorService:
         price_source: Any = None,
         world_source: Any = None,
         fundamentals_source: Any = None,
+        discovery_source: Any = None,
         instruments: Any = None,
         benchmarks: Any = None,
     ):
@@ -165,6 +167,7 @@ class MonitorService:
         self.research.initialize()
         self.markets = MarketMonitor(db, settings, now=self.now, price_source=price_source,
                                      world_source=world_source, fundamentals_source=fundamentals_source,
+                                     discovery_source=discovery_source,
                                      instruments=instruments, benchmarks=benchmarks)
         self.stop_event = asyncio.Event()
 
@@ -180,6 +183,7 @@ class MonitorService:
             "discourse": 2 * settings.discourse_interval_seconds + settings.source_timeout_seconds,
             "markets": 2 * settings.market_interval_seconds + settings.source_timeout_seconds,
             "world_news": 2 * settings.market_interval_seconds + settings.source_timeout_seconds,
+            "listed_discovery": 7200 + settings.source_timeout_seconds,
         })
         health.set_database_ready(True)
         sec_client = ResilientClient(
@@ -238,7 +242,7 @@ class MonitorService:
             hacker_news_enabled=settings.hacker_news_enabled,
             user_agent=settings.sec_user_agent,
         )) if settings.discourse_enabled else None
-        prices = world = fundamentals = None
+        prices = world = fundamentals = discovery = None
         if settings.markets_enabled:
             prices = DailyPriceCollector(api_key=settings.twelve_data_api_key)
             world = WorldNewsCollector()
@@ -246,6 +250,11 @@ class MonitorService:
                                            allowed_hosts=("data.sec.gov",), max_response_bytes=8_000_000)
             clients.append(facts_client)
             fundamentals = SECCompanyFactsCollector(facts_client)
+            if settings.listed_discovery_enabled:
+                discovery_client = ResilientClient(headers={"User-Agent": settings.sec_user_agent}, max_attempts=2,
+                                                    timeout=20, allowed_hosts=("www.sec.gov", "data.sec.gov"), max_response_bytes=8_000_000)
+                clients.append(discovery_client)
+                discovery = ListedDiscoveryCollector(discovery_client, max_new_ciks=settings.listed_discovery_max_new_ciks)
         return cls(
             settings=settings,
             db=db,
@@ -258,7 +267,7 @@ class MonitorService:
             archive=EvidenceArchive(settings.evidence_archive_path),
             clients=tuple(clients),
             discourse_source=discourse,
-            price_source=prices, world_source=world, fundamentals_source=fundamentals,
+            price_source=prices, world_source=world, fundamentals_source=fundamentals, discovery_source=discovery,
         )
 
     def _collector_last_success(self, name: str) -> datetime | None:
@@ -343,6 +352,13 @@ class MonitorService:
                 self.db.update_collector_state(name, error=f"{type(exc).__name__}: {exc}")
                 logger.exception("Market research collection incomplete", extra={"collector": name})
         summary.update(self.markets.last_counts)
+        if self.markets.discovery_source is not None:
+            try:
+                await self._poll_discovery()
+            except Exception as exc:
+                self.health.mark_error("listed_discovery", f"{type(exc).__name__}: {exc}")
+                self.db.update_collector_state("listed_discovery", error=f"{type(exc).__name__}: {exc}")
+            summary.update(self.markets.last_counts)
         if self.discourse_source is not None:
             try:
                 summary["discourse_records"] = await self._poll_discourse()
@@ -418,6 +434,8 @@ class MonitorService:
             tasks.append(asyncio.create_task(self._collector_loop("markets", self.settings.market_interval_seconds, self._poll_markets)))
         if self.markets.world_source is not None:
             tasks.append(asyncio.create_task(self._collector_loop("world_news", self.settings.market_interval_seconds, self._poll_world)))
+        if self.markets.discovery_source is not None:
+            tasks.append(asyncio.create_task(self._collector_loop("listed_discovery", 3605, self._poll_discovery)))
         if serve_health:
             config = uvicorn.Config(
                 create_health_app(self.health, self.db),
@@ -474,7 +492,8 @@ class MonitorService:
 
     def companies(self) -> tuple[CompanyWatch, ...]:
         public = [CompanyWatch(item.name, aliases=(*item.aliases, "$" + item.symbol)) for item in self.markets.instruments] if self.settings.markets_enabled else []
-        names = list(self.settings.watch_companies)
+        names = [candidate["name"] for candidate in self.markets.discovery_candidates() if candidate.get("financial_eligible")]
+        names += list(self.settings.watch_companies)
         names += [candidate["issuer_name"] for candidate in self.tracker.candidates(limit=50) if candidate["ipo_confirmed"] and candidate["active"]]
         watches = public + [CompanyWatch(name, aliases=("Anduril Industries",) if name == "Anduril" else ()) for name in dict.fromkeys(names)]
         seen = set()
@@ -525,6 +544,14 @@ class MonitorService:
             self.health.mark_success("discourse")
             self.db.update_collector_state("discourse", success_at=self.now())
         return inserted
+
+    async def _poll_discovery(self) -> None:
+        await asyncio.wait_for(self.markets.collect_discovery(), timeout=self.settings.source_timeout_seconds)
+        coverage = self.markets.store.coverage("listed_discovery")
+        if not coverage or any(item.get("status") != "ok" for item in coverage):
+            raise RuntimeError("Listed issuer discovery has incomplete primary-source coverage; completed candidates were retained")
+        self.health.mark_success("listed_discovery")
+        self.db.update_collector_state("listed_discovery", success_at=self.now(), error=None)
 
     def create_report(self, counts: dict[str, Any] | None = None) -> dict[str, Any]:
         watches = self.companies()

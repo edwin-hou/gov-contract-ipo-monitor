@@ -171,6 +171,22 @@ def report_markdown(report: dict[str, Any]) -> str:
             lines += ["", "No sourced listed-company research is saved yet."]
         for exclusion in rows(metadata.get("reviewed_exclusions")):
             lines += ["", f"Reviewed exclusion — {clean(exclusion.get('name'))}: {clean(exclusion.get('reason'))}. {link(exclusion.get('source_url'))}."]
+        discovery = rows(report.get("listed_discovery"))
+        if "listed_discovery" in report:
+            scope = report.get("listed_discovery_summary") or {}
+            lines += ["", "## Newly discovered listed issuers — research/watch findings", "",
+                      "Bounded current SEC 10-Q/10-K filings discover companies beyond the reviewed shortlist. A fresh comparable quarter must show at least 10% year-over-year entity-wide total revenue growth and positive reported US GAAP net income. These findings remain WAIT for security class, trading currency, price/news, valuation and trade review; no buy/sell instruction is implied.", "",
+                      f"New issuer facts limit: {clean(scope.get('new_ciks_per_hour_limit', 5))} per hour. Current candidate view limit: {clean(scope.get('active_candidate_limit', 25))}. This is an incomplete US-filing sample, not an exhaustive global screen.", "",
+                      "| Issuer / CIK | SEC ticker / exchange | State | YoY revenue / net margin | Profit / reporting currency | Period / reported | Review reasons | Primary financial / listing evidence |",
+                      "|---|---|---|---|---|---|---|---|"]
+            for candidate in discovery:
+                financial = candidate.get("financials") or {}
+                lines.append(f"| {clean(candidate.get('name'))} / {clean(candidate.get('cik'))} | {clean(candidate.get('symbol'))} / {clean(candidate.get('exchange'))} | {clean(candidate.get('status'))} | {display_number(candidate.get('revenue_growth_percent'), decimals=1, suffix='%')} / {display_number(candidate.get('net_margin_percent'), decimals=1, suffix='%')} | {display_number(financial.get('net_income'), decimals=0)} {clean(financial.get('currency'))} | {clean(financial.get('period_end'))} / {clean(financial.get('reported_at'))} | {clean('; '.join(items(candidate.get('reasons'))))} | {link(financial.get('source_url'), 'Financial filing')} / {link(candidate.get('listing_source_url'), 'SEC listing directory')} |")
+            if not discovery:
+                lines += ["", "No additional issuer currently passes or awaits the bounded discovery review. Rejected financial screens remain saved in the checkpoint."]
+            lines += ["", "| Discovery source | Status | Observed | Items | Limitation / error |", "|---|---|---|---|---|"]
+            for receipt in rows(report.get("listed_discovery_coverage")):
+                lines.append(f"| {link(receipt.get('source_url'), receipt.get('source'))} | {clean(receipt.get('status'))} | {clean(receipt.get('observed_at'))} | {clean(receipt.get('collected_count', 0))} | {clean(receipt.get('error') or '; '.join(items(receipt.get('limitations'))))} |")
         lines += ["", "## Conditional trade ideas", "",
                   "Conditional buy means review the entry trigger and all checks before considering a purchase. Reduce if already owned is a review for an existing holding. Wait means the required evidence or setup is missing. No orders are placed.", "",
                   "Prices are latest completed daily observations, not executable live quotes. Screening rules have no validated return forecast. Invalidation is a risk reference, not a guaranteed exit; gaps and costs can increase losses. For reduce-if-owned, the holding review level is the recent low to check against a fresh quote. Levels use the displayed trading currency.", "",
@@ -186,6 +202,11 @@ def report_markdown(report: dict[str, Any]) -> str:
                       for key in ("entry", "invalidation", "target", "risk_reward")]
             checks = items(idea.get("conditions")) or items(idea.get("reasons")) or ["No verified setup or required evidence is available."]
             lines.append(f"| {clean(idea.get('symbol'))} · {clean(idea.get('company'))} / {clean(idea.get('exchange'))} / {clean(idea.get('currency'))} / {clean(idea.get('listing_kind'))} | {action_label(action)} | {display_number(indicator.get('last_close'))} {clean(idea.get('currency'))} / {clean(idea.get('price_as_of'))} | {' | '.join(levels)} | {clean(checks[0])} |")
+            strategy = idea.get("strategy") or {}
+            if action == "conditional_buy" and isinstance(strategy, dict):
+                risk = strategy.get("risk_budget") or {}
+                lines += ["", f"{clean(idea.get('symbol'))} entry cap: {display_number(strategy.get('maximum_entry'))} {clean(idea.get('currency'))}; setup valid through {clean(strategy.get('setup_valid_through'))}. Review after 5 completed sessions and exit by 15 sessions from a verified actual fill; no fill or holding is assumed.",
+                          f"Planned risk per share: {display_number(risk.get('planned_risk_per_share'))} {clean(idea.get('currency'))}. {clean(risk.get('budget_formula'))}. Quantity requires your portfolio value, loss allowance, actual entry, stop, costs and broker lot size: {clean(risk.get('quantity_formula'))}. No quantity is assumed.", ""]
         if not ideas:
             lines += ["", "No conditional trade ideas are saved yet."]
         for idea in ideas:

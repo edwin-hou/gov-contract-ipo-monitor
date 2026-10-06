@@ -7,7 +7,7 @@ import pytest
 
 from contract_ipo_monitor.fundamentals import FinancialFact
 from contract_ipo_monitor.market import DailyBar, PriceHistory
-from contract_ipo_monitor.trades import assess_trade
+from contract_ipo_monitor.trades import assess_trade, completed_session_date, completed_sessions_since, session_count, sessions_after
 from contract_ipo_monitor.universe import Instrument
 from contract_ipo_monitor.worldnews import WorldEvent
 
@@ -24,9 +24,11 @@ def financials():
 
 
 def trading_dates(end=date(2026, 10, 2), count=65):
+    # Independent fixture calendar: weekends alone are not actual U.S. sessions.
+    holidays_2026 = {date(2026, month, day) for month, day in ((1,1),(1,19),(2,16),(4,3),(5,25),(6,19),(7,3),(9,7),(11,26),(12,25))}
     days = []
     while len(days) < count:
-        if end.weekday() < 5:
+        if end.weekday() < 5 and end not in holidays_2026:
             days.append(end)
         end -= timedelta(days=1)
     return list(reversed(days))
@@ -153,6 +155,107 @@ def test_large_unadjusted_move_cannot_become_false_momentum_buy():
     idea = assess(history=jump)
     assert idea["action"] == "wait"
     assert any("corporate" in item.casefold() or "30%" in item for item in idea["conditions"]+idea["risks"])
+
+
+@pytest.mark.parametrize("affected", ["history", "benchmark"])
+def test_exactly_sixty_bars_cannot_hide_a_large_corporate_action_jump(affected):
+    original = replace(history(symbol="ACWI" if affected == "benchmark" else "TEST"), bars=history(symbol="ACWI" if affected == "benchmark" else "TEST").bars[-60:])
+    changed = tuple(replace(bar, open=bar.open*2, high=bar.high*2, low=bar.low*2, close=bar.close*2) if index >= 15 else bar for index, bar in enumerate(original.bars))
+    idea = assess(**{affected: replace(original, bars=changed)})
+    assert idea["action"] == "wait"
+    assert any("30%" in item for item in idea["conditions"])
+
+
+@pytest.mark.parametrize("affected", ["history", "benchmark"])
+def test_future_observation_of_old_completed_prices_cannot_pass(affected):
+    item = history(symbol="ACWI" if affected == "benchmark" else "TEST", observed_at=NOW+timedelta(seconds=1))
+    idea = assess(**{affected: item})
+    assert idea["action"] == "wait"
+    assert any("observation timestamp" in item for item in idea["conditions"])
+
+
+def test_current_intraday_bar_waits_but_completed_same_day_is_eligible():
+    intraday = history(end=date(2026,10,5))
+    benchmark = history(symbol="ACWI", end=date(2026,10,5), step=.1)
+    assert assess(history=intraday, benchmark=benchmark)["action"] == "wait"
+    after_close = datetime(2026,10,5,20,15,tzinfo=UTC)
+    valid = assess(history=replace(intraday, observed_at=after_close), benchmark=replace(benchmark, observed_at=after_close), now=after_close)
+    assert valid["action"] == "conditional_buy"
+    # Re-running later cannot retroactively turn an intraday observation into a final close.
+    assert assess(history=intraday, benchmark=benchmark, now=after_close)["action"] == "wait"
+
+
+@pytest.mark.parametrize("changes", [{"exchange":"NYSE"}, {"exchange_timezone":"UTC"}, {"exchange_timezone":None}])
+def test_benchmark_venue_and_session_timezone_must_be_reviewed(changes):
+    assert assess(benchmark=replace(history(symbol="ACWI", step=.1), **changes))["action"] == "wait"
+
+
+def test_known_holiday_and_early_close_determine_completed_sessions():
+    pre_open = datetime(2026,5,26,13,tzinfo=UTC)
+    assert completed_session_date("NASDAQ", pre_open) == date(2026,5,22)
+    assert completed_sessions_since(date(2026,5,22), pre_open, "NYSE") == 0
+    assert session_count(date(2026,5,22), date(2026,5,26), "NYSE") == 1
+    assert sessions_after(date(2026,5,22),1,"NASDAQ") == date(2026,5,26)
+    assert completed_session_date("NASDAQ", datetime(2026,11,27,18,14,tzinfo=UTC)) == date(2026,11,25)
+    assert completed_session_date("NASDAQ", datetime(2026,11,27,18,15,tzinfo=UTC)) == date(2026,11,27)
+    # Sunday local time remains Friday's completed session even on UTC Monday.
+    assert completed_session_date("NASDAQ", datetime(2026,10,5,1,tzinfo=UTC)) == date(2026,10,2)
+
+
+@pytest.mark.parametrize("call", [
+    lambda:session_count(date(2026,10,5),date(2026,10,5),"UNKNOWN"),
+    lambda:session_count(date(2026,10,5),date(2026,10,4),"UNKNOWN"),
+    lambda:sessions_after(date(2026,10,5),0,"UNKNOWN"),
+    lambda:session_count(date(2029,10,5),date(2029,10,5),"NASDAQ"),
+    lambda:sessions_after(date(2029,10,5),0,"NASDAQ"),
+])
+def test_zero_and_reversed_calendar_operations_still_fail_closed(call):
+    with pytest.raises(ValueError, match="calendar"):
+        call()
+
+
+def test_entry_cap_rounded_risk_and_exit_strategy_do_not_assume_a_purchase():
+    idea = assess(history=history(spread=.837))
+    strategy = idea["strategy"]
+    assert idea["action"] == "conditional_buy"
+    assert strategy["scope"] == "paper_reference_only" and not strategy["assumed_position"]
+    assert strategy["state"] == "awaiting_fresh_quote"
+    assert strategy["risk_budget"]["quantity"] is None
+    assert strategy["currency"] == strategy["risk_budget"]["currency"] == "USD"
+    assert strategy["risk_budget"]["planned_risk_per_share"] == pytest.approx(idea["entry"]-idea["invalidation"])
+    maximum = strategy["maximum_entry"]
+    actual_rr = (idea["target"]-maximum)/(maximum-idea["invalidation"])
+    assert actual_rr >= strategy["risk_budget"]["minimum_reward_risk"]
+    assert strategy["risk_budget"]["reward_risk_at_maximum_entry"] == pytest.approx(actual_rr,abs=1e-6)
+    assert strategy["stop"]["price"] == idea["invalidation"] and strategy["target"]["price"] == idea["target"]
+    assert "actual_entry" in strategy["risk_budget"]["quantity_formula"] and "cost" in strategy["risk_budget"]["quantity_formula"]
+    assert strategy["setup_start_session"] == "2026-10-02" and strategy["setup_valid_through"] == "2026-10-09"
+    assert strategy["time_exit"]["review_after_sessions"] == 5 and strategy["time_exit"]["exit_after_sessions"] == 15
+    assert "never report publication" in strategy["time_exit"]["count_from"]
+    assert "order is unknown" in strategy["daily_bar_policy"]
+    assert "Cancel" in strategy["gap_policy"]
+
+
+def test_reduction_strategy_requires_verified_ownership_and_wait_assumes_none():
+    reduction = assess(history=history(step=-.3))["strategy"]
+    assert reduction["state"] == "exit_review_if_owned"
+    assert not reduction["assumed_position"] and reduction["entry_trigger"] is None
+    assert "existing position" in reduction["exit_trigger"]["verification"]
+    waiting = assess(history=None)["strategy"]
+    assert waiting["state"] == "blocked" and waiting["stop"] is None
+
+
+def test_provenance_label_cannot_promote_a_forum_url_to_primary_results_or_prices():
+    assert assess(fact=replace(financials(), source_url="https://example.org/forum"))["action"] == "wait"
+    assert assess(history=replace(history(), source_url="https://example.org/forum"))["action"] == "wait"
+
+
+def test_malformed_commentary_is_unknown_context_not_a_crash_or_buy_override():
+    idea = assess(sentiment={"label":"negative", "score":float("nan"), "scored_count":None, "independent_origins":True})
+    assert idea["sentiment"]["score"] is None and idea["sentiment"]["scored_count"] == 0
+    assert idea["sentiment"]["independent_origins"] == 0
+    blocked = assess(fact=None, sentiment={"label":"positive", "scored_count":999})
+    assert blocked["action"] == "wait"
 
 
 def test_new_reviewed_snapshot_advances_older_cache_without_downgrading_newer_cache(tmp_path):

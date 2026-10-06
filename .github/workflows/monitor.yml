@@ -21,9 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     env:
-      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || 'CompanyTradeResearchMonitor/0.4 edwin.s.hou@gmail.com' }}
+      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || 'CompanyTradeResearchMonitor/0.5 edwin.s.hou@gmail.com' }}
       DATABASE_PATH: data/monitor.db
       SMTP_ENABLED: 'false'
+      LISTED_DISCOVERY_ENABLED: ${{ vars.LISTED_DISCOVERY_ENABLED || 'true' }}
+      LISTED_DISCOVERY_MAX_NEW_CIKS: ${{ vars.LISTED_DISCOVERY_MAX_NEW_CIKS || '5' }}
+      LISTED_DISCOVERY_MAX_CANDIDATES: ${{ vars.LISTED_DISCOVERY_MAX_CANDIDATES || '25' }}
       WATCH_COMPANIES: ${{ vars.WATCH_COMPANIES || 'Anduril,SpaceX,OpenAI,Anthropic,Databricks,Stripe' }}
       YOUTUBE_VIDEO_URLS: ${{ vars.YOUTUBE_VIDEO_URLS || 'https://youtu.be/0BE2AAOlYWI' }}
       NEWS_FEED_URLS: ${{ vars.NEWS_FEED_URLS }}

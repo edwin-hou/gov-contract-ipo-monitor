@@ -221,10 +221,18 @@ class Database:
         lease_for = lease_for or timedelta(seconds=30)
         lease_until = now + lease_for
         with self.transaction() as conn:
+            # An interrupted worker may have submitted DATA before its receipt
+            # was saved. Expiry cannot establish that the provider rejected it.
+            conn.execute(
+                """UPDATE outbox_messages SET status='unknown', lease_until=NULL,
+                   last_error='smtp_interrupted_send'
+                   WHERE status='leased' AND (lease_until IS NULL OR julianday(lease_until) IS NULL
+                     OR julianday(lease_until) <= julianday(?))""", (now.isoformat(),),
+            )
             row = conn.execute(
                 """
                 SELECT * FROM outbox_messages
-                WHERE status IN ('pending','leased')
+                WHERE status='pending'
                   AND julianday(next_attempt_at) <= julianday(?)
                   AND (lease_until IS NULL OR julianday(lease_until) <= julianday(?))
                 ORDER BY id LIMIT 1
@@ -241,6 +249,20 @@ class Database:
             result["status"] = "leased"
             result["lease_until"] = lease_until.isoformat()
             return result
+
+    def mark_outbox_unknown(self, message_id: int, *, failed_at: datetime, lease_until: str, error: str = "smtp_delivery_unknown") -> bool:
+        """Fence an uncertain provider outcome; readback/manual review is required."""
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM outbox_messages WHERE id=?", (message_id,)).fetchone()
+            if row is None or row["status"] != "leased" or row["lease_until"] != lease_until:
+                return False
+            conn.execute("UPDATE outbox_messages SET status='unknown', attempts=attempts+1, lease_until=NULL, last_error=? WHERE id=?",
+                         (error, message_id))
+            conn.execute(
+                "INSERT INTO dead_letters(component, source, external_id, payload_json, error, created_at) VALUES(?,?,?,?,?,?)",
+                ("smtp", "outbox", str(message_id), _json({"status": "unknown", "subject": row["subject"]}), error, failed_at.isoformat()),
+            )
+            return True
 
     def mark_outbox_sent(self, message_id: int, *, sent_at: datetime, smtp_message_id: str | None, lease_until: str | None = None) -> None:
         with self.transaction() as conn:

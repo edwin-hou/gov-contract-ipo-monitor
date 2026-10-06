@@ -129,7 +129,7 @@ def test_database_context_closes_connection(tmp_path):
         conn.execute("SELECT 1")
 
 
-def test_expired_worker_cannot_overwrite_new_lease(tmp_path):
+def test_expired_worker_cannot_overwrite_fenced_unknown_delivery(tmp_path):
     db = database(tmp_path)
     processor = EvidenceProcessor(db, now=lambda: NOW)
     processor.ingest_contract(contract())
@@ -138,8 +138,9 @@ def test_expired_worker_cannot_overwrite_new_lease(tmp_path):
     second = db.lease_outbox(now=NOW + timedelta(seconds=2))
     with pytest.raises(RuntimeError, match="lease"):
         db.mark_outbox_sent(first["id"], sent_at=NOW, smtp_message_id="old", lease_until=first["lease_until"])
-    db.mark_outbox_sent(second["id"], sent_at=NOW, smtp_message_id="new", lease_until=second["lease_until"])
-    assert db.fetch_outbox()[0]["smtp_message_id"] == "new"
+    assert second is None
+    assert db.fetch_outbox()[0]["status"] == "unknown"
+    assert db.fetch_outbox()[0]["smtp_message_id"] is None
 
 
 def test_outbox_compares_instants_across_timezone_offsets(tmp_path):
