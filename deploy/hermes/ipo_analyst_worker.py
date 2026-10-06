@@ -225,7 +225,33 @@ def _item_projection(item):
             "status": "completed", "phase": item.get("phase"), "content": parts}
 
 
-def consume_response(events, *, max_bytes):
+def _terminal_authority_diagnostics(response, settled):
+    """Fixed labels and bounded counts only; never output values or identifiers."""
+    explicit = response.get("output")
+    shape = ("missing" if "output" not in response else "null" if explicit is None else
+             "empty_list" if isinstance(explicit, list) and not explicit else
+             "list" if isinstance(explicit, list) else "string" if isinstance(explicit, str) else "other")
+
+    def count(items, kind):
+        return min(MAX_EVENTS, sum(isinstance(item, dict) and item.get("type") == kind for item in items))
+
+    return {"terminal_output_shape": shape, "done_item_count": min(len(settled), MAX_EVENTS),
+            "terminal_item_count": min(len(explicit), MAX_EVENTS) if isinstance(explicit, list) else None,
+            "done_message_count": count(settled, "message"), "done_reasoning_count": count(settled, "reasoning"),
+            "terminal_message_count": count(explicit, "message") if isinstance(explicit, list) else None,
+            "terminal_reasoning_count": count(explicit, "reasoning") if isinstance(explicit, list) else None}
+
+
+def _projection_difference_fields(explicit, settled):
+    """Describe a mismatch using our fixed projection field names, not values."""
+    different = {"item_count"} if len(explicit) != len(settled) else set()
+    for first, second in zip(explicit, settled):
+        different.update(key for key in ("type", "id", "role", "status", "phase", "content")
+                         if first.get(key) != second.get(key))
+    return sorted(different)
+
+
+def consume_response(events, *, max_bytes, diagnostics=None):
     delta_bytes, done_items = 0, []
     done_ids, done_indexes, done_values = set(), set(), set()
     for event in events:
@@ -279,9 +305,27 @@ def consume_response(events, *, max_bytes):
                     ordered.sort(key=lambda value: value[0])
                 settled = [item for _, item in ordered]
                 explicit = response.get("output")
-                if explicit is not None:
-                    if not isinstance(explicit, list) or ([_item_projection(item) for item in explicit]
-                                                         != [_item_projection(item) for item in settled]):
+                if diagnostics is not None:
+                    diagnostics.update(_terminal_authority_diagnostics(response, settled))
+                # Installed Hermes codex_runtime.py documents terminal output
+                # null / [] / absent while completed output_item.done carries
+                # the answer. An empty list is omission, not conflicting text.
+                # Only this supported empty variant is normalized; every
+                # nonempty explicit item list must still agree exactly.
+                if isinstance(explicit, list) and not explicit:
+                    if diagnostics is not None:
+                        diagnostics["terminal_output_normalization"] = "empty_list_omission"
+                elif explicit is not None:
+                    if not isinstance(explicit, list):
+                        if diagnostics is not None:
+                            diagnostics["terminal_difference_fields"] = ["output_type"]
+                        raise WorkerFailure("conflicting_terminal_output")
+                    explicit_projection = [_item_projection(item) for item in explicit]
+                    settled_projection = [_item_projection(item) for item in settled]
+                    if explicit_projection != settled_projection:
+                        if diagnostics is not None:
+                            diagnostics["terminal_difference_fields"] = _projection_difference_fields(
+                                explicit_projection, settled_projection)
                         raise WorkerFailure("conflicting_terminal_output")
                 response = {**response, "output": settled}
             return completed_text(response, max_bytes=max_bytes)
@@ -334,7 +378,8 @@ def consume_http_body(chunks, *, deadline, max_bytes, diagnostics, clock=time.mo
             yield prefix.removeprefix(b"\xef\xbb\xbf")
             yield from bounded
 
-        return consume_response(sse_events(replay(), deadline=deadline, clock=clock), max_bytes=max_bytes)
+        return consume_response(sse_events(replay(), deadline=deadline, clock=clock),
+                                max_bytes=max_bytes, diagnostics=diagnostics)
     if start[:1] in (b"{", b"["):
         diagnostics["body_protocol"] = "json"
         raw = bytearray(prefix.removeprefix(b"\xef\xbb\xbf"))

@@ -274,12 +274,95 @@ def test_duplicate_unidentified_done_items_are_rejected():
     assert answer["error_code"] == "duplicate_output_item"
 
 
-@pytest.mark.parametrize("output", [[], [native_done_item(text="conflicting JSON")],
+@pytest.mark.parametrize("output", [[native_done_item(text="conflicting JSON")],
                                     [native_done_item(identifier="conflicting_id")], "not-an-output-list"])
 def test_conflicting_explicit_terminal_output_is_rejected(output):
     answer = native_answer([{"type": "response.output_item.done", "item": native_done_item()},
                             native_completion(output=output)])
     assert answer["error_code"] == "conflicting_terminal_output" and answer["text"] == ""
+
+
+@pytest.mark.parametrize("output", [None, []])
+def test_native_completed_done_message_accepts_null_or_empty_terminal_output(output):
+    # Installed Hermes agent/codex_runtime.py explicitly documents [] as well
+    # as null/absent terminal output; done items remain authoritative.
+    answer = native_answer([{"type": "response.output_item.done", "item": native_done_item(), "output_index": 0},
+                            native_completion(output=output)])
+    assert answer["status"] == "ok" and answer["text"] == '{"decisions":[]}'
+    assert answer["diagnostics"]["terminal_output_shape"] == ("null" if output is None else "empty_list")
+    assert answer["diagnostics"]["done_item_count"] == 1
+    assert answer["diagnostics"]["terminal_item_count"] == (None if output is None else 0)
+
+
+def test_empty_terminal_output_without_authoritative_done_items_still_fails_closed():
+    answer = native_answer([{"type": "response.output_text.delta", "delta": '{"decisions":[]}'},
+                            native_completion(output=[])])
+    assert answer["error_code"] == "missing_output" and answer["text"] == ""
+
+
+@pytest.mark.parametrize("changes,code", [({"model": "gpt-6-astra"}, "response_model_mismatch"),
+                                         ({"status": "incomplete"}, "incomplete_response"),
+                                         ({"error": {"message": "SECRET"}}, "provider_response_failed"),
+                                         ({"usage": None}, "missing_usage"),
+                                         ({"usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 4}}, "invalid_usage")])
+def test_empty_terminal_omission_preserves_completion_model_error_and_usage_checks(changes, code):
+    answer = native_answer([{"type": "response.output_item.done", "item": native_done_item()},
+                            native_completion(output=[], **changes)])
+    assert answer["error_code"] == code and answer["text"] == ""
+    assert "SECRET" not in json.dumps(answer)
+
+
+@pytest.mark.parametrize("changes", [{"role": "user"}, {"status": "in_progress"}, {"phase": "analysis"},
+                                    {"type": "function_call"}, {"content": [{"type": "refusal", "refusal": "SECRET"}]}])
+def test_empty_terminal_omission_requires_a_completed_final_assistant_done_item(changes):
+    answer = native_answer([{"type": "response.output_item.done", "item": native_done_item(**changes)},
+                            native_completion(output=[])])
+    assert answer["status"] == "unavailable" and answer["text"] == ""
+    assert "SECRET" not in json.dumps(answer)
+
+
+def test_empty_terminal_uses_completed_message_and_never_exposes_reasoning():
+    reasoning = {"type": "reasoning", "id": "SECRET reasoning id", "encrypted_content": "SECRET encrypted content"}
+    answer = native_answer([{"type": "response.output_item.done", "item": reasoning, "output_index": 0},
+                            {"type": "response.output_item.done", "item": native_done_item(), "output_index": 1},
+                            native_completion(output=[])])
+    assert answer["status"] == "ok" and answer["text"] == '{"decisions":[]}'
+    assert answer["diagnostics"]["done_message_count"] == answer["diagnostics"]["done_reasoning_count"] == 1
+    assert answer["diagnostics"]["terminal_message_count"] == answer["diagnostics"]["terminal_reasoning_count"] == 0
+    assert "SECRET" not in json.dumps(answer)
+
+
+@pytest.mark.parametrize("output", ["", "SECRET conflicting response", {}, 0])
+def test_nonlist_terminal_output_is_not_normalized_even_after_done_items(output):
+    answer = native_answer([{"type": "response.output_item.done", "item": native_done_item()},
+                            native_completion(output=output)])
+    assert answer["error_code"] == "conflicting_terminal_output" and answer["text"] == ""
+    assert answer["diagnostics"]["terminal_difference_fields"] == ["output_type"]
+    assert "SECRET" not in json.dumps(answer)
+
+
+@pytest.mark.parametrize("changes,fields", [({"text": "SECRET conflicting text"}, ["content"]),
+                                          ({"identifier": "SECRET conflicting id"}, ["id"]),
+                                          ({"phase": None}, ["phase"])])
+def test_terminal_conflict_diagnostics_use_only_fixed_field_names_and_counts(changes, fields):
+    answer = native_answer([{"type": "response.output_item.done", "item": native_done_item()},
+                            native_completion(output=[native_done_item(**changes)])])
+    assert answer["error_code"] == "conflicting_terminal_output" and answer["text"] == ""
+    assert answer["diagnostics"]["terminal_difference_fields"] == fields
+    assert answer["diagnostics"]["done_message_count"] == answer["diagnostics"]["terminal_message_count"] == 1
+    assert answer["diagnostics"]["done_reasoning_count"] == answer["diagnostics"]["terminal_reasoning_count"] == 0
+    assert "SECRET" not in json.dumps(answer)
+
+
+def test_nonempty_terminal_message_order_conflict_is_preserved():
+    first = native_done_item(identifier="msg_0", text="first")
+    second = native_done_item(identifier="msg_1", text="second")
+    answer = native_answer([{"type": "response.output_item.done", "item": first, "output_index": 0},
+                            {"type": "response.output_item.done", "item": second, "output_index": 1},
+                            native_completion(output=[second, first])])
+    assert answer["error_code"] == "conflicting_terminal_output" and answer["text"] == ""
+    assert answer["diagnostics"]["terminal_difference_fields"] == ["content", "id"]
+    assert answer["diagnostics"]["done_item_count"] == answer["diagnostics"]["terminal_item_count"] == 2
 
 
 @pytest.mark.parametrize("events", [
@@ -315,7 +398,8 @@ def test_valid_sse_uses_protocol_despite_missing_or_non_sse_media_label(media, l
     client = Client(response)
     answer = worker.run(json.dumps(request()).encode(), runtime=runtime(client))
     assert answer["status"] == "ok" and answer["text"] == '{"decisions":[]}'
-    assert answer["diagnostics"] == {"http_status": 200, "media_type": label, "body_protocol": "sse"}
+    assert {key: answer["diagnostics"][key] for key in ("http_status", "media_type", "body_protocol")} == {
+        "http_status": 200, "media_type": label, "body_protocol": "sse"}
     assert "SECRET" not in json.dumps(answer) and len(client.calls) == 1 and client.closed
 
 
