@@ -127,8 +127,11 @@ def _window_text(window, prefix):
     from zoneinfo import ZoneInfo
     try:
         zone = ZoneInfo(window[prefix + "_timezone"])
-        start = datetime.fromisoformat(window[prefix + "_open"]).astimezone(zone)
-        end = datetime.fromisoformat(window[prefix + "_close"]).astimezone(zone)
+        start = datetime.fromisoformat(window[prefix + "_open"])
+        end = datetime.fromisoformat(window[prefix + "_close"])
+        if start.utcoffset() is None or end.utcoffset() is None or end <= start:
+            raise ValueError("Unverified session window")
+        start, end = start.astimezone(zone), end.astimezone(zone)
         return start.strftime("%a %b %d, %Y %I:%M %p") + "–" + end.strftime("%I:%M %p %Z")
     except (ValueError, KeyError, TypeError):
         return "calendar unavailable; verify exchange hours with your broker"

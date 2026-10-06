@@ -143,6 +143,16 @@ def report_markdown(report: dict[str, Any]) -> str:
             if form == "legacy":
                 form = "Unspecified legacy form"
             lines.append(f"| {clean(form)} | {clean(gap.get('updated_at', ''))} | {clean(gap.get('last_error', ''))} |")
+    sec_collection = report.get("sec_collection")
+    if isinstance(sec_collection, dict):
+        lines += ["", "## SEC collection progress", "",
+                  f"Status: **{clean(sec_collection.get("status"))}**. Pending filing documents: **{clean(sec_collection.get("pending_filings", 0))}**.",
+                  f"Daily-index scope starts {clean(sec_collection.get("scope_start"))}; captured through {clean(sec_collection.get("captured_through"))}; latest published index seen {clean(sec_collection.get("published_through"))}.",
+                  f"Published-index catch-up complete: {clean(sec_collection.get("catchup_complete"))}. {clean(sec_collection.get("scope"))}"]
+        if sec_collection.get("current_feed_truncated_forms"):
+            lines.append("Current-feed page windows reached their bound for: " + clean(", ".join(sec_collection["current_feed_truncated_forms"])) + ". Published daily indexes provide durable catch-up; pending work remains above.")
+        if sec_collection.get("error"):
+            lines.append("Collection error: " + clean(sec_collection["error"]))
     market_scope = any(key in report for key in ("listed_companies", "universe", "trade_ideas", "price_coverage", "world_news", "world_coverage"))
     if market_scope:
         metadata = report.get("universe") or {}
@@ -294,10 +304,21 @@ def write_report(report: dict[str, Any], directory: Path) -> None:
         temporary.replace(target)
 
 
+MAX_CHECKPOINT_BYTES = 250_000_000
+
+
 def checkpoint_database(db: Database, destination: Path) -> None:
     """SQLite backup includes committed WAL data; copying the .db alone does not."""
+    from .checkpoint import validate_database
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp")
-    with closing(db.connect()) as source, closing(sqlite3.connect(temporary)) as target:
-        source.backup(target)
-    temporary.replace(destination)
+    try:
+        with closing(db.connect()) as source, closing(sqlite3.connect(temporary)) as target:
+            source.backup(target)
+        # Match the portable artifact/restore contract before publication; an
+        # unusable backup must never replace the preceding usable checkpoint.
+        validate_database(temporary, max_bytes=MAX_CHECKPOINT_BYTES)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)

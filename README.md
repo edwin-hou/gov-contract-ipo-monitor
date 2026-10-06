@@ -58,7 +58,7 @@ gov-contract-ipo-monitor report --output data/reports
 gov-contract-ipo-monitor run
 ```
 
-`run-once` writes `latest.md` and `latest.json`, saves a durable run receipt, and returns exit code 3 if the required SEC or USAspending collector is incomplete. Optional source gaps remain visible in a degraded report. A SQLite backup captures committed WAL data for recovery.
+`run-once` writes `latest.md` and `latest.json`, saves a durable run receipt, and returns exit code 3 if the required SEC or USAspending collector is incomplete. Optional source gaps remain visible in a degraded report. A SQLite backup captures committed WAL data for recovery. Publishing and restoring checkpoints enforce the same 250 MB bound, SQLite integrity and the original required schema; an invalid checkpoint cannot replace existing history.
 
 `run` polls configured sources continuously, publishes a report every minute, and serves:
 
@@ -88,7 +88,9 @@ Configure repository **Variables** for `SEC_USER_AGENT`, `WATCH_SYMBOLS`, `WATCH
 
 ## Important limits
 
-SEC discovery currently samples bounded current-feed pages, with durable processed-accession receipts and explicit truncation errors. It covers U.S. public filings, not confidential submissions or every international exchange. A page-limit gap is not proof there are no other IPOs.
+SEC discovery saves exact-form current-feed pages to a durable filing queue, then catches up from official published daily indexes. The initial index scope is frozen at seven calendar days before the first catalogue poll; later runs resume that scope across checkpoints. Each run captures up to three daily indexes and discovers every configured bounded current feed before processing documents. It then processes up to `SEC_MAX_PAGES × 40` queued documents per configured form, oldest first, with a work budget of 80% of the hard source deadline (capped at one hour). Reaching this budget between completed documents leaves a visible durable backlog; an in-flight HTTP failure or hard deadline still fails collection. SEC publishes these indexes nightly after 10 p.m. Eastern, so index catch-up does not promise immediate discovery of every filing. Configured form scope is saved with the catalogue; newly enabled forms replay verified saved index bytes, while retained disabled forms do not count as active backlog. Index-only dates are explicitly marked as date-only. Official Filing Date and exact Accepted timestamps are stored separately; an acceptance after the dissemination cutoff may precede its filing date. Uncertain lifecycle order cannot authorize an active IPO.
+
+A full current-feed page window is reported as a bounded real-time sample; it no longer discards discovered filings or fails a run solely because older work remains queued. Reports show pending documents, captured/published index dates and catch-up status. HTTP, malformed-source, document, archive and checkpoint failures still fail visibly. Earlier historical coverage flags remain unresolved. This scope covers configured U.S. public filing forms, not earlier complete history, confidential submissions or every international exchange.
 
 `SEC_MAX_DOCUMENT_BYTES` applies the same limit to SEC response streaming, decompression, and filing text. It defaults to 20 MiB (20971520 bytes), may be configured up to 50 MiB, and reports larger filings as collection gaps. Other sources retain their own limits.
 
@@ -135,4 +137,4 @@ Delivery tests inject lost provider acknowledgements, crashes after acceptance, 
 
 Analyst tests cover real evidence types, quote identity/freshness, material-context cache changes, durable attempt limits, malformed/duplicate model JSON, unknown evidence references, pending-alert authority and delivered-notice recovery. Worker protocol tests mock provider responses and check a single tools-free request, bounded streams, refusals, incomplete responses, redacted errors and no automatic retry. Passing these checks establishes software behaviour, not live provider availability or investment accuracy.
 
-Container builds are published after CI. Publication receipts are saved as Actions artifacts rather than committing back to `main`, preventing recursive build workflows. `deployments/container.json` is a historical receipt, not proof of a running service.
+Container builds are published after successful same-repository `main` push CI. Each revision tag and immutable digest reference use the checked-out source commit and verified registry digest. Only a source commit still matching the current `main` head can promote that digest to `latest`, with registry readback and concurrent main advancement recorded. Publication receipts are saved as Actions artifacts rather than committing back to `main`, preventing recursive build workflows. `deployments/container.json` is a historical receipt, not proof of a running service.

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 import signal
+from time import monotonic
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, timedelta
@@ -50,7 +51,11 @@ class SECSource:
         forms: tuple[str, ...],
         *,
         recipient_resolver: USAspendingRecipientResolver | None = None,
+        processing_budget_seconds: float = 480,
+        clock: Callable[[], float] = monotonic,
     ):
+        if isinstance(processing_budget_seconds, bool) or not 0 < processing_budget_seconds <= 3600:
+            raise ValueError("SEC processing budget must be bounded positive seconds")
         self.collector = collector
         self.forms = forms
         self.recipient_resolver = recipient_resolver
@@ -58,27 +63,71 @@ class SECSource:
         self.processed_entries: list[dict[str, Any]] = []
         self.parse_errors: list[str] = []
         self.partial_signals: list[Any] = []
+        self.truncated_forms: list[str] = []
+        self.processing_budget_seconds = processing_budget_seconds
+        self.clock = clock
+        self.document_processing_budget_exhausted = False
 
     async def collect(self, *, observed_at: datetime) -> list[Any]:
+        deadline = self.clock() + self.processing_budget_seconds
         self.ipo_events = []
         self.processed_entries = []
         self.parse_errors = []
         self.partial_signals = []
+        self.truncated_forms = []
+        self.document_processing_budget_exhausted = False
         signals = self.partial_signals
         seen: set[str] = set()
+        catalog = getattr(self.collector, "catalog", None)
+        if catalog is not None:
+            try:
+                catalog.verify_index_receipts()
+                self.collector.requeue_invalid_catalog_receipts()
+                await catalog.sync(self.collector._text, enabled_forms=self.forms, observed_at=observed_at)
+            except Exception as exc:
+                self.parse_errors.append(f"daily index: {type(exc).__name__}: {exc}")
+        discovered: dict[str, list[Any]] = {}
+        # Capture every configured live feed before processing any document.
+        # A large early-form backlog must not hide later forms' new filings.
         for form in self.forms:
             try:
                 entries = await self.collector.current_entries(form, count=40)
             except Exception as exc:
                 self.parse_errors.append(f"{form}: {type(exc).__name__}: {exc}")
-                continue
+                if catalog is None:
+                    continue
+                entries = []
             if getattr(self.collector, "last_feed_truncated", False):
-                self.parse_errors.append(f"{form}: feed page limit reached; older filings may be missing")
-                if getattr(self.collector, "db", None) is not None:
+                # With a durable catalog, the finite real-time window is a
+                # coverage limitation; queued entries and published daily
+                # indexes continue catch-up. HTTP/parse failures still fail.
+                self.truncated_forms.append(form)
+                if catalog is None:
+                    self.parse_errors.append(f"{form}: feed page limit reached; older filings may be missing")
+                if catalog is None and getattr(self.collector, "db", None) is not None:
                     self.collector.db.update_collector_state(f"sec_feed_gap:{form}", error="Bootstrap/page-limit coverage gap: older public filings were not fully scanned.")
+            discovered[form] = entries
+
+        for form in self.forms:
+            if catalog is not None:
+                entries = catalog.pending_entries(form, limit=self.collector.max_pages * 40)
+            else:
+                entries = discovered.get(form, [])
             for entry in entries:
+                # A work budget is a visible queue boundary, not a network
+                # error. An in-flight request still uses the caller's hard
+                # deadline and retains genuine HTTP/parse errors.
+                if self.clock() >= deadline:
+                    self.document_processing_budget_exhausted = True
+                    if catalog is None:
+                        self.parse_errors.append(f"{form}: document processing budget exhausted without a durable pending queue")
+                    return signals
                 key = str(entry.get("accession") or entry.get("source_url"))
-                if key in seen or self.collector.is_processed(key):
+                if key in seen:
+                    continue
+                if self.collector.is_processed(key):
+                    if catalog is not None:
+                        catalog.note_processed(key)
                     continue
                 seen.add(key)
                 try:
@@ -201,6 +250,7 @@ class MonitorService:
             SECCollector(sec_client, max_pages=settings.sec_max_pages, db=db, max_document_bytes=settings.sec_max_document_bytes),
             settings.enabled_sec_forms,
             recipient_resolver=recipient_resolver,
+            processing_budget_seconds=min(.8 * settings.source_timeout_seconds, 3600),
         )
         usa_source = USAspendingCollector(usa_client, recipient_resolver=recipient_resolver)
         sam_source = None
@@ -304,17 +354,13 @@ class MonitorService:
         self._alerts_before = self.db.count("alerts")
         observed = self.now()
         try:
-            contracts = await asyncio.wait_for(self._collect_usaspending_records(observed), timeout=self.settings.source_timeout_seconds)
-            summary["contracts"] = len(contracts)
-            for evidence in contracts:
-                results = await self.processor.ingest_contract_async(evidence)
-                summary["alerts_created"] += sum(int(result.alert_created) for result in results)
-            self.health.mark_success("usaspending")
-            self.db.update_collector_state("usaspending", cursor=observed.date().isoformat(), success_at=observed, error=None)
+            await self._poll_usaspending()
         except Exception as exc:
             self.health.mark_error("usaspending", f"{type(exc).__name__}: {exc}", disabled=isinstance(exc, PermanentHTTPError))
             self.db.update_collector_state("usaspending", error=f"{type(exc).__name__}: {exc}", disabled=isinstance(exc, PermanentHTTPError))
             logger.exception("USAspending collection failed")
+        finally:
+            summary["contracts"] = self.last_usaspending_count
 
         try:
             signals = await self._poll_sec()
@@ -462,9 +508,20 @@ class MonitorService:
 
     async def _poll_usaspending(self) -> None:
         observed = self.now()
-        records = await asyncio.wait_for(self._collect_usaspending_records(observed), timeout=self.settings.source_timeout_seconds)
+        self.last_usaspending_count = 0
+        error: Exception | None = None
+        try:
+            records = await asyncio.wait_for(self._collect_usaspending_records(observed), timeout=self.settings.source_timeout_seconds)
+        except Exception as exc:
+            error = exc
+            records = getattr(exc, "records", getattr(self.usaspending_source, "partial_records", ()))
+        # Completed pages survive a later HTTP/parse/deadline failure, but an
+        # incomplete window never advances the successful collection cursor.
         for record in records:
             await self.processor.ingest_contract_async(record)
+            self.last_usaspending_count += 1
+        if error is not None:
+            raise error
         self.db.update_collector_state("usaspending", cursor=observed.date().isoformat(), success_at=observed, error=None)
         self.health.mark_success("usaspending")
 
@@ -566,6 +623,14 @@ class MonitorService:
             sentiment.append(summary)
         health = self.health.snapshot()
         coverage = self.research.coverage()
+        catalog = getattr(getattr(self.sec_source, "collector", None), "catalog", None)
+        sec_coverage = catalog.coverage() if catalog is not None else None
+        if sec_coverage is not None:
+            sec_coverage["current_feed_truncated_forms"] = getattr(self.sec_source, "truncated_forms", [])
+            sec_coverage["document_processing_budget_seconds"] = getattr(self.sec_source, "processing_budget_seconds", None)
+            sec_coverage["document_processing_budget_exhausted"] = getattr(self.sec_source, "document_processing_budget_exhausted", False)
+            sec_coverage["documents_processed_this_poll"] = len(getattr(self.sec_source, "processed_entries", []))
+            coverage.append(sec_coverage)
         with self.db.connect() as conn:
             historic_gaps = [dict(row) for row in conn.execute("SELECT name,last_error,updated_at FROM collector_state WHERE name LIKE 'sec_feed_gap:%' ORDER BY name")]
             # Count persisted identities independently of content versions and
@@ -585,14 +650,15 @@ class MonitorService:
         market_report = self.markets.report(sentiment)
         return serializable({
             **market_report,
-            "completed_at": self.now(), "status": "ok" if health["ready"] and not historic_gaps and all(item.get("ok") for item in health["collectors"].values()) and (not self.settings.markets_enabled or market_report.get("world_coverage_ready") and market_report.get("price_coverage") and not market_report.get("market_restore_errors")) else "degraded",
+            "completed_at": self.now(), "status": "ok" if health["ready"] and not historic_gaps and (sec_coverage is None or sec_coverage.get("status") == "ok" and not sec_coverage.get("current_feed_truncated_forms")) and all(item.get("ok") for item in health["collectors"].values()) and (not self.settings.markets_enabled or market_report.get("world_coverage_ready") and market_report.get("price_coverage") and not market_report.get("market_restore_errors")) else "degraded",
             "counts": counts or {}, "history": history, "health": health, "ipo_summary": self.tracker.summary(),
             "ipos": self.tracker.candidates(limit=100), "sentiment": sentiment, "coverage": coverage,
+            "sec_collection": sec_coverage,
             "watchlist": [company.name for company in self.companies()],
             "historic_coverage_gaps": historic_gaps,
             "evidence": [{"source_url": item.source_url, "source_kind": item.source_kind, "text_kind": item.text_kind, "title": item.title, "excerpt": item.text[:300], "company_names": item.company_names, "published_at": item.published_at, "bias_flags": item.bias_flags} for item in records[:100]],
             "limitations": [
-                "SEC coverage is U.S. public filings in bounded current-feed pages; confidential and international filings are not covered.",
+                "SEC covers configured U.S. public filing forms through a durable current-feed queue and published daily-index catch-up within the disclosed date scope. Pending, historical, confidential and international coverage gaps remain explicit.",
                 "Watchlist companies are research targets; inclusion does not establish an announced or planned IPO.",
                 "Government contracts are supplementary evidence and are not required to track an IPO.",
                 "Sentiment is an English lexicon estimate of an accessible sample, balanced by publisher, Hacker News account, Reddit community, YouTube channel, and platform, with duplication controls; it is not internet-wide opinion.",

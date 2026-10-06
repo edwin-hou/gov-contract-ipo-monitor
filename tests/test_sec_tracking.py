@@ -3,7 +3,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import closing
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -13,7 +13,7 @@ from contract_ipo_monitor.archive import EvidenceArchive
 from contract_ipo_monitor.db import Database
 from contract_ipo_monitor.sources.http import ResilientClient
 from contract_ipo_monitor.sources.sec import SECCollector, SECNormalizer, document_text
-from contract_ipo_monitor.tracking import IPOTracker
+from contract_ipo_monitor.tracking import IPOEvidence, IPOTracker
 
 
 NOW = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
@@ -460,3 +460,163 @@ async def test_recovered_receipt_checks_companion_index_archive(tmp_path):
         conn.execute("UPDATE sec_raw_documents SET gzip_blob=? WHERE sha256=?", (b"damaged index", manifest["index_sha256"]))
     assert not collector.is_processed(entry["accession"])
     await client.aclose()
+
+
+def chronology_tracker(tmp_path):
+    db = Database(tmp_path / "chronology.db")
+    db.initialize()
+    tracker = IPOTracker(db)
+    tracker.initialize()
+    return tracker
+
+
+def chronology_event(identity, kind, *, at=NOW, precision="second", confirmed=True,
+                     accepted_at=None, source_filing_date=None):
+    return IPOEvidence(
+        event_id=identity, issuer_name="Chronology Example Inc.", cik="42", source="sec",
+        source_kind="regulatory", source_url=f"https://www.sec.gov/Archives/{identity}.htm",
+        registration_id="333-999", filed_at=at, filed_at_precision=precision,
+        accepted_at=accepted_at, source_filing_date=source_filing_date,
+        event_type=kind, is_ipo=confirmed and kind in {"registration", "amendment", "prospectus"},
+        offering_kind="ipo" if confirmed else "unclassified",
+    )
+
+
+def test_same_day_date_only_withdrawal_cannot_sort_away_before_precise_registration(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration"))
+    tracker.record(chronology_event("rw", "withdrawn", at=NOW.replace(hour=0), precision="date"))
+    candidate = tracker.candidates()[0]
+    assert candidate["status"] == "chronology_unresolved" and candidate["active"] is False
+    assert candidate["ipo_confirmed"] is True
+    assert candidate["first_filed_at_precision"] == "date"
+    assert candidate["last_filed_at_precision"] == "second"
+    assert any("midnight placeholder" in value for value in candidate["limitations"])
+    assert tracker.summary()["withdrawn_ipos"] == 0
+    assert tracker.summary()["chronology_unresolved_candidates"] == 1
+
+
+def test_two_date_only_filings_cannot_establish_same_day_withdrawal_order(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    day = NOW.replace(hour=0)
+    tracker.record(chronology_event("s1", "registration", at=day, precision="date"))
+    tracker.record(chronology_event("rw", "withdrawn", at=day, precision="date"))
+    assert tracker.candidates()[0]["status"] == "chronology_unresolved"
+    assert tracker.candidates()[0]["active"] is False
+
+
+@pytest.mark.parametrize("after", [True, False])
+def test_exact_accepted_replay_resolves_date_only_withdrawal_without_losing_audit_versions(tmp_path, after):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration"))
+    approximate = chronology_event("rw", "withdrawn", at=NOW.replace(hour=0), precision="date")
+    tracker.record(approximate)
+    assert tracker.candidates()[0]["status"] == "chronology_unresolved"
+    exact = chronology_event("rw", "withdrawn", at=NOW+timedelta(hours=1 if after else -1))
+    tracker.record(exact, observed_at=NOW+timedelta(days=1))
+    # Rechecking the old already-saved version must not supersede exact evidence.
+    assert tracker.record(approximate, observed_at=NOW+timedelta(days=2)) is False
+    candidate = tracker.candidates()[0]
+    assert candidate["status"] == ("withdrawn" if after else "filed")
+    assert candidate["active"] is not after
+    assert candidate["evidence_count"] == 2
+    assert len(tracker.evidence()) == 3
+    assert candidate["first_filed_at_precision"] == candidate["last_filed_at_precision"] == "second"
+
+
+def test_date_only_registration_and_amendment_do_not_create_lifecycle_ambiguity(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    day = NOW.replace(hour=0)
+    tracker.record(chronology_event("s1", "registration", at=day, precision="date"))
+    tracker.record(chronology_event("amended", "amendment", at=day, precision="date"))
+    assert tracker.candidates()[0]["status"] == "amended"
+    assert tracker.candidates()[0]["active"] is True
+
+
+def test_distinct_official_filing_dates_establish_withdrawal_order(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration", source_filing_date=NOW.date()))
+    next_day = NOW+timedelta(days=1)
+    tracker.record(chronology_event("rw", "withdrawn", at=next_day.replace(hour=0), precision="date",
+                                    source_filing_date=next_day.date()))
+    candidate = tracker.candidates()[0]
+    assert candidate["status"] == "withdrawn" and candidate["active"] is False
+    assert candidate["last_filed_at_precision"] == "date"
+    assert tracker.summary()["withdrawn_ipos"] == 1
+
+
+@pytest.mark.parametrize("after", [True, False])
+def test_actual_accepted_replay_resolves_order_without_changing_date_precision(tmp_path, after):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration", accepted_at=NOW, source_filing_date=NOW.date()))
+    approximate = chronology_event("rw", "withdrawn", at=NOW.replace(hour=0), precision="date",
+                                   source_filing_date=NOW.date())
+    tracker.record(approximate)
+    assert tracker.candidates()[0]["status"] == "chronology_unresolved"
+    accepted = NOW+timedelta(hours=1 if after else -1)
+    exact = approximate.model_copy(update={"accepted_at": accepted})
+    tracker.record(exact, observed_at=NOW+timedelta(days=1))
+    candidate = tracker.candidates()[0]
+    assert candidate["status"] == ("withdrawn" if after else "filed")
+    assert candidate["active"] is not after
+    assert candidate["first_filed_at_precision"] == "date"
+    assert candidate["first_accepted_at"] == accepted.isoformat()
+    assert candidate["first_source_filing_date"] == NOW.date().isoformat()
+    assert len(tracker.evidence()) == 3
+
+
+def test_after_hours_atom_and_next_day_catalogue_do_not_imply_withdrawal_order(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration", at=datetime(2026, 10, 5, 23, tzinfo=UTC)))
+    tracker.record(chronology_event("rw", "withdrawn", at=datetime(2026, 10, 6, tzinfo=UTC),
+                                    precision="date", source_filing_date=date(2026, 10, 6)))
+    candidate = tracker.candidates()[0]
+    assert candidate["status"] == "chronology_unresolved" and candidate["active"] is False
+
+
+def test_same_official_filing_date_requires_both_actual_accepted_times(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration", source_filing_date=NOW.date(), accepted_at=NOW))
+    tracker.record(chronology_event("rw", "withdrawn", at=NOW+timedelta(hours=1), source_filing_date=NOW.date()))
+    assert tracker.candidates()[0]["status"] == "chronology_unresolved"
+
+
+def test_accepted_timestamp_requires_timezone_and_normalizes_utc():
+    with pytest.raises(ValueError, match="Accepted timestamp must include a timezone"):
+        chronology_event("s1", "registration", accepted_at=NOW.replace(tzinfo=None))
+    from datetime import timezone
+    event = chronology_event("s1", "registration", accepted_at=NOW.astimezone(timezone(timedelta(hours=-4))))
+    assert event.accepted_at == NOW and event.accepted_at.tzinfo is UTC
+
+
+def test_date_only_same_eastern_day_is_ambiguous_across_utc_midnight(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration", at=datetime(2026, 10, 6, 1, tzinfo=UTC)))
+    tracker.record(chronology_event("rw", "withdrawn", at=NOW.replace(hour=0), precision="date"))
+    assert tracker.candidates()[0]["status"] == "chronology_unresolved"
+
+
+def test_unclassified_same_day_withdrawal_keeps_registration_inactive_and_unconfirmed(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration", confirmed=False))
+    tracker.record(chronology_event("rw", "withdrawn", at=NOW.replace(hour=0), precision="date", confirmed=False))
+    candidate = tracker.candidates()[0]
+    assert candidate["status"] == "chronology_unresolved" and candidate["active"] is False
+    assert candidate["ipo_confirmed"] is False
+
+
+def test_single_date_only_prospectus_has_no_ambiguity_against_itself(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("prospectus", "prospectus", at=NOW.replace(hour=0), precision="date"))
+    assert tracker.candidates()[0]["status"] == "prospectus_filed"
+    assert tracker.candidates()[0]["active"] is True
+
+
+def test_definite_withdrawal_remains_terminal_despite_other_ambiguous_stage(tmp_path):
+    tracker = chronology_tracker(tmp_path)
+    tracker.record(chronology_event("s1", "registration"))
+    tracker.record(chronology_event("effect", "effective", at=NOW.replace(hour=0), precision="date"))
+    tracker.record(chronology_event("rw", "withdrawn", at=NOW+timedelta(days=1)))
+    assert tracker.candidates()[0]["status"] == "withdrawn"
+    assert tracker.candidates()[0]["active"] is False
+    assert tracker.summary()["withdrawn_ipos"] == 1

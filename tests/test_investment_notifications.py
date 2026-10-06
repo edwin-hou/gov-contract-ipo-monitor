@@ -100,6 +100,26 @@ def test_mail_keeps_exact_report_attachments_and_no_assumed_position():
     assert b'"entry": 101.0' in attachments["research-report.json"]
 
 
+@pytest.mark.parametrize("open_at,close_at", [
+    ("2026-10-06T08:30:00", "2026-10-06T15:00:00-05:00"),
+    ("2026-10-06T08:30:00-05:00", "2026-10-06T15:00:00"),
+    ("2026-10-06T15:00:00-05:00", "2026-10-06T08:30:00-05:00"),
+    ("2026-10-06T08:30:00-05:00", "2026-10-06T08:30:00-05:00"),
+])
+def test_plaintext_report_does_not_invent_times_from_ambiguous_or_reversed_windows(open_at, close_at):
+    report = {"completed_at": NOW.isoformat(), "trade_ideas": [{
+        "symbol": "EXAMPLE", "action": "conditional_buy", "exchange": "NASDAQ", "currency": "USD",
+        "entry": 101, "invalidation": 95, "target": 113,
+        "strategy": {"timing": {"entry_window": {"local_timezone": "America/Chicago",
+                                                "local_open": open_at, "local_close": close_at}}},
+    }]}
+    raw = report_message(report, sender=ADDRESS, recipient=ADDRESS, event_key="timing-test", created_at=NOW)
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    text = message.get_body(preferencelist=("plain",)).get_content()
+    assert "calendar unavailable; verify exchange hours with your broker" in text
+    assert "08:30 AM" not in text and "03:00 PM" not in text
+
+
 def test_publication_is_idempotent_and_cannot_change_content_or_recipient(tmp_path):
     outbox = EmailOutbox(tmp_path / "mail.db")
     first = enqueue(outbox)

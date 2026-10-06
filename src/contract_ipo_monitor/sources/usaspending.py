@@ -125,6 +125,16 @@ class USAspendingNormalizer:
         )
 
 
+class IncompleteUSAspendingCollection(RuntimeError):
+    """Incomplete source scan with usable records and no successful watermark."""
+
+    def __init__(self, reason: str, *, records: list[ContractEvidence], page: int):
+        super().__init__(reason)
+        self.reason = reason
+        self.records = tuple(records)
+        self.page = page
+
+
 class USAspendingCollector:
     URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
 
@@ -132,6 +142,7 @@ class USAspendingCollector:
         self.client = client
         self.normalizer = USAspendingNormalizer()
         self.recipient_resolver = recipient_resolver
+        self.partial_records: list[ContractEvidence] = []
 
     async def collect(
         self,
@@ -145,59 +156,70 @@ class USAspendingCollector:
         max_pages: int = 250,
         enrich_uei: bool = False,
     ) -> list[ContractEvidence]:
+        # Retain completed observations even if a later page fails or the
+        # caller's deadline cancels the request. This is never a success cursor.
+        self.partial_records = []
         start = start_date or (observed_at.date() - lookback)
         end = end_date or observed_at.date()
         if start > end or page < 1 or not 1 <= limit <= 100 or max_pages < 1:
             raise ValueError("invalid USAspending collection window or pagination limits")
         current_page = page
-        records: list[ContractEvidence] = []
+        records = self.partial_records
         seen: set[tuple[str, str]] = set()
 
-        while True:
-            payload = {
-                "filters": {
-                    "time_period": [{"start_date": start.isoformat(), "end_date": end.isoformat()}],
-                    "award_type_codes": ["A", "B", "C", "D"],
-                },
-                "fields": [
-                    "Award ID", "Recipient Name", "Award Amount", "Recipient UEI", "Recipient Location",
-                    "Awarding Agency", "Awarding Sub Agency", "Start Date", "End Date",
-                    "Base Obligation Date", "Last Modified Date", "Description", "Contract Award Type", "generated_internal_id",
-                ],
-                "page": current_page,
-                "limit": limit,
-                "subawards": False,
-                "sort": "Start Date",
-                "order": "desc",
-            }
-            data = await self.client.request_json("POST", self.URL, json=payload)
-            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
-                raise ValueError("USAspending response does not contain a results list")
-            rows = data["results"]
-            for row in rows:
-                record = self.normalizer.normalize(row, observed_at=observed_at)
-                if not record.award_id or not record.recipient_name:
-                    raise ValueError("USAspending returned an award without an identifier or recipient")
-                if enrich_uei and record.recipient_uei is None and self.recipient_resolver is not None:
-                    uei = await self.recipient_resolver.resolve_uei(record.recipient_name)
-                    if uei:
-                        record = record.model_copy(update={"recipient_uei": uei})
-                key = (record.source_record_id, record.raw_payload_hash)
-                if key not in seen:
-                    seen.add(key)
-                    records.append(record)
+        try:
+            while True:
+                payload = {
+                    "filters": {
+                        "time_period": [{"start_date": start.isoformat(), "end_date": end.isoformat()}],
+                        "award_type_codes": ["A", "B", "C", "D"],
+                    },
+                    "fields": [
+                        "Award ID", "Recipient Name", "Award Amount", "Recipient UEI", "Recipient Location",
+                        "Awarding Agency", "Awarding Sub Agency", "Start Date", "End Date",
+                        "Base Obligation Date", "Last Modified Date", "Description", "Contract Award Type", "generated_internal_id",
+                    ],
+                    "page": current_page,
+                    "limit": limit,
+                    "subawards": False,
+                    "sort": "Start Date",
+                    "order": "desc",
+                }
+                data = await self.client.request_json("POST", self.URL, json=payload)
+                if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                    raise ValueError("USAspending response does not contain a results list")
+                rows = data["results"]
+                for row in rows:
+                    record = self.normalizer.normalize(row, observed_at=observed_at)
+                    if not record.award_id or not record.recipient_name:
+                        raise ValueError("USAspending returned an award without an identifier or recipient")
+                    if enrich_uei and record.recipient_uei is None and self.recipient_resolver is not None:
+                        uei = await self.recipient_resolver.resolve_uei(record.recipient_name)
+                        if uei:
+                            record = record.model_copy(update={"recipient_uei": uei})
+                    key = (record.source_record_id, record.raw_payload_hash)
+                    if key not in seen:
+                        seen.add(key)
+                        records.append(record)
 
-            metadata = (data or {}).get("page_metadata") or {}
-            if not metadata.get("hasNext"):
-                break
-            if current_page - page + 1 >= max_pages:
-                raise RuntimeError(
-                    f"USAspending pagination exceeded max_pages={max_pages} for {start.isoformat()}..{end.isoformat()}; refusing to truncate silently."
-                )
-            next_page = metadata.get("next")
-            proposed_page = int(next_page) if next_page is not None else current_page + 1
-            if proposed_page <= current_page or not rows:
-                raise RuntimeError("USAspending pagination did not advance; refusing incomplete collection")
-            current_page = proposed_page
+                metadata = (data or {}).get("page_metadata") or {}
+                if not metadata.get("hasNext"):
+                    break
+                if current_page - page + 1 >= max_pages:
+                    raise RuntimeError(
+                        f"USAspending pagination exceeded max_pages={max_pages} for {start.isoformat()}..{end.isoformat()}; refusing to truncate silently."
+                    )
+                next_page = metadata.get("next")
+                proposed_page = int(next_page) if next_page is not None else current_page + 1
+                if proposed_page <= current_page or not rows:
+                    raise RuntimeError("USAspending pagination did not advance; refusing incomplete collection")
+                current_page = proposed_page
+
+        except Exception as exc:
+            if records:
+                raise IncompleteUSAspendingCollection(
+                    str(exc), records=records, page=current_page,
+                ) from exc
+            raise
 
         return records

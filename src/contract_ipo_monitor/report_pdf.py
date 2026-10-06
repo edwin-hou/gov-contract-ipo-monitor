@@ -303,6 +303,18 @@ def report_pdf(report: dict, *, notice: str = "", test: bool = False) -> bytes:
         story.append(p(f"{len(ideas) - _MAX_IDEAS} additional plans are retained in the JSON audit; this PDF is bounded to {_MAX_IDEAS} readable plans.", "small"))
     story += [CondPageBreak(140), p("Source coverage and context", "appendix_title"),
               p("Source-run summary. The JSON audit preserves exact dates, full risks, original text, all receipts and waiting states. Collection and email delivery are separate records.", "small", 400)]
+    sec_collection = _dict(report.get("sec_collection"))
+    if sec_collection:
+        complete = sec_collection.get("catchup_complete")
+        catchup = "complete within this published-index scope" if complete is True else "incomplete" if complete is False else "unconfirmed"
+        story.append(p("SEC filing review: " + _text(sec_collection.get("pending_filings"), 30, fallback="Unavailable")
+                       + " pending documents. Index scope starts " + _text(sec_collection.get("scope_start"), 25)
+                       + "; captured through " + _text(sec_collection.get("captured_through"), 25)
+                       + "; latest published index seen " + _text(sec_collection.get("published_through"), 25)
+                       + ". Index catch-up is " + catchup + ".", "small", 450))
+        story.append(p("Daily-index filing dates have no verified intraday filing time. Pending documents have not yet been classified; index catch-up does not establish complete earlier, confidential, international or real-time filing coverage.", "small", 350))
+        if sec_collection.get("error"):
+            story.append(labelled("SEC collection error:", sec_collection["error"], "small", 300))
     coverage = []
     for key in ("coverage", "world_coverage", "price_coverage", "quote_coverage", "listed_discovery_coverage"):
         coverage.extend(_list(report.get(key)))

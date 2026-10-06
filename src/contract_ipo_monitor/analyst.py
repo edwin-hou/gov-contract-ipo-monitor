@@ -204,6 +204,7 @@ class AnalystStore:
     def claim(self, identity: str, model: str, now: datetime, *, daily_limit: int = 4):
         if type(daily_limit) is not int or not 1 <= daily_limit <= 8:
             raise ValueError("Invalid daily analyst limit")
+        now = stamp(now)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM analyst_calls WHERE identity=?", (identity,)).fetchone()
@@ -211,8 +212,16 @@ class AnalystStore:
                 if not timedelta(0) <= now - stamp(row["claimed_at"]) <= timedelta(hours=6):
                     return {"status": "review_expired", "cached": True, "result": None}
                 return {"status": row["status"], "cached": True, "result": json.loads(row["result_json"]) if row["result_json"] else None}
-            start = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            count = connection.execute("SELECT COUNT(*) FROM analyst_calls WHERE claimed_at>=?", (start,)).fetchone()[0]
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=1)
+            # Old claims may contain an aware local offset. ISO strings cannot
+            # be compared lexically with a UTC day boundary. Parse the durable
+            # instants exactly (including microseconds) without rewriting them.
+            try:
+                count = sum(start <= stamp(row["claimed_at"]) < end for row in
+                            connection.execute("SELECT claimed_at FROM analyst_calls"))
+            except (ValueError, TypeError, OverflowError):
+                raise ValueError("Invalid durable analyst claim timestamp") from None
             if count >= daily_limit:
                 return {"status": "daily_limit", "cached": True, "result": None}
             connection.execute("INSERT INTO analyst_calls(identity,model,claimed_at,status) VALUES(?,?,?,?)",

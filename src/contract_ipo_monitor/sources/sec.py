@@ -20,6 +20,8 @@ from ..models import ListingRoute, ListingSignal
 from ..risk import RiskAnalyzer
 from ..tracking import IPOEvidence
 from .http import ResilientClient
+from .sec_catalog import SECFilingCatalog
+from .sec_metadata import accepted_at_from_filing_index, filing_date_from_filing_index
 
 
 class _DocumentHTML(HTMLParser):
@@ -458,6 +460,7 @@ class SECCollector:
         self.last_feed_truncated = False
         self.db = db
         self.archive = archive
+        self.catalog = SECFilingCatalog(db) if db is not None else None
         self.max_document_bytes = max_document_bytes
         self._request_lock = asyncio.Lock()
         self._last_request = 0.0
@@ -530,34 +533,37 @@ class SECCollector:
         if self.db is None:
             return False
         with closing(self.db.connect()) as conn:
-            if conn.execute("SELECT 1 FROM sec_processed_filings WHERE accession=?", (accession,)).fetchone() is None:
-                return False
-            # Receipts created before raw archiving was added need a one-time replay.
-            # The latest version supersedes older missing references after recovery.
-            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ipo_evidence'").fetchone():
-                row = conn.execute(
-                    "SELECT evidence_json FROM ipo_evidence WHERE source='sec' AND event_id=? ORDER BY id DESC LIMIT 1",
-                    (accession,),
-                ).fetchone()
-                if row:
-                    try:
-                        evidence = json.loads(row["evidence_json"])
-                    except (ValueError, TypeError):
-                        return False
-                    return self._has_durable_archive(conn, accession, evidence)
-            # Alternate listing routes (e.g. an 8-K business combination) can have
-            # a legacy signal without an IPO event. Ordinary ignored 8-Ks do not.
+            return self._is_processed(conn, accession)
+
+    def _is_processed(self, conn, accession: str) -> bool:
+        if conn.execute("SELECT 1 FROM sec_processed_filings WHERE accession=?", (accession,)).fetchone() is None:
+            return False
+        # Receipts created before raw archiving was added need a one-time replay.
+        # The latest version supersedes older missing references after recovery.
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ipo_evidence'").fetchone():
             row = conn.execute(
-                "SELECT version_json FROM listing_signals WHERE signal_id=? ORDER BY id DESC LIMIT 1", (accession,),
+                "SELECT evidence_json FROM ipo_evidence WHERE source='sec' AND event_id=? ORDER BY id DESC LIMIT 1",
+                (accession,),
             ).fetchone()
             if row:
                 try:
-                    evidence = json.loads(row["version_json"])
+                    evidence = json.loads(row["evidence_json"])
                 except (ValueError, TypeError):
                     return False
-                if evidence.get("source") == "sec":
-                    return self._has_durable_archive(conn, accession, evidence)
-            return True
+                return self._has_durable_archive(conn, accession, evidence)
+        # Alternate listing routes (e.g. an 8-K business combination) can have
+        # a legacy signal without an IPO event. Ordinary ignored 8-Ks do not.
+        row = conn.execute(
+            "SELECT version_json FROM listing_signals WHERE signal_id=? ORDER BY id DESC LIMIT 1", (accession,),
+        ).fetchone()
+        if row:
+            try:
+                evidence = json.loads(row["version_json"])
+            except (ValueError, TypeError):
+                return False
+            if evidence.get("source") == "sec":
+                return self._has_durable_archive(conn, accession, evidence)
+        return True
 
     def _has_durable_archive(self, conn, accession: str, evidence: dict[str, Any]) -> bool:
         reference = evidence.get("raw_archive_path")
@@ -611,11 +617,26 @@ class SECCollector:
                 return False
         return True
 
+    def requeue_invalid_catalog_receipts(self) -> int:
+        """Recheck archived evidence even after its filing leaves the live feed."""
+        if self.catalog is None or self.db is None:
+            return 0
+        with self.db.transaction() as conn:
+            candidates = conn.execute(
+                "SELECT accession FROM sec_pending_filings WHERE processed_at IS NOT NULL"
+            ).fetchall()
+            invalid = [row["accession"] for row in candidates
+                       if not self._is_processed(conn, row["accession"])]
+            conn.executemany("UPDATE sec_pending_filings SET processed_at=NULL WHERE accession=?",
+                             [(accession,) for accession in invalid])
+        return len(invalid)
+
     def mark_processed(self, accession: str, *, observed_at: datetime) -> None:
         if self.db is None:
             return
-        with closing(self.db.connect()) as conn:
+        with self.db.transaction() as conn:
             conn.execute("INSERT OR IGNORE INTO sec_processed_filings(accession,processed_at) VALUES(?,?)", (accession, observed_at.isoformat()))
+            conn.execute("UPDATE sec_pending_filings SET processed_at=? WHERE accession=?", (observed_at.isoformat(), accession))
 
     async def current_entries(self, form_type: str, *, count: int = 100) -> list[dict[str, Any]]:
         if count < 1 or count > 100:
@@ -631,6 +652,11 @@ class SECCollector:
             parsed = self.normalizer.parse_atom(xml)
             new = [entry for entry in parsed if entry["accession"] not in seen]
             matching = [entry for entry in parsed if entry["form_type"].strip().upper() == form_type.strip().upper()]
+            if self.catalog is not None:
+                observed = datetime.now(UTC)
+                self.catalog.capture(matching, observed_at=observed)
+                invalid = [entry for entry in matching if not self.is_processed(entry["accession"])]
+                self.catalog.capture(invalid, observed_at=observed, requeue=True)
             for entry in new:
                 seen.add(entry["accession"])
                 if entry["form_type"].strip().upper() == form_type.strip().upper():
@@ -641,10 +667,10 @@ class SECCollector:
                 break
             if not new:
                 # The upstream may ignore the requested pagination offset.
-                self.last_feed_truncated = any(not self.is_processed(entry["accession"]) for entry in matching)
+                self.last_feed_truncated = True
                 break
             if page == self.max_pages - 1:
-                self.last_feed_truncated = any(not self.is_processed(entry["accession"]) for entry in matching)
+                self.last_feed_truncated = True
         return entries
 
     async def issuer_address(self, cik: str | None) -> str | None:
@@ -670,6 +696,12 @@ class SECCollector:
                 or not parsed_url.path.startswith("/Archives/edgar/data/") or parsed_url.username is not None):
             raise ValueError("SEC entry does not reference an official EDGAR archive document")
         index_html = await self._text(entry["source_url"])
+        accepted = accepted_at_from_filing_index(index_html)
+        source_filing_date = filing_date_from_filing_index(index_html)
+        if accepted is not None and accepted > datetime.now(UTC):
+            raise ValueError("SEC index acceptance timestamp is in the future")
+        if source_filing_date is None and entry.get("filed_at_precision") == "date":
+            source_filing_date = entry["filed_at"].date()
         document_url = self.normalizer.primary_document_url(entry["source_url"], index_html, entry["form_type"])
         if document_url == entry["source_url"] and "-index." in document_url:
             raise ValueError("No primary filing document found in SEC filing index")
@@ -679,6 +711,12 @@ class SECCollector:
         enriched["registration_id"] = entry.get("registration_id") or self.normalizer.registration_number(text) or self.normalizer.registration_number(index_html)
         event = self.normalizer.tracking_document(text=text, **enriched)
         signal = self.normalizer.classify_document(text=text, **enriched)
+        precision = entry.get("filed_at_precision", "second")
+        temporal = {"filed_at_precision": precision, "accepted_at": accepted, "source_filing_date": source_filing_date}
+        if event is not None:
+            event = event.model_copy(update=temporal)
+        if signal is not None:
+            signal = signal.model_copy(update=temporal)
         if event is not None or signal is not None:
             reference = self._archive_documents(
                 accession=entry["accession"], index_url=entry["source_url"], index_html=index_html,

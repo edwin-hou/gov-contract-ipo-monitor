@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class EvidenceClass(StrEnum):
@@ -75,6 +75,9 @@ class ListingSignal(BaseModel):
     issuer_address: str | None = None
     cik: str | None = None
     filed_at: datetime
+    filed_at_precision: Literal["second", "date"] = "second"
+    accepted_at: datetime | None = None
+    source_filing_date: date | None = None
     active: bool = True
     status: str = "active"
     route: ListingRoute
@@ -101,6 +104,15 @@ class ListingSignal(BaseModel):
     registration_id: str | None = None
     risk_findings: tuple[str, ...] = ()
     raw_payload_hash: str | None = None
+
+    @field_validator("accepted_at")
+    @classmethod
+    def accepted_timestamp(cls, value: datetime | None) -> datetime | None:
+        if value is not None:
+            if value.utcoffset() is None:
+                raise ValueError("SEC acceptance timestamp must be aware")
+            return value.astimezone(UTC)
+        return None
 
 
 class MarketSnapshot(BaseModel):

@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 import json
 
 import pytest
@@ -115,6 +115,56 @@ def test_daily_budget_bounds_calls_across_separate_store_instances(tmp_path):
     assert first.claim("one",DEFAULT_MODEL,NOW,daily_limit=1)["cached"] is False
     assert second.claim("two",DEFAULT_MODEL,NOW,daily_limit=1)["status"] == "daily_limit"
     assert second.claim("two",DEFAULT_MODEL,NOW+timedelta(days=1),daily_limit=1)["cached"] is False
+
+
+@pytest.mark.parametrize("offset", [-5, 9])
+def test_daily_claim_budget_uses_utc_day_for_aware_local_input(tmp_path, offset):
+    store = AnalystStore(tmp_path / "analyst.db")
+    at = datetime(2026, 10, 6, tzinfo=UTC).astimezone(timezone(timedelta(hours=offset)))
+    assert store.claim("one", DEFAULT_MODEL, at, daily_limit=1)["cached"] is False
+    assert store.claim("two", DEFAULT_MODEL, at, daily_limit=1)["status"] == "daily_limit"
+    with store.connect() as connection:
+        rows = connection.execute("SELECT claimed_at FROM analyst_calls").fetchall()
+    assert [row["claimed_at"] for row in rows] == ["2026-10-06T00:00:00+00:00"]
+
+
+@pytest.mark.parametrize("recorded_at,expected", [
+    ("2026-10-05T19:00:00-05:00", "daily_limit"),
+    ("2026-10-06T09:00:00+09:00", "daily_limit"),
+    ("2026-10-05T18:59:59.999999-05:00", "claimed"),
+    ("2026-10-06T18:59:59.999999-05:00", "daily_limit"),
+    ("2026-10-06T19:00:00-05:00", "claimed"),
+])
+def test_existing_offset_claims_count_exact_utc_instants_without_rewriting_history(tmp_path, recorded_at, expected):
+    store = AnalystStore(tmp_path / "analyst.db")
+    with store.connect() as connection:
+        connection.execute("INSERT INTO analyst_calls(identity,model,claimed_at,status) VALUES(?,?,?,?)",
+                           ("legacy-offset", DEFAULT_MODEL, recorded_at, "unavailable"))
+        original = dict(connection.execute("SELECT * FROM analyst_calls WHERE identity='legacy-offset'").fetchone())
+    result = store.claim("new", DEFAULT_MODEL, datetime(2026, 10, 6, tzinfo=UTC), daily_limit=1)
+    assert result["status"] == expected
+    with store.connect() as connection:
+        assert dict(connection.execute("SELECT * FROM analyst_calls WHERE identity='legacy-offset'").fetchone()) == original
+
+
+def test_naive_claim_clock_cannot_spend_or_renew_budget(tmp_path):
+    store = AnalystStore(tmp_path / "analyst.db")
+    with pytest.raises(ValueError, match="Aware timestamp required"):
+        store.claim("unknown-timezone", DEFAULT_MODEL, datetime(2026, 10, 6), daily_limit=1)
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM analyst_calls").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("recorded_at", ["2026-10-06T00:00:00", "invalid"])
+def test_unverifiable_durable_claim_times_cannot_authorize_another_attempt(tmp_path, recorded_at):
+    store = AnalystStore(tmp_path / "analyst.db")
+    with store.connect() as connection:
+        connection.execute("INSERT INTO analyst_calls(identity,model,claimed_at,status) VALUES(?,?,?,?)",
+                           ("unknown-time", DEFAULT_MODEL, recorded_at, "claimed"))
+    with pytest.raises(ValueError, match="Invalid durable analyst claim timestamp"):
+        store.claim("new", DEFAULT_MODEL, datetime(2026, 10, 6, tzinfo=UTC), daily_limit=1)
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM analyst_calls").fetchone()[0] == 1
 
 
 def test_wrong_current_quote_symbol_never_calls_model(tmp_path):

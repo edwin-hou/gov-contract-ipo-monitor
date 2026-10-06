@@ -27,6 +27,9 @@ class IPOEvidence(BaseModel):
     source_url: str
     source_kind: Literal["regulatory", "issuer", "reporting", "commentary"] = "commentary"
     filed_at: datetime
+    filed_at_precision: Literal["second", "date"] = "second"
+    accepted_at: datetime | None = None
+    source_filing_date: date | None = None
     event_type: Literal[
         "registration", "amendment", "effective", "prospectus",
         "withdrawn", "amendment_withdrawn", "rumor",
@@ -50,6 +53,15 @@ class IPOEvidence(BaseModel):
     def require_timezone(cls, value: datetime) -> datetime:
         if value.utcoffset() is None:
             raise ValueError("evidence timestamp must include a timezone")
+        return value.astimezone(UTC)
+
+    @field_validator("accepted_at")
+    @classmethod
+    def require_accepted_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.utcoffset() is None:
+            raise ValueError("SEC Accepted timestamp must include a timezone")
         return value.astimezone(UTC)
 
     @field_validator("cik")
@@ -90,6 +102,23 @@ CREATE TABLE IF NOT EXISTS ipo_evidence(
 CREATE INDEX IF NOT EXISTS ipo_evidence_issuer ON ipo_evidence(issuer_key, filed_at);
 CREATE INDEX IF NOT EXISTS ipo_evidence_registration ON ipo_evidence(issuer_key, registration_id);
 """
+
+
+def _filing_order(left: IPOEvidence, right: IPOEvidence) -> int | None:
+    if (left.source, left.event_id) == (right.source, right.event_id):
+        return 0
+    if left.accepted_at is not None and right.accepted_at is not None:
+        return (left.accepted_at > right.accepted_at) - (left.accepted_at < right.accepted_at)
+    if left.source_filing_date is not None and right.source_filing_date is not None:
+        if left.source_filing_date == right.source_filing_date:
+            return None
+        return (left.source_filing_date > right.source_filing_date) - (left.source_filing_date < right.source_filing_date)
+    if left.filed_at_precision == right.filed_at_precision == "second":
+        return (left.filed_at > right.filed_at) - (left.filed_at < right.filed_at)
+    # Atom updated timestamps and the SEC's legal Filing Date have different
+    # meanings. After-hours acceptance can receive the next business day's
+    # filing date, so their apparent calendar-day separation proves no order.
+    return None
 
 
 class IPOTracker:
@@ -137,7 +166,17 @@ class IPOTracker:
         if limit < 1:
             return []
         groups: dict[tuple[str, str], list[IPOEvidence]] = {}
-        for evidence in self.evidence():
+        # Keep all versions in evidence(), but derive lifecycle state from the
+        # newest source accession receipt. A precise Accepted-time replay must
+        # supersede its earlier date-only observation rather than coexist with
+        # an ambiguous copy of the same filing.
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute("""SELECT evidence_json FROM ipo_evidence current
+                WHERE current.id=(SELECT MAX(newer.id) FROM ipo_evidence newer
+                  WHERE newer.source=current.source AND newer.event_id=current.event_id)
+                ORDER BY filed_at,id""").fetchall()
+        for row in rows:
+            evidence = IPOEvidence.model_validate_json(row["evidence_json"])
             if evidence.event_type == "rumor" or not evidence.authoritative:
                 scope = "unverified"
             elif evidence.registration_id:
@@ -160,6 +199,7 @@ class IPOTracker:
             current = eligible[-1] if eligible else latest
             status = "rumored" if not authoritative else "registration_observed"
             active = True
+            ambiguous_notices = []
             confidence = "unverified" if not authoritative else "unclassified_registration"
             if confirmed:
                 first_confirmation = confirmed[0]
@@ -167,7 +207,11 @@ class IPOTracker:
                 status = "amended" if first_confirmation.event_type == "amendment" else "filed"
                 # Only replay notices sharing this exact registration scope and issuer.
                 for event in authoritative:
-                    if event.filed_at < first_confirmation.filed_at:
+                    order = _filing_order(event, first_confirmation)
+                    if order is None and event.event_type in {"withdrawn", "effective", "prospectus"}:
+                        ambiguous_notices.append(event)
+                        continue
+                    if order == -1:
                         continue
                     if event.event_type == "withdrawn":
                         status, active = "withdrawn", False
@@ -180,8 +224,17 @@ class IPOTracker:
                 # Effectiveness and final prospectus do not establish completed trading.
             elif eligible and scope != "unverified":
                 for event in authoritative:
-                    if event.event_type == "withdrawn" and event.filed_at >= eligible[0].filed_at:
-                        status, active = "withdrawn_unclassified_registration", False
+                    if event.event_type == "withdrawn":
+                        order = _filing_order(event, eligible[0])
+                        if order is None:
+                            ambiguous_notices.append(event)
+                        elif order >= 0:
+                            status, active = "withdrawn_unclassified_registration", False
+            # A definitely applicable withdrawal is terminal regardless of any
+            # other uncertain stage. Otherwise date-only lifecycle overlap
+            # with the registration withholds an active-state assertion.
+            if ambiguous_notices and active:
+                status, active = "chronology_unresolved", False
 
             urls = list(dict.fromkeys(event.source_url for event in events))
             result.append({
@@ -194,10 +247,18 @@ class IPOTracker:
                 "offering_kind": current.offering_kind,
                 "effective_date": next((event.effective_date.isoformat() for event in reversed(authoritative) if event.effective_date), None),
                 "first_filed_at": events[0].filed_at.isoformat(), "last_filed_at": latest.filed_at.isoformat(),
+                "first_filed_at_precision": events[0].filed_at_precision,
+                "last_filed_at_precision": latest.filed_at_precision,
+                "first_accepted_at": events[0].accepted_at.isoformat() if events[0].accepted_at else None,
+                "last_accepted_at": latest.accepted_at.isoformat() if latest.accepted_at else None,
+                "first_source_filing_date": events[0].source_filing_date.isoformat() if events[0].source_filing_date else None,
+                "last_source_filing_date": latest.source_filing_date.isoformat() if latest.source_filing_date else None,
                 "evidence_count": len(events), "source_urls": urls,
                 "classification_reason": current.classification_reason,
                 "limitations": [
                     "Public filings do not prove the offering completed or shares began trading.",
+                    *(["Date-only SEC filing evidence does not establish the order of a registration and its lifecycle notice; active status is withheld until official Accepted timestamps resolve it."] if status == "chronology_unresolved" else []),
+                    *(["At least one source reports only a filing date; its midnight placeholder is not an actual filing time."] if any(event.filed_at_precision == "date" for event in events) else []),
                     *(["SEC registration file number missing; lifecycle cannot be linked safely."] if scope.startswith("unscoped:") else []),
                     *(["Commentary or reporting is unverified and cannot confirm an IPO."] if not authoritative else []),
                 ],
@@ -214,6 +275,7 @@ class IPOTracker:
             "companies": company_count, "evidence": evidence_count, "ipo_candidates": len(candidates),
             "confirmed_ipos": sum(candidate["ipo_confirmed"] for candidate in candidates),
             "active_ipos": sum(candidate["ipo_confirmed"] and candidate["active"] for candidate in candidates),
-            "withdrawn_ipos": sum(candidate["ipo_confirmed"] and not candidate["active"] for candidate in candidates),
+            "withdrawn_ipos": sum(candidate["ipo_confirmed"] and candidate["status"] == "withdrawn" for candidate in candidates),
+            "chronology_unresolved_candidates": sum(candidate["status"] == "chronology_unresolved" for candidate in candidates),
             "unverified_candidates": sum(candidate["status"] == "rumored" for candidate in candidates),
         }

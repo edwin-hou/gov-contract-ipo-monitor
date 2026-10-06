@@ -209,3 +209,33 @@ def test_naive_instants_remain_unavailable_and_same_host_history_links_are_disti
     assert "Price history | Benchmark history" in rendered
     assert "https://api.nasdaq.com/quote/MU" in links(pdf)
     assert "https://api.nasdaq.com/quote/ACWI" in links(pdf)
+
+
+@pytest.mark.parametrize("complete,expected", [(True, "complete within this published-index scope"),
+    (False, "incomplete"), ("true", "unconfirmed"), (None, "unconfirmed")])
+def test_sec_catalogue_progress_is_separate_from_classification_and_intraday_time(complete, expected):
+    report = sample_report()
+    report["sec_collection"] = {"pending_filings": 180, "scope_start": "2026-09-29",
+        "captured_through": "2026-10-02", "published_through": "2026-10-05", "catchup_complete": complete}
+    rendered = text(reader(report))
+    assert "SEC filing review: 180 pending documents" in rendered
+    assert "Index scope starts 2026-09-29; captured through 2026-10-02; latest published index seen 2026-10-05" in rendered
+    assert "Index catch-up is " + expected in rendered
+    assert "no verified intraday filing time" in rendered
+    assert "Pending documents have not yet been classified" in rendered
+    assert "complete earlier, confidential, international or real-time filing coverage" in rendered
+    # Index-only dates stay exactly as reported; local timezone conversion would
+    # turn a placeholder UTC midnight into the previous U.S. calendar date.
+    assert "Sep 28" not in rendered
+
+
+def test_sec_catalogue_errors_and_unknown_progress_remain_explicit_and_escaped():
+    report = sample_report()
+    report["sec_collection"] = {"status": "error", "error": "HTTP 503 <b>source unavailable</b>"}
+    pdf = reader(report)
+    rendered = text(pdf)
+    assert "SEC filing review: Unavailable pending documents" in rendered
+    assert "captured through Unavailable; latest published index seen Unavailable" in rendered
+    assert "Index catch-up is unconfirmed" in rendered
+    assert "SEC collection error: HTTP 503 <b>source unavailable</b>" in rendered
+    assert links(pdf) == ["https://investors.micron.com/results?view=full&year=2026", "https://www.reddit.com"]

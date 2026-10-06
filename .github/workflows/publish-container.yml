@@ -18,7 +18,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main')
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     env:
       SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
@@ -28,6 +30,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.SOURCE_SHA }}
+
+      - name: Validate the build checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -39,16 +47,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate container metadata
+      - name: Generate container metadata for the verified source
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=latest
-            type=sha,format=long
+          flavor: latest=false
+          tags: type=raw,value=sha-${{ env.SOURCE_SHA }}
+          labels: org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
 
-      - name: Build and publish container
+      - name: Build and publish the source revision
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -59,28 +68,75 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Record successful publication
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p deployments
-          python - <<'PY'
-          import json
-          import os
-          from datetime import datetime, timezone
-          from pathlib import Path
+      - name: Verify publication and conditionally promote latest
+        uses: actions/github-script@v7
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        with:
+          script: |
+            const fs = require('fs');
+            const source = process.env.SOURCE_SHA;
+            const digest = process.env.BUILD_DIGEST;
+            const image = process.env.IMAGE.toLowerCase();
+            if (source?.length !== 40 || !/^[a-f0-9]{40}$/.test(source)
+                || digest?.length !== 71 || !/^sha256:[a-f0-9]{64}$/.test(digest)
+                || image !== image.trim() || !/^ghcr\.io\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(image)) {
+              throw new Error('Container publication identity is invalid');
+            }
+            const revisionTag = `${image}:sha-${source}`;
+            const digestReference = `${image}@${digest}`;
+            async function inspect(reference) {
+              const result = await exec.getExecOutput('docker', [
+                'buildx', 'imagetools', 'inspect', reference, '--format', '{{json .Manifest}}'
+              ], {silent: true});
+              const manifest = JSON.parse(result.stdout);
+              if (manifest.digest !== digest) throw new Error('Registry readback does not match the verified build digest');
+              return manifest.digest;
+            }
+            async function mainSha() {
+              const {data} = await github.rest.git.getRef({...context.repo, ref: 'heads/main'});
+              if (data.ref !== 'refs/heads/main' || data.object?.type !== 'commit'
+                  || data.object.sha?.length !== 40 || !/^[a-f0-9]{40}$/.test(data.object.sha)) {
+                throw new Error('Live main reference is not a verified commit');
+              }
+              return data.object.sha;
+            }
+            await inspect(revisionTag);
+            const mainBefore = await mainSha();
+            let promoted = false;
+            let latestDigest = null;
+            if (mainBefore === source) {
+              // The live-main check and registry write span separate services.
+              // Serialization prevents competing publication jobs, not new pushes.
+              await exec.exec('docker', ['buildx', 'imagetools', 'create', '--prefer-index=false',
+                '--tag', `${image}:latest`, digestReference]);
+              latestDigest = await inspect(`${image}:latest`);
+              promoted = true;
+            } else {
+              core.info('Published the source revision; latest was retained because main has advanced.');
+            }
+            const mainAfter = await mainSha();
+            if (promoted && mainAfter !== source) {
+              core.warning('Main advanced after the promotion check; the receipt retains the exact published digest.');
+            }
+            const record = {
+              image: revisionTag,
+              digest_reference: digestReference,
+              digest,
+              source_sha: source,
+              published_at: new Date().toISOString(),
+              platform: 'linux/amd64',
+              registry: 'ghcr.io',
+              latest_promoted: promoted,
+              latest_digest: latestDigest,
+              main_sha_before_promotion: mainBefore,
+              main_sha_after_publication: mainAfter,
+              main_advanced_after_check: promoted && mainAfter !== source,
+              promotion_strategy: 'live-main-check-before-registry-write'
+            };
+            fs.mkdirSync('deployments', {recursive: true});
+            fs.writeFileSync('deployments/container.json', JSON.stringify(record, null, 2) + '\n');
 
-          record = {
-              "image": f"{os.environ['IMAGE']}:latest",
-              "source_sha": os.environ["SOURCE_SHA"],
-              "published_at": datetime.now(timezone.utc).isoformat(),
-              "platform": "linux/amd64",
-              "registry": "ghcr.io",
-          }
-          Path("deployments/container.json").write_text(
-              json.dumps(record, indent=2) + "\n", encoding="utf-8"
-          )
-          PY
       - name: Save publication receipt
         uses: actions/upload-artifact@v4
         with:

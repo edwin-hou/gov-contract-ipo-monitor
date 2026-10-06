@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
 
@@ -73,7 +74,7 @@ def setup(tmp_path, *, baseline=None):
     source = config.outputs / "baseline" / "latest.json"
     monitor.write_json(source, baseline)
     ledger = {"last_report_at": baseline["completed_at"], "last_notified_run": "100", "source_report": str(source),
-              "ideas": monitor.idea_snapshot(baseline)}
+              "report_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "ideas": monitor.idea_snapshot(baseline)}
     monitor.write_json(config.ledger, ledger)
     return config
 
@@ -228,6 +229,143 @@ def test_newer_unfinished_or_failed_run_is_pending_and_never_relabels_baseline_a
     receipt = monitor.read_json(config.receipt)
     assert receipt["outcome"] == "pending_report" and receipt["newest_run"] == "101"
     assert not any(operation == "download" for operation, arguments in github.calls)
+    assert config.ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize("prior_verified", [False, True])
+def test_failed_collection_cannot_rebind_changed_cached_report_bytes(tmp_path, prior_verified):
+    config = setup(tmp_path)
+    if prior_verified:
+        assert monitor.poll(config, now=NOW, github=FakeGitHub(report())) == ""
+        binding = monitor.read_json(config.receipt)
+    else:
+        binding = monitor.read_json(config.ledger)
+    baseline = config.ledger.read_bytes()
+    path = Path(binding["source_report"])
+    altered = monitor.read_json(path)
+    altered["trade_ideas"][0]["entry"] = 103
+    monitor.write_json(path, altered)
+    assert "needs attention" in monitor.poll(config, now=NOW, github=FakeGitHub(report(), run_id=102, conclusion="failure"))
+    receipt = monitor.read_json(config.receipt)
+    assert receipt["status"] == "error" and receipt["failure_code"] == "report_hash_mismatch"
+    assert config.ledger.read_bytes() == baseline
+    if prior_verified:
+        assert receipt["report_sha256"] == binding["report_sha256"]
+    else:
+        assert "report_sha256" not in receipt
+
+
+@pytest.mark.parametrize("prior_verified", [False, True])
+def test_missing_cached_report_hash_requires_verified_hosted_artifact(tmp_path, prior_verified):
+    config = setup(tmp_path)
+    if prior_verified:
+        assert monitor.poll(config, now=NOW, github=FakeGitHub(report())) == ""
+        binding_path = config.receipt
+    else:
+        binding_path = config.ledger
+    binding = monitor.read_json(binding_path)
+    binding.pop("report_sha256")
+    monitor.write_json(binding_path, binding)
+    before = config.ledger.read_bytes()
+    assert "needs attention" in monitor.poll(config, now=NOW, github=FakeGitHub(report(), run_id=102, conclusion="failure"))
+    receipt = monitor.read_json(config.receipt)
+    assert receipt["failure_code"] == "report_hash_missing" and receipt["status"] == "error"
+    assert "report_sha256" not in receipt
+    assert config.ledger.read_bytes() == before
+
+
+def test_reused_baseline_cannot_be_reauthorized_by_run_identity_without_saved_hash(tmp_path):
+    config = setup(tmp_path)
+    ledger = monitor.read_json(config.ledger)
+    ledger.pop("report_sha256")
+    monitor.write_json(config.ledger, ledger)
+    before = config.ledger.read_bytes()
+    github = FakeGitHub(report(), run_id=100)
+    assert "needs attention" in monitor.poll(config, now=NOW, github=github)
+    assert monitor.read_json(config.receipt)["failure_code"] == "report_hash_missing"
+    assert not any(operation == "download" for operation, _ in github.calls)
+    assert config.ledger.read_bytes() == before
+
+
+def test_conflicting_receipt_and_ledger_hashes_never_choose_a_fresh_authority(tmp_path):
+    config = setup(tmp_path)
+    assert "Material IPO/trade" in monitor.poll(config, now=NOW, github=FakeGitHub(report(entry=102)))
+    receipt = monitor.read_json(config.receipt)
+    ledger = monitor.read_json(config.ledger)
+    assert ledger["source_report"] == receipt["source_report"]
+    ledger["report_sha256"] = "b" * 64
+    monitor.write_json(config.ledger, ledger)
+    before = config.ledger.read_bytes()
+    assert "needs attention" in monitor.poll(config, now=NOW, github=FakeGitHub(report(), run_id=102, conclusion="failure"))
+    failed = monitor.read_json(config.receipt)
+    assert failed["failure_code"] == "report_hash_mismatch" and failed["report_sha256"] == receipt["report_sha256"]
+    assert config.ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize("status,conclusion", [("queued", None), ("in_progress", None), ("completed", "failure")])
+def test_newer_failed_or_pending_collection_does_not_hide_unconsumed_successful_report(tmp_path, status, conclusion):
+    config = setup(tmp_path, baseline=report(NOW - timedelta(hours=7)))
+
+    class History(FakeGitHub):
+        def __call__(self, operation, *arguments):
+            if operation == "runs":
+                success = super().__call__(operation, *arguments)[0]
+                return [{**success, "id": 102, "status": status, "conclusion": conclusion}, success]
+            return super().__call__(operation, *arguments)
+
+    current = report(entry=102)
+    github = History(current)
+    assert "Material IPO/trade" in monitor.poll(config, now=NOW, github=github)
+    receipt = monitor.read_json(config.receipt)
+    assert receipt["newest_run"] == "102" and receipt["newest_run_status"] == status
+    assert receipt["newest_run_conclusion"] == conclusion and receipt["verified_run"] == "101"
+    assert receipt["report_completed_at"] == current["completed_at"]
+    assert receipt["artifact_downloaded"] is True and receipt["status"] == "degraded"
+    assert "failure_code" not in receipt and "unsuccessful or unfinished" in receipt["pending_reason"]
+    assert [args for operation, args in github.calls if operation == "run"] == [("101",)]
+    assert [args for operation, args in github.calls if operation == "download"] == [(999, config.outputs / "run-101")]
+    assert monitor.read_json(config.ledger)["last_notified_run"] == "101"
+    assert monitor.poll(config, now=NOW + timedelta(minutes=1), github=github) == ""
+    assert sum(operation == "download" for operation, _ in github.calls) == 1
+    repeated = monitor.read_json(config.receipt)
+    assert repeated["newest_run"] == "102" and repeated["verified_run"] == "101"
+
+
+def test_failed_current_main_cannot_fall_back_to_success_on_another_commit(tmp_path):
+    config = setup(tmp_path, baseline=report(NOW - timedelta(hours=7)))
+    before = config.ledger.read_bytes()
+
+    class WrongCommit(FakeGitHub):
+        def __call__(self, operation, *arguments):
+            if operation == "runs":
+                success = super().__call__(operation, *arguments)[0]
+                return [{**success, "id": 102, "conclusion": "failure"}, {**success, "head_sha": "b" * 40}]
+            return super().__call__(operation, *arguments)
+
+    github = WrongCommit(report(entry=102))
+    assert "needs attention" in monitor.poll(config, now=NOW, github=github)
+    receipt = monitor.read_json(config.receipt)
+    assert receipt["newest_run"] == "102" and receipt["failure_code"] == "report_stale"
+    assert not any(operation in {"run", "artifacts", "download"} for operation, _ in github.calls)
+    assert config.ledger.read_bytes() == before
+
+
+def test_preceding_successful_run_still_requires_valid_actual_artifact(tmp_path):
+    config = setup(tmp_path, baseline=report(NOW - timedelta(hours=7)))
+    before = config.ledger.read_bytes()
+
+    class InvalidArtifact(FakeGitHub):
+        def __call__(self, operation, *arguments):
+            if operation == "runs":
+                success = super().__call__(operation, *arguments)[0]
+                return [{**success, "id": 102, "conclusion": "failure"}, success]
+            if operation == "artifacts":
+                return []
+            return super().__call__(operation, *arguments)
+
+    assert "needs attention" in monitor.poll(config, now=NOW, github=InvalidArtifact(report(entry=102)))
+    receipt = monitor.read_json(config.receipt)
+    assert receipt["newest_run"] == "102" and receipt["failure_code"] == "report_artifact_missing"
     assert config.ledger.read_bytes() == before
 
 

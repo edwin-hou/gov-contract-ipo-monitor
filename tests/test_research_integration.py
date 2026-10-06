@@ -296,12 +296,17 @@ async def test_discourse_timeout_keeps_completed_sources(tmp_path):
     assert monitor.last_report["coverage"][0]["status"] == "error"
 
 
-def test_checkpoint_restore_rejects_arbitrary_files_and_corruption(tmp_path):
+def checkpoint_restorer():
     import importlib.util
     from pathlib import Path
     spec = importlib.util.spec_from_file_location("restore_checkpoint", Path(__file__).parents[1] / "scripts/restore_checkpoint.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def test_checkpoint_restore_rejects_arbitrary_files_and_corruption(tmp_path):
+    module = checkpoint_restorer()
     archive = tmp_path / "checkpoint.zip"
     target = tmp_path / "restored.db"
     with zipfile.ZipFile(archive, "w") as bundle:
@@ -316,6 +321,83 @@ def test_checkpoint_restore_rejects_arbitrary_files_and_corruption(tmp_path):
         bundle.write(checkpoint, "monitor.db")
     assert module.restore(archive, target)
     assert Database(target).count("alerts") == 0
+
+
+@pytest.mark.parametrize("payload", [b"", b"not a database" * 100, b"SQLite format 3\x00" + b"\x00" * 496])
+def test_checkpoint_restore_rejects_empty_or_non_sqlite_without_replacing_history(tmp_path, payload):
+    module = checkpoint_restorer()
+    archive = tmp_path / "checkpoint.zip"
+    target = tmp_path / "preserved.db"
+    target.write_bytes(b"previous checkpoint must survive")
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("monitor.db", payload)
+    with pytest.raises(ValueError):
+        module.restore(archive, target)
+    assert target.read_bytes() == b"previous checkpoint must survive"
+    assert not target.with_suffix(".restore").exists()
+
+
+@pytest.mark.parametrize("mutation", ["unrelated", "missing_table", "missing_column", "view"])
+def test_checkpoint_restore_requires_original_monitor_schema_and_preserves_target(tmp_path, mutation):
+    import sqlite3
+    from contextlib import closing
+
+    module = checkpoint_restorer()
+    source = tmp_path / "source.db"
+    if mutation == "unrelated":
+        with closing(sqlite3.connect(source)) as conn:
+            conn.execute("CREATE TABLE unrelated(id INTEGER PRIMARY KEY)")
+    else:
+        db = Database(source)
+        db.initialize()
+        with db.connect() as conn:
+            if mutation == "missing_table":
+                conn.execute("DROP TABLE collector_state")
+            elif mutation == "missing_column":
+                conn.execute("ALTER TABLE collector_state DROP COLUMN cursor")
+            else:
+                conn.execute("DROP TABLE collector_state")
+                conn.execute("CREATE VIEW collector_state AS SELECT 1 AS name")
+    archive = tmp_path / "checkpoint.zip"
+    target = tmp_path / "preserved.db"
+    target.write_bytes(b"previous checkpoint must survive")
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.write(source, "monitor.db")
+    with pytest.raises(ValueError, match="monitor schema"):
+        module.restore(archive, target)
+    assert target.read_bytes() == b"previous checkpoint must survive"
+    assert not target.with_suffix(".restore").exists()
+
+
+def test_checkpoint_restore_accepts_original_schema_without_later_optional_migrations(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import closing
+    from contract_ipo_monitor.db import SCHEMA
+
+    module = checkpoint_restorer()
+    source = tmp_path / "original.db"
+    with closing(sqlite3.connect(source)) as conn:
+        conn.executescript(SCHEMA)
+        conn.execute("INSERT INTO schema_migrations VALUES(1,?)", (NOW.isoformat(),))
+        conn.commit()
+    before = source.read_bytes()
+    archive = tmp_path / "checkpoint.zip"
+    target = tmp_path / "restored.db"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.write(source, "monitor.db")
+    original_connect = module.sqlite3.connect
+    connections = []
+    def readonly_connect(path, **options):
+        connections.append((path, options))
+        return original_connect(path, **options)
+    monkeypatch.setattr(module.sqlite3, "connect", readonly_connect)
+    assert module.restore(archive, target)
+    assert len(connections) == 1
+    assert connections[0][0].endswith("?mode=ro")
+    assert connections[0][1] == {"uri": True}
+    assert target.read_bytes() == before
+    assert source.read_bytes() == before
+    assert not target.with_suffix(".restore").exists()
 
 
 def test_historic_feed_gaps_remain_visible_after_current_collection_recovers(tmp_path):

@@ -96,6 +96,39 @@ def read_json(path: Path, *, optional: bool = False):
         raise CheckError("local_json_invalid", "A required local report or baseline is missing, oversized, or invalid.") from None
 
 
+def read_verified_report(path: Path, *bindings: dict):
+    """Reuse exactly sealed report bytes; never create authority from a new hash."""
+    expected = set()
+    for binding in bindings:
+        source = binding.get("source_report")
+        if not isinstance(source, str) or not source or Path(source).resolve() != path.resolve():
+            continue
+        digest = binding.get("report_sha256")
+        if digest is None:
+            continue
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise CheckError("report_hash_mismatch", "The saved local report authority is invalid; no report is reauthorized.")
+        expected.add(digest)
+    if not expected:
+        raise CheckError("report_hash_missing", "The local report has no saved hash binding; a verified hosted artifact is required before reuse.")
+    if len(expected) != 1:
+        raise CheckError("report_hash_mismatch", "The saved local report authorities conflict; no report is reauthorized.")
+    digest = next(iter(expected))
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(8_000_001)
+        if len(raw) > 8_000_000:
+            raise ValueError("Size limit")
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise CheckError("report_hash_mismatch", "The previously verified local report changed unexpectedly.")
+        report = _decode(raw)
+        if not isinstance(report, dict):
+            raise ValueError("Expected object")
+    except (OSError, ValueError, UnicodeError):
+        raise CheckError("local_json_invalid", "A required local report or baseline is missing, oversized, or invalid.") from None
+    return report, digest
+
+
 def atomic_write(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
@@ -450,17 +483,25 @@ def poll(config=Config(), *, now=None, github=None):
         receipt["main_sha"] = main_sha
         candidates = [item for item in github("runs", main_sha) if item.get("name") == workflow.get("name") and item.get("head_branch") == "main" and item.get("head_sha") == main_sha]
         candidates.sort(key=lambda item: int(item["id"]), reverse=True)
-        candidate = candidates[0] if candidates else None
-        receipt["newest_run"] = str(candidate["id"]) if candidate else None
-        receipt["newest_run_status"] = candidate.get("status") if candidate else None
-        receipt["newest_run_conclusion"] = candidate.get("conclusion") if candidate else None
+        newest = candidates[0] if candidates else None
+        receipt["newest_run"] = str(newest["id"]) if newest else None
+        receipt["newest_run_status"] = newest.get("status") if newest else None
+        receipt["newest_run_conclusion"] = newest.get("conclusion") if newest else None
+        # Collection status and report authority are separate. A failed or
+        # queued collection must not hide a preceding successful artifact that
+        # this installation has not consumed. Keep the newest attempt visible,
+        # then verify the newest successful current-main report normally.
+        candidate = next((item for item in candidates if item.get("status") == "completed"
+                          and item.get("conclusion") == "success"), None)
+        if newest is not None and candidate is not None and newest["id"] != candidate["id"]:
+            receipt["pending_reason"] = "The latest current-main collection is unsuccessful or unfinished; the preceding successful current-main artifact still requires normal report verification."
         source_path = Path(previous_receipt.get("source_report") or ledger.get("source_report", ""))
-        if candidate is None or candidate.get("status") != "completed" or candidate.get("conclusion") != "success":
-            report = read_json(source_path)
+        if candidate is None:
+            report, sealed_hash = read_verified_report(source_path, previous_receipt, ledger)
             validate_report(report, now)
             receipt.update(status="degraded" if source_gaps(report) else "ok", outcome="pending_report",
                            source_report=str(source_path), report_completed_at=report["completed_at"], source_gaps=source_gaps(report),
-                           report_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                           report_sha256=sealed_hash,
                            last_failure_code=None, pending_reason="No newer successful current-main monitor artifact is complete.")
             return finish_quiet(config, receipt, report, now)
         run_id = str(candidate["id"])
@@ -470,22 +511,20 @@ def poll(config=Config(), *, now=None, github=None):
                     or run.get("status") != "completed" or run.get("conclusion") != "success"):
                 raise CheckError("run_identity_invalid", "The baseline hosted run does not match the current main monitor workflow.")
             source_path = Path(ledger.get("source_report", ""))
-            report = read_json(source_path)
+            report, sealed_hash = read_verified_report(source_path, ledger)
             completed = validate_report(report, now)
             if completed != timestamp(ledger.get("last_report_at"), "Baseline report"):
                 raise CheckError("baseline_invalid", "The local baseline report does not match the preserved notification ledger.")
             receipt.update(status="degraded" if source_gaps(report) else "ok", outcome="no_newer_report", source_report=str(source_path),
-                           verified_run=run_id, head_sha=main_sha, report_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                           verified_run=run_id, head_sha=main_sha, report_sha256=sealed_hash,
                            report_completed_at=completed.isoformat(), verification="existing_notified_baseline_readback; current_main_run_identity",
                            artifact_downloaded=False, source_gaps=source_gaps(report), last_failure_code=None)
             return finish_quiet(config, receipt, report, now)
         if previous_receipt.get("verified_run") == run_id and previous_receipt.get("head_sha") == main_sha:
-            report = read_json(source_path)
-            if hashlib.sha256(source_path.read_bytes()).hexdigest() != previous_receipt.get("report_sha256"):
-                raise CheckError("report_hash_mismatch", "The previously verified local report changed unexpectedly.")
+            report, sealed_hash = read_verified_report(source_path, previous_receipt, ledger)
             validate_report(report, now)
             receipt.update(status="degraded" if source_gaps(report) else "ok", outcome="no_newer_report", last_failure_code=None,
-                           source_gaps=source_gaps(report))
+                           report_sha256=sealed_hash, source_gaps=source_gaps(report))
             return finish_quiet(config, receipt, report, now)
         run = github("run", run_id)
         if (str(run.get("id")) != run_id or run.get("path") != WORKFLOW_PATH or run.get("head_branch") != "main"
