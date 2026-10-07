@@ -486,8 +486,41 @@ class SECCollector:
                      accession TEXT NOT NULL, document_sha256 TEXT NOT NULL REFERENCES sec_raw_documents(sha256),
                      index_sha256 TEXT NOT NULL REFERENCES sec_raw_documents(sha256),
                      document_url TEXT NOT NULL, index_url TEXT NOT NULL, archived_at TEXT NOT NULL,
-                     PRIMARY KEY(accession,document_sha256,index_sha256));
+                     PRIMARY KEY(accession,document_sha256,index_sha256,document_url,index_url));
                 """)
+            self._migrate_archive_manifest_urls()
+
+    def _migrate_archive_manifest_urls(self) -> None:
+        """Retain receipts for identical bytes fetched through distinct aliases.
+
+        Source documents are content-addressed; retrieval manifests also need
+        their URLs. Rebuild only the earlier manifest key, atomically, without
+        touching archived bytes or suppressing any original retrieval row.
+        """
+        with self.db.transaction() as conn:
+            columns = conn.execute("PRAGMA table_info(sec_raw_filing_archives)").fetchall()
+            key = tuple(row["name"] for row in sorted(columns, key=lambda row: row["pk"]) if row["pk"])
+            original_key = ("accession", "document_sha256", "index_sha256")
+            retrieval_key = (*original_key, "document_url", "index_url")
+            if key == retrieval_key:
+                return
+            if (key != original_key or {row["name"] for row in columns}
+                    != {*retrieval_key, "archived_at"}):
+                raise ValueError("Unexpected SEC archive manifest schema; source receipts were not changed")
+            original_count = conn.execute("SELECT COUNT(*) FROM sec_raw_filing_archives").fetchone()[0]
+            conn.execute("""CREATE TABLE sec_raw_filing_archives_url_migration(
+                accession TEXT NOT NULL, document_sha256 TEXT NOT NULL REFERENCES sec_raw_documents(sha256),
+                index_sha256 TEXT NOT NULL REFERENCES sec_raw_documents(sha256),
+                document_url TEXT NOT NULL, index_url TEXT NOT NULL, archived_at TEXT NOT NULL,
+                PRIMARY KEY(accession,document_sha256,index_sha256,document_url,index_url))""")
+            conn.execute("""INSERT INTO sec_raw_filing_archives_url_migration
+                (accession,document_sha256,index_sha256,document_url,index_url,archived_at)
+                SELECT accession,document_sha256,index_sha256,document_url,index_url,archived_at
+                FROM sec_raw_filing_archives""")
+            if conn.execute("SELECT COUNT(*) FROM sec_raw_filing_archives_url_migration").fetchone()[0] != original_count:
+                raise ValueError("SEC archive manifest migration did not retain every source receipt")
+            conn.execute("DROP TABLE sec_raw_filing_archives")
+            conn.execute("ALTER TABLE sec_raw_filing_archives_url_migration RENAME TO sec_raw_filing_archives")
 
     async def _text(self, url: str, **kwargs) -> str:
         await self._throttle()
