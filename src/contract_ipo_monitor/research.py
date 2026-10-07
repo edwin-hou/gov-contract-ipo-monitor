@@ -153,6 +153,10 @@ def report_markdown(report: dict[str, Any]) -> str:
             lines.append("Current-feed page windows reached their bound for: " + clean(", ".join(sec_collection["current_feed_truncated_forms"])) + ". Published daily indexes provide durable catch-up; pending work remains above.")
         if sec_collection.get("error"):
             lines.append("Collection error: " + clean(sec_collection["error"]))
+        if sec_collection.get("issuer_review_count"):
+            lines += ["", f"**{clean(sec_collection['issuer_review_count'])} SEC submissions await issuer attribution.** Affected IPO and listing assertions remain inactive."]
+            for review in rows(sec_collection.get("issuer_reviews"))[:5]:
+                lines.append(f"- {clean(review.get('accession'))} ({clean(review.get('form'))}): {clean(review.get('reason'))}")
     market_scope = any(key in report for key in ("listed_companies", "universe", "trade_ideas", "price_coverage", "world_news", "world_coverage"))
     if market_scope:
         metadata = report.get("universe") or {}

@@ -187,7 +187,13 @@ class IPOTracker:
             groups.setdefault((evidence.issuer_key, scope), []).append(evidence)
 
         result: list[dict] = []
+        reviews = self.db.sec_issuer_reviews()
+        held_registrations = self.db.sec_issuer_held_registrations(reviews, evidence_kind="ipo")
         for (issuer_key, scope), events in groups.items():
+            issuer_holds = [reason for event in events
+                            if (reason := self.db.sec_issuer_hold_reason(event, reviews))]
+            if (reason := held_registrations.get((events[0].cik, scope))):
+                issuer_holds.append(reason)
             authoritative = [event for event in events if event.authoritative]
             registration_events = [event for event in authoritative if event.event_type in {"registration", "amendment", "prospectus"}]
             # Resale and generic lifecycle notices remain audit evidence, not IPO candidates.
@@ -235,12 +241,14 @@ class IPOTracker:
             # with the registration withholds an active-state assertion.
             if ambiguous_notices and active:
                 status, active = "chronology_unresolved", False
+            if issuer_holds:
+                status, active, confidence = "issuer_unresolved", False, "issuer_unresolved"
 
             urls = list(dict.fromkeys(event.source_url for event in events))
             result.append({
                 "issuer_key": issuer_key, "issuer_name": current.issuer_name, "cik": current.cik,
                 "registration_id": None if scope.startswith("unscoped:") or scope == "unverified" else scope,
-                "status": status, "active": active, "ipo_confirmed": bool(confirmed),
+                "status": status, "active": active, "ipo_confirmed": bool(confirmed) and not issuer_holds,
                 "confidence": confidence, "ticker": next((event.ticker for event in reversed(eligible) if event.ticker), None),
                 "exchange": next((event.exchange for event in reversed(eligible) if event.exchange), None),
                 "proposed_price": next((event.proposed_price for event in reversed(eligible) if event.proposed_price is not None), None),
@@ -257,6 +265,7 @@ class IPOTracker:
                 "classification_reason": current.classification_reason,
                 "limitations": [
                     "Public filings do not prove the offering completed or shares began trading.",
+                    *list(dict.fromkeys(issuer_holds)),
                     *(["Date-only SEC filing evidence does not establish the order of a registration and its lifecycle notice; active status is withheld until official Accepted timestamps resolve it."] if status == "chronology_unresolved" else []),
                     *(["At least one source reports only a filing date; its midnight placeholder is not an actual filing time."] if any(event.filed_at_precision == "date" for event in events) else []),
                     *(["SEC registration file number missing; lifecycle cannot be linked safely."] if scope.startswith("unscoped:") else []),
@@ -277,5 +286,6 @@ class IPOTracker:
             "active_ipos": sum(candidate["ipo_confirmed"] and candidate["active"] for candidate in candidates),
             "withdrawn_ipos": sum(candidate["ipo_confirmed"] and candidate["status"] == "withdrawn" for candidate in candidates),
             "chronology_unresolved_candidates": sum(candidate["status"] == "chronology_unresolved" for candidate in candidates),
+            "issuer_unresolved_candidates": sum(candidate["status"] == "issuer_unresolved" for candidate in candidates),
             "unverified_candidates": sum(candidate["status"] == "rumored" for candidate in candidates),
         }

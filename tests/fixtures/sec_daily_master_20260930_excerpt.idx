@@ -1,0 +1,17 @@
+Description:           Daily Index of EDGAR Dissemination Feed
+Last Data Received:    Sep 30, 2026
+Comments:              webmaster@sec.gov
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+ 
+CIK|Company Name|Form Type|Date Filed|File Name
+--------------------------------------------------------------------------------
+1000275|ROYAL BANK OF CANADA|424B2|20260930|edgar/data/1000275/0000950103-26-014800.txt
+1000275|ROYAL BANK OF CANADA|424B2|20260930|edgar/data/1000275/0000950103-26-014809.txt
+1005101|Marygold Companies, Inc.|8-K|20260930|edgar/data/1005101/0001493152-26-044987.txt
+1891856|GEN Restaurant Group, Inc.|S-1|20260930|edgar/data/1891856/0001193125-26-409268.txt
+1002047|NetApp, Inc.|CORRESP|20260402|edgar/data/1002047/0001193125-26-140818.txt
+1755672|Corteva, Inc.|8-K|20260930|edgar/data/1755672/0001193125-26-408740.txt
+30554|EIDP, Inc.|8-K|20260930|edgar/data/30554/0001193125-26-408740.txt
+1004158|GS MORTGAGE SECURITIES CORP II|ABS-15G|20260930|edgar/data/1004158/0001539497-26-002618.txt
+1004158|GS MORTGAGE SECURITIES CORP II|ABS-15G|20260930|edgar/data/1004158/0001539497-26-002618.txt
+1004158|GS MORTGAGE SECURITIES CORP II|ABS-15G|20260930|edgar/data/1004158/0001539497-26-002618.txt

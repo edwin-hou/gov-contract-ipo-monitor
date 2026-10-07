@@ -102,7 +102,7 @@ class EvidenceProcessor:
         if not signal.active or signal.status.lower() in {"withdrawn", "terminated", "abandoned", "rejected"}:
             self._listing_correction(signal, observed)
             return []
-        if not any(item.signal_id == signal.signal_id for item in self.db.load_listing_signals()):
+        if not any(item == signal and item.active for item in self.db.load_listing_signals()):
             return []
         results: list[GateResult] = []
         for evidence in self.db.load_contracts():
@@ -142,7 +142,7 @@ class EvidenceProcessor:
         if not signal.active or signal.status.lower() in {"withdrawn", "terminated", "abandoned", "rejected"}:
             self._listing_correction(signal, observed)
             return []
-        if not any(item.signal_id == signal.signal_id for item in self.db.load_listing_signals()):
+        if not any(item == signal and item.active for item in self.db.load_listing_signals()):
             return []
         results: list[GateResult] = []
         for evidence in self.db.load_contracts():

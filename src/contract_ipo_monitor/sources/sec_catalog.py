@@ -60,6 +60,47 @@ def _index_url(day: date) -> str:
     return f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/master.{day:%Y%m%d}.idx"
 
 
+def _directory_index_days(listing: Any, *, quarter: tuple[int, int]) -> list[date]:
+    """Adapt SEC directory identities while validating the complete listing.
+
+    SEC daily-index JSON names its directory relative to Archives/edgar,
+    e.g. daily-index/2026/QTR4/. Also accept the equivalent absolute archive
+    path; neither variant can change the requested year or quarter. Download
+    URLs are built from validated filenames, never directory href values.
+    """
+    year, number = quarter
+    relative_path = f"daily-index/{year}/QTR{number}"
+    directory_path = f"/Archives/edgar/{relative_path}"
+    directory = listing.get("directory") if isinstance(listing, dict) else None
+    if not isinstance(directory, dict):
+        raise ValueError("SEC daily-index directory listing has an unexpected shape")
+    name = directory.get("name")
+    if (not isinstance(name, str) or name.removesuffix("/") not in {relative_path, directory_path}
+            or not isinstance(directory.get("item"), list)):
+        raise ValueError("SEC daily-index directory listing has an unexpected shape")
+    seen = set()
+    days = []
+    for item in directory["item"]:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise ValueError("SEC daily-index directory has an invalid item")
+        filename = item["name"]
+        if filename in seen:
+            raise ValueError("SEC daily-index directory has duplicate filenames")
+        seen.add(filename)
+        match = _MASTER_NAME.fullmatch(filename)
+        if not match:
+            if filename.startswith("master.") and filename.endswith(".idx"):
+                raise ValueError("SEC daily-index directory has a malformed master filename")
+            continue
+        day = datetime.strptime(match[1], "%Y%m%d").date()
+        if _quarter(day) != quarter or item.get("type", "file") != "file":
+            raise ValueError("SEC daily index is outside its declared quarter")
+        if "href" in item and item["href"] != filename:
+            raise ValueError("SEC daily index href and filename disagree")
+        days.append(day)
+    return days
+
+
 def _forms(values: Iterable[str]) -> set[str]:
     result = {str(value).strip().upper() for value in values}
     if not result or any(not _FORM.fullmatch(value) for value in result):
@@ -103,6 +144,21 @@ def _entry(value: dict[str, Any]) -> dict[str, Any]:
     result = dict(value)
     result.update(accession=accession, cik=f"{int(cik):010d}", issuer_name=issuer.strip(),
                   form_type=form, filed_at=stamp.isoformat(), filed_at_precision=precision)
+    if "catalogue_filers" in value:
+        filers = value["catalogue_filers"]
+        if not isinstance(filers, list) or not filers:
+            raise ValueError("Invalid SEC catalogue filer identities")
+        normalized = []
+        seen_filers = set()
+        for filer in filers:
+            if not isinstance(filer, dict) or set(filer) != {"cik", "issuer_name", "source_url"}:
+                raise ValueError("Invalid SEC catalogue filer identity")
+            identity = _entry({**{key: item for key, item in result.items() if key != "catalogue_filers"}, **filer})
+            if identity["cik"] in seen_filers:
+                raise ValueError("Duplicate SEC catalogue filer identity")
+            seen_filers.add(identity["cik"])
+            normalized.append({key: identity[key] for key in ("cik", "issuer_name", "source_url")})
+        result["catalogue_filers"] = normalized
     return result
 
 
@@ -114,12 +170,12 @@ def parse_master_index(text: str, *, day: date, enabled_forms: Iterable[str]) ->
     if re.search(r"<(?:html|body|script|!doctype)\b", text, re.I):
         raise ValueError("SEC daily index returned HTML instead of an index")
     lines = text.splitlines()
-    header = "CIK|Company Name|Form Type|Date Filed|Filename"
-    matches = [index for index, line in enumerate(lines) if line.strip() == header]
+    headers = {"CIK|Company Name|Form Type|Date Filed|File Name",
+               "CIK|Company Name|Form Type|Date Filed|Filename"}
+    matches = [index for index, line in enumerate(lines) if line.strip() in headers]
     if len(matches) != 1 or matches[0] > 100:
         raise ValueError("SEC daily index has no unique expected header")
-    entries = []
-    seen = set()
+    submissions = {}
     for raw in lines[matches[0] + 1:]:
         line = raw.strip()
         if not line or set(line) == {"-"}:
@@ -138,19 +194,33 @@ def parse_master_index(text: str, *, day: date, enabled_forms: Iterable[str]) ->
         if not path or int(path[1]) != int(cik):
             raise ValueError("SEC daily index contains an invalid archive path or CIK")
         accession = path[2]
-        if accession in seen:
-            raise ValueError("SEC daily index contains duplicate filing accessions")
-        seen.add(accession)
-        if form not in allowed:
-            continue
-        entries.append(_entry({
+        entry = _entry({
             "accession": accession, "cik": cik, "issuer_name": issuer, "form_type": form,
             "filed_at": datetime.combine(filed_day, datetime.min.time(), UTC), "filed_at_precision": "date",
             "source_url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/{accession}-index.htm",
             "catalogue_source_url": _index_url(day),
             "catalogue_index_day": day.isoformat(),
-        }))
-    return entries
+        })
+        previous = submissions.get(accession)
+        filer = {key: entry[key] for key in ("cik", "issuer_name", "source_url")}
+        if previous is None:
+            entry["catalogue_filers"] = [filer]
+            entry["catalogue_index_row_count"] = 1
+            submissions[accession] = entry
+            continue
+        if previous["form_type"] != form or previous["filed_at"] != entry["filed_at"]:
+            raise ValueError("SEC daily index has conflicting form or date for one accession")
+        existing = next((identity for identity in previous["catalogue_filers"] if identity["cik"] == entry["cik"]), None)
+        if existing is not None and existing != filer:
+            raise ValueError("SEC daily index has conflicting filer identity for one accession")
+        # One accepted submission can appear under several filers, and SEC
+        # also publishes exact repeated rows. Keep their source identities and
+        # row count while enqueueing the accession once. The first source row
+        # is a representative identity, not an inferred primary registrant.
+        if existing is None:
+            previous["catalogue_filers"].append(filer)
+        previous["catalogue_index_row_count"] += 1
+    return [_entry(entry) for entry in submissions.values() if entry["form_type"] in allowed]
 
 
 class SECFilingCatalog:
@@ -168,18 +238,46 @@ class SECFilingCatalog:
         inserted = 0
         for entry in entries:
             old = conn.execute("SELECT entry_json FROM sec_pending_filings WHERE accession=?", (entry["accession"],)).fetchone()
-            retained = entry
+            retained = dict(entry)
+            reopen = requeue
             if old:
                 previous = json.loads(old["entry_json"])
                 if previous.get("filed_at_precision") == "second" and entry["filed_at_precision"] == "date":
-                    retained = previous
+                    retained = dict(previous)
+                # Atom may supply a more precise timestamp and a different
+                # representative filer. Keep the observed daily-index filer
+                # identities regardless of which timestamp version is retained.
+                catalogue = entry if "catalogue_filers" in entry else previous
+                for key in ("catalogue_filers", "catalogue_source_url", "catalogue_index_day", "catalogue_index_row_count"):
+                    if key in catalogue:
+                        retained[key] = catalogue[key]
+                for key in ("issuer_review", "issuer_review_history"):
+                    if key in previous and key not in retained:
+                        retained[key] = previous[key]
+                old_review = previous.get("issuer_review", {})
+                changed_exact_observation = (entry["filed_at_precision"] == "second"
+                    and (entry["filed_at"] != previous.get("filed_at")
+                         or entry["cik"] != previous.get("cik")))
+                changed_filers = ("catalogue_filers" in entry
+                                 and entry["catalogue_filers"] != previous.get("catalogue_filers"))
+                if old_review.get("status") == "unresolved" and (requeue or changed_exact_observation or changed_filers):
+                    history = list(retained.get("issuer_review_history", []))
+                    if old_review not in history:
+                        history.append(old_review)
+                    retained["issuer_review_history"] = history
+                    retained["issuer_review"] = {**old_review, "status": "retry_requested"}
+                    reopen = True
+            if len(retained.get("catalogue_filers", [])) > 1 and "issuer_review" not in retained:
+                retained["issuer_review"] = {"status": "retry_requested",
+                    "reason": "Published SEC index identifies multiple filers; primary issuer authority must be checked before classification."}
+                reopen = True
             inserted += conn.execute(
                 "INSERT OR IGNORE INTO sec_pending_filings VALUES(?,?,?,?,NULL)",
                 (entry["accession"], entry["form_type"], json.dumps(retained, sort_keys=True), observed),
             ).rowcount
             conn.execute("UPDATE sec_pending_filings SET form=?,entry_json=? WHERE accession=?",
                          (retained["form_type"], json.dumps(retained, sort_keys=True), entry["accession"]))
-            if requeue:
+            if reopen:
                 conn.execute("UPDATE sec_pending_filings SET processed_at=NULL WHERE accession=?", (entry["accession"],))
         return inserted
 
@@ -213,6 +311,26 @@ class SECFilingCatalog:
         with self.db.connect() as conn:
             conn.execute("UPDATE sec_pending_filings SET processed_at=? WHERE accession=?", (stamp, accession))
 
+    def record_issuer_review(self, entry: dict[str, Any], review: dict[str, Any]) -> None:
+        """Keep completed source processing separate from issuer classification."""
+        if (review.get("status") not in {"unresolved", "resolved"}
+                or not isinstance(review.get("reason"), str) or not 1 <= len(review["reason"]) <= 1000):
+            raise ValueError("Invalid SEC issuer review status or reason")
+        observed = _aware(datetime.fromisoformat(review["processed_document_at"]))
+        self.capture([entry], observed_at=observed)
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT entry_json FROM sec_pending_filings WHERE accession=?", (entry["accession"],)).fetchone()
+            current = json.loads(row["entry_json"])
+            previous = current.get("issuer_review")
+            history = current.get("issuer_review_history", [])
+            if previous and previous != review and previous not in history:
+                history.append(previous)
+            if history:
+                current["issuer_review_history"] = history
+            current["issuer_review"] = review
+            conn.execute("UPDATE sec_pending_filings SET entry_json=? WHERE accession=?",
+                         (json.dumps(current, sort_keys=True), entry["accession"]))
+
     def _state(self) -> dict[str, Any] | None:
         with self.db.connect() as conn:
             row = conn.execute("SELECT * FROM sec_catalog_state WHERE id=1").fetchone()
@@ -226,6 +344,10 @@ class SECFilingCatalog:
             pending = (conn.execute(f"SELECT COUNT(*) FROM sec_pending_filings WHERE processed_at IS NULL AND form IN ({','.join('?' for _ in enabled)})", enabled).fetchone()[0]
                        if enabled else total_pending)
             days = conn.execute("SELECT COUNT(*) FROM sec_index_days").fetchone()[0]
+            review_rows = conn.execute("""SELECT accession,form,entry_json FROM sec_pending_filings
+                WHERE json_extract(entry_json,'$.issuer_review.status') IN ('unresolved','retry_requested')
+                ORDER BY discovered_at,accession""").fetchall()
+        reviews = [row for row in review_rows if not enabled or row["form"] in enabled]
         latest_closed_day = ((datetime.fromisoformat(state["last_sync_at"]).astimezone(_NEW_YORK).date() - timedelta(days=1)).isoformat()
                              if state.get("last_sync_at") else None)
         catchup_complete = bool(state.get("listed_through") and latest_closed_day
@@ -236,11 +358,16 @@ class SECFilingCatalog:
                 "source": "sec_daily_index", "scope": "Configured forms in published daily indexes from the frozen initial seven-day window onward; delayed releases may have older filing dates. Earlier index history remains incomplete.",
                 "captured_index_days": days, "pending_filings": pending, "pending_filings_total": total_pending,
                 "configured_forms": enabled,
-                "status": "error" if state.get("last_error") else "pending" if state and (pending or not catchup_complete) else "ok" if state else "not_attempted",
+                "issuer_review_count": len(reviews), "issuer_review_count_total": len(review_rows),
+                "issuer_reviews": [{"accession": row["accession"], "form": row["form"],
+                                    "reason": json.loads(row["entry_json"])["issuer_review"]["reason"]} for row in reviews[:20]],
+                "status": "error" if state.get("last_error") else "review_required" if reviews else "pending" if state and (pending or not catchup_complete) else "ok" if state else "not_attempted",
                 "error": state.get("last_error"),
-                "catchup_complete": catchup_complete,
+                "index_catchup_complete": catchup_complete,
+                "catchup_complete": catchup_complete and not reviews,
                 "limitations": ["Directory availability establishes published daily indexes, not real-time coverage; SEC builds indexes nightly after 10 p.m. Eastern.",
-                                "An index queue entry is not a processed filing or verified IPO; document processing receipts are independent."]}
+                                "An index queue entry is not a processed filing or verified IPO; document processing receipts are independent.",
+                                *([f"{len(reviews)} SEC submissions require issuer review; their source evidence cannot authorize an IPO or listing signal until attribution is resolved."] if reviews else [])]}
 
     async def sync(self, fetch_text: Callable[[str], Awaitable[str]], enabled_forms: Iterable[str], *,
                    observed_at: datetime, max_indexes: int = 3) -> dict[str, Any]:
@@ -282,26 +409,7 @@ class SECFilingCatalog:
                 directory_path = f"/Archives/edgar/daily-index/{year}/QTR{number}"
                 url = f"https://www.sec.gov{directory_path}/index.json"
                 listing = json.loads(await fetch_text(url))
-                directory = listing.get("directory") if isinstance(listing, dict) else None
-                if (not isinstance(directory, dict) or str(directory.get("name", "")).rstrip("/") != directory_path
-                        or not isinstance(directory.get("item"), list)):
-                    raise ValueError("SEC daily-index directory listing has an unexpected shape")
-                seen = set()
-                for item in directory["item"]:
-                    if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                        raise ValueError("SEC daily-index directory has an invalid item")
-                    name = item["name"]
-                    if name in seen:
-                        raise ValueError("SEC daily-index directory has duplicate filenames")
-                    seen.add(name)
-                    match = _MASTER_NAME.fullmatch(name)
-                    if not match:
-                        if name.startswith("master.") and name.endswith(".idx"):
-                            raise ValueError("SEC daily-index directory has a malformed master filename")
-                        continue
-                    day = datetime.strptime(match[1], "%Y%m%d").date()
-                    if _quarter(day) != quarter or item.get("type", "file") != "file":
-                        raise ValueError("SEC daily index is outside its declared quarter")
+                for day in _directory_index_days(listing, quarter=quarter):
                     if not scope <= day <= last_day:
                         continue
                     published = max(published or day.isoformat(), day.isoformat())
@@ -346,7 +454,8 @@ class SECFilingCatalog:
             raise
         result = self.coverage()
         # Cursor equality alone cannot prove all quarters have been examined.
-        result["catchup_complete"] = result["catchup_complete"] and quarter > _quarter(last_day) and len(available) <= max_indexes
+        result["index_catchup_complete"] = result["index_catchup_complete"] and quarter > _quarter(last_day) and len(available) <= max_indexes
+        result["catchup_complete"] = result["catchup_complete"] and result["index_catchup_complete"]
         result["indexes_captured_this_run"] = min(len(available), max_indexes)
         return result
 

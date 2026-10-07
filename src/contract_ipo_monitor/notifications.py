@@ -13,10 +13,6 @@ from email.utils import format_datetime, parseaddr
 from pathlib import Path
 from typing import Any
 
-from .email_html import report_email_html
-from .research import serializable
-
-
 def _address(value: str) -> str:
     if not isinstance(value, str) or any(c in value for c in "\r\n"):
         raise ValueError("A single confirmed email address is required")
@@ -29,6 +25,12 @@ def _address(value: str) -> str:
 def report_message(report: dict, *, sender: str, recipient: str, event_key: str,
                    created_at: datetime, notice: str = "", test: bool = False) -> bytes:
     """Attach the exact report and give each setup a readable approximate strategy."""
+    # Report preparation belongs to the monitor's Python 3.12+ environment.
+    # Native Hermes delivery uses Python 3.11 and only imports EmailOutbox to
+    # deliver already sealed bytes; it must not import report/UI dependencies.
+    from .email_html import report_email_html
+    from .research import serializable
+
     if created_at.utcoffset() is None or not event_key:
         raise ValueError("Message identity and aware creation time are required")
     report = serializable(report)

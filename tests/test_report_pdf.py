@@ -239,3 +239,11 @@ def test_sec_catalogue_errors_and_unknown_progress_remain_explicit_and_escaped()
     assert "Index catch-up is unconfirmed" in rendered
     assert "SEC collection error: HTTP 503 <b>source unavailable</b>" in rendered
     assert links(pdf) == ["https://investors.micron.com/results?view=full&year=2026", "https://www.reddit.com"]
+
+
+def test_sec_issuer_review_holds_remain_visible_in_pdf():
+    report = sample_report()
+    report["sec_collection"] = {"status": "review_required", "issuer_review_count": 2}
+    rendered = text(reader(report))
+    assert "2 SEC submissions await issuer attribution" in rendered
+    assert "Affected IPO and listing assertions remain inactive" in rendered

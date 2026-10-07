@@ -175,6 +175,11 @@ class Database:
 
     def save_evaluation(self, candidate: Candidate, decisions: Sequence[GateDecision], payload: AlertPayload | None, *, created_at: datetime) -> tuple[bool, bool]:
         with self.transaction() as conn:
+            if payload is not None:
+                # The write transaction fences classification changes during
+                # an awaited quote lookup. Recheck authority before queuing.
+                if not self.listing_is_current_authorized(candidate.listing):
+                    return False, False
             if payload is not None and conn.execute("SELECT 1 FROM alerts WHERE fingerprint=?", (payload.fingerprint,)).fetchone():
                 return False, True
             trace_fingerprint = payload.fingerprint if payload else self._candidate_trace_fingerprint(candidate, decisions)
@@ -229,18 +234,39 @@ class Database:
                    WHERE status='leased' AND (lease_until IS NULL OR julianday(lease_until) IS NULL
                      OR julianday(lease_until) <= julianday(?))""", (now.isoformat(),),
             )
-            row = conn.execute(
+            while True:
+                row = conn.execute(
                 """
-                SELECT * FROM outbox_messages
-                WHERE status='pending'
-                  AND julianday(next_attempt_at) <= julianday(?)
-                  AND (lease_until IS NULL OR julianday(lease_until) <= julianday(?))
-                ORDER BY id LIMIT 1
+                SELECT message.*,alert.signal_id,trace.listing_json FROM outbox_messages message
+                JOIN alerts alert ON alert.id=message.alert_id
+                LEFT JOIN candidate_matches trace ON trace.fingerprint=alert.fingerprint
+                WHERE message.status='pending'
+                  AND julianday(message.next_attempt_at) <= julianday(?)
+                  AND (message.lease_until IS NULL OR julianday(message.lease_until) <= julianday(?))
+                ORDER BY message.id LIMIT 1
                 """,
                 (now.isoformat(), now.isoformat()),
-            ).fetchone()
-            if row is None:
-                return None
+                ).fetchone()
+                if row is None:
+                    return None
+                # Corrections describe withdrawn evidence; they do not endorse
+                # its original trade claim and retain their independent lease.
+                if row["correction_key"] is not None:
+                    break
+                if row["listing_json"] is not None:
+                    from .models import ListingSignal
+                    try:
+                        authorized = self.listing_is_current_authorized(ListingSignal.model_validate_json(row["listing_json"]))
+                    except (ValueError, TypeError):
+                        authorized = False
+                else:
+                    stored = [item for item in self.all_listing_signals() if item.signal_id == row["signal_id"]]
+                    authorized = (not stored or any(item.signal_id == row["signal_id"] and item.active
+                        for item in self.load_listing_signals())) and row["signal_id"] not in self.sec_issuer_reviews()
+                if authorized:
+                    break
+                conn.execute("UPDATE outbox_messages SET status='cancelled',lease_until=NULL,last_error='listing_authority_withheld' WHERE id=?", (row["id"],))
+                conn.execute("UPDATE alerts SET status='withheld' WHERE id=? AND status='queued'", (row["alert_id"],))
             conn.execute(
                 "UPDATE outbox_messages SET status='leased', lease_until=? WHERE id=?",
                 (lease_until.isoformat(), row["id"]),
@@ -354,7 +380,98 @@ class Database:
 
     def load_listing_signals(self) -> list[Any]:
         result = self.all_listing_signals()
+        reviews = self.sec_issuer_reviews()
+        held = {item.signal_id: reason for item in result
+                if (reason := self.sec_issuer_hold_reason(item, reviews))}
+        held_scopes = {(item.cik, item.registration_id) for item in result
+                       if item.signal_id in held and item.cik and item.registration_id}
+        held_scopes.update(self.sec_issuer_held_registrations(reviews))
+        # Retain the notice and its registration as inactive audit evidence.
+        # Dropping an uncertain withdrawal would resurrect the earlier filing.
+        result = [item.model_copy(update={
+            "active": False, "status": "issuer_unresolved",
+            "risk_findings": (*item.risk_findings, held.get(item.signal_id,
+                "A notice for this registration is awaiting SEC issuer attribution.")),
+        }) if item.signal_id in held or (item.cik, item.registration_id) in held_scopes
+            or any(other.related_signal_id == item.signal_id and other.signal_id in held for other in result)
+            else item for item in result]
         return [item for item in result if not any(self.listing_is_superseded(item, other) for other in result)]
+
+    def listing_is_current_authorized(self, signal: Any) -> bool:
+        if not signal.active or signal.status.strip().lower() in {"withdrawn", "terminated", "abandoned", "rejected", "closed"}:
+            return False
+        reviews = self.sec_issuer_reviews()
+        if (self.sec_issuer_hold_reason(signal, reviews)
+                or (signal.cik, signal.registration_id) in self.sec_issuer_held_registrations(reviews)):
+            return False
+        stored = [item for item in self.all_listing_signals() if item.signal_id == signal.signal_id]
+        return not stored or any(item == signal and item.active for item in self.load_listing_signals())
+
+    def sec_issuer_reviews(self) -> dict[str, dict[str, Any]]:
+        """Read classification authority without altering original evidence."""
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sec_pending_filings'").fetchone():
+                return {}
+            rows = conn.execute("""SELECT accession,entry_json FROM sec_pending_filings
+                WHERE json_extract(entry_json,'$.issuer_review.status') IS NOT NULL""").fetchall()
+        return {row["accession"]: json.loads(row["entry_json"])["issuer_review"] for row in rows}
+
+    def sec_issuer_held_registrations(self, reviews: dict[str, dict[str, Any]], *, evidence_kind: str = "listing") -> dict[tuple[str, str], str]:
+        if evidence_kind not in {"listing", "ipo"}:
+            raise ValueError("Unknown SEC issuer authority context")
+        result = {}
+        for accession, review in reviews.items():
+            if not review.get("affected_registrations"):
+                continue
+            if review.get("status") == "resolved":
+                # Keep paired scopes fenced until corrected evidence has been
+                # ingested, not merely until the source worker wrote a review.
+                with self.connect() as conn:
+                    event_payload = signal_payload = None
+                    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ipo_evidence'").fetchone():
+                        row = conn.execute("SELECT evidence_json FROM ipo_evidence WHERE source='sec' AND event_id=? ORDER BY id DESC LIMIT 1", (accession,)).fetchone()
+                        if row:
+                            event_payload = json.loads(row[0])
+                    row = conn.execute("SELECT version_json FROM listing_signals WHERE signal_id=? AND json_extract(version_json,'$.source')='sec' ORDER BY id DESC LIMIT 1", (accession,)).fetchone()
+                    if row:
+                        signal_payload = json.loads(row[0])
+                # Each projection must replace its own historical assertion.
+                # A context with no assertion may use the other source receipt.
+                payload = (event_payload if event_payload is not None else signal_payload) if evidence_kind == "ipo" else (signal_payload if signal_payload is not None else event_payload)
+                if payload is not None and self._sec_resolution_matches(payload, review):
+                    continue
+            for scope in review.get("affected_registrations", []):
+                if scope.get("cik") and scope.get("registration_id"):
+                    result[(scope["cik"], scope["registration_id"])] = str(review.get("reason")
+                        or "SEC primary issuer attribution is awaiting review.")[:1000]
+        return result
+
+    @staticmethod
+    def _sec_resolution_matches(payload: dict[str, Any], review: dict[str, Any]) -> bool:
+        issuer = review.get("resolved_issuer", {})
+        return bool(issuer.get("cik") and issuer.get("issuer_name") and "registration_id" in issuer
+                    and payload.get("cik") == issuer["cik"]
+                    and payload.get("issuer_name") == issuer["issuer_name"]
+                    and payload.get("registration_id") == issuer["registration_id"]
+                    and review.get("raw_payload_hash")
+                    and payload.get("raw_payload_hash") == review["raw_payload_hash"])
+
+    @staticmethod
+    def sec_issuer_hold_reason(item: Any, reviews: dict[str, dict[str, Any]]) -> str | None:
+        if item.source != "sec":
+            return None
+        accession = getattr(item, "event_id", None) or item.signal_id
+        review = reviews.get(accession)
+        if review is None:
+            return None
+        if review.get("status") == "resolved":
+            # Resolution precedes downstream ingestion. Bind authority to the
+            # exact document and issuer so an interrupted replay cannot revive
+            # the previous version attributed to a different company.
+            if Database._sec_resolution_matches(item.model_dump(), review):
+                return None
+            return "Stored SEC attribution has not yet been replaced by evidence matching the resolved primary issuer and document."
+        return str(review.get("reason") or "SEC primary issuer attribution is awaiting review.")[:1000]
 
     def all_listing_signals(self) -> list[Any]:
         from .models import ListingSignal

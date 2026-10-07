@@ -1,0 +1,2 @@
+# Exact public SEC responses retain their original line endings and whitespace.
+tests/fixtures/sec_* -text -whitespace

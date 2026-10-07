@@ -48,6 +48,9 @@ The analyst uses the existing authenticated Hermes `openai-codex` route. Verify 
 
 Gmail delivery requires the owning profile's already configured native Google OAuth credentials and `scripts/gmail_sync.py` token-refresh helper. The authenticated sender and confirmed recipient must match the private delivery configuration. Reuse that locked helper; do not copy tokens into the repository, replace another job's credentials or configure SMTP.
 
+
+Report preparation runs in the monitor’s Python 3.12+ environment. The owning Hermes Gmail worker may use Python 3.11: it imports only the sealed outbox and Gmail transport, then delivers already prepared MIME bytes. It does not import the collector, report renderer or PDF dependencies. Preserve this boundary when adding delivery features; test the actual installed Hermes interpreter as well as the collector versions.
+
 ## What runs and what sends
 
 The script job checks actual hosted report artifacts and refreshes candidate quotes. Report age, listing/currency identity, provider timestamp/delay and a quote observation no more than five minutes old gate analyst review. A freshly checked latest-session close is labelled a closed-market research reference and still requires a live broker check before entry.

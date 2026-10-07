@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<edgarSubmission>
+
+    <schemaVersion>X0101</schemaVersion>
+
+    <submissionType>EFFECT</submissionType>
+
+    <act>33</act>
+
+    <testOrLive>LIVE</testOrLive>
+
+    <effectiveData>
+        <finalEffectivenessDispDate>2026-09-30</finalEffectivenessDispDate>
+        <finalEffectivenessDispTime>16:30:00</finalEffectivenessDispTime>
+        <form>F-4</form>
+        <filer>
+            <cik>0002058261</cik>
+            <entityName>CubeBio Holdings Ltd</entityName>
+            <fileNumber>333-298262</fileNumber>
+        </filer>
+        <filer>
+            <cik>0002058594</cik>
+            <entityName>Cubebio Co., Ltd</entityName>
+            <fileNumber>333-298262-01</fileNumber>
+        </filer>
+    </effectiveData>
+</edgarSubmission>

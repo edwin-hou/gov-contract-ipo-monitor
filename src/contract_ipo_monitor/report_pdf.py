@@ -315,6 +315,9 @@ def report_pdf(report: dict, *, notice: str = "", test: bool = False) -> bytes:
         story.append(p("Daily-index filing dates have no verified intraday filing time. Pending documents have not yet been classified; index catch-up does not establish complete earlier, confidential, international or real-time filing coverage.", "small", 350))
         if sec_collection.get("error"):
             story.append(labelled("SEC collection error:", sec_collection["error"], "small", 300))
+        if sec_collection.get("issuer_review_count"):
+            story.append(p(_text(sec_collection["issuer_review_count"], 30)
+                + " SEC submissions await issuer attribution. Affected IPO and listing assertions remain inactive.", "small", 300))
     coverage = []
     for key in ("coverage", "world_coverage", "price_coverage", "quote_coverage", "listed_discovery_coverage"):
         coverage.extend(_list(report.get(key)))

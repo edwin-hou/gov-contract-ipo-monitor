@@ -21,6 +21,7 @@ from ..risk import RiskAnalyzer
 from ..tracking import IPOEvidence
 from .http import ResilientClient
 from .sec_catalog import SECFilingCatalog
+from .sec_issuer import effect_filer_registrations, filing_index_filers, primary_issuer
 from .sec_metadata import accepted_at_from_filing_index, filing_date_from_filing_index
 
 
@@ -153,7 +154,15 @@ class SECNormalizer:
             return {}
         if root.tag.rsplit("}", 1)[-1] != "edgarSubmission":
             return {}
-        values = {element.tag.rsplit("}", 1)[-1]: (element.text or "").strip() for element in root.iter()}
+        grouped: dict[str, list[str]] = {}
+        for element in root.iter():
+            grouped.setdefault(element.tag.rsplit("}", 1)[-1], []).append((element.text or "").strip())
+        # An EFFECT can contain several paired filer/file-number notices.
+        # Flattening them would silently attribute the final filer to the
+        # entire submission. Such shared notices require issuer review.
+        if any(len(grouped.get(name, [])) > 1 for name in ("filer", "cik", "entityName", "fileNumber", "form", "finalEffectivenessDispDate")):
+            return {}
+        values = {name: items[0] for name, items in grouped.items()}
         metadata: dict[str, Any] = {}
         if values.get("cik", "").isdigit():
             metadata["cik"] = values["cik"]
@@ -538,6 +547,18 @@ class SECCollector:
     def _is_processed(self, conn, accession: str) -> bool:
         if conn.execute("SELECT 1 FROM sec_processed_filings WHERE accession=?", (accession,)).fetchone() is None:
             return False
+        catalog_row = conn.execute("SELECT form,entry_json FROM sec_pending_filings WHERE accession=?", (accession,)).fetchone()
+        catalogue = json.loads(catalog_row["entry_json"]) if catalog_row else {}
+        review = catalogue.get("issuer_review")
+        if review:
+            if review.get("status") == "retry_requested":
+                return False
+            if review.get("status") not in {"unresolved", "resolved"}:
+                return False
+            manifest = conn.execute("""SELECT 1 FROM sec_raw_filing_archives WHERE accession=?
+                AND document_sha256=? AND index_sha256=? AND document_url=? AND index_url=?""",
+                (accession, review.get("raw_payload_hash"), review.get("index_sha256"), review.get("source_url"), review.get("index_url"))).fetchone()
+            return manifest is not None and self._has_durable_archive(conn, accession, review)
         # Receipts created before raw archiving was added need a one-time replay.
         # The latest version supersedes older missing references after recovery.
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ipo_evidence'").fetchone():
@@ -550,7 +571,19 @@ class SECCollector:
                     evidence = json.loads(row["evidence_json"])
                 except (ValueError, TypeError):
                     return False
-                return self._has_durable_archive(conn, accession, evidence)
+                valid = self._has_durable_archive(conn, accession, evidence)
+                if valid and catalog_row and catalog_row["form"] == "EFFECT":
+                    # Revisit only historical EFFECT assertions whose actual
+                    # archived notice cannot establish their attributed issuer.
+                    archived = conn.execute("SELECT gzip_blob FROM sec_raw_documents WHERE sha256=?", (evidence.get("raw_payload_hash"),)).fetchone()
+                    if archived is None:
+                        return False
+                    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    text = decoder.decompress(archived["gzip_blob"], self.max_document_bytes + 1).decode("utf-8")
+                    identity = primary_issuer(text, "EFFECT")
+                    if identity is None or identity["cik"] != evidence.get("cik"):
+                        return False
+                return valid
         # Alternate listing routes (e.g. an 8-K business combination) can have
         # a legacy signal without an IPO event. Ordinary ignored 8-Ks do not.
         row = conn.execute(
@@ -627,6 +660,13 @@ class SECCollector:
             ).fetchall()
             invalid = [row["accession"] for row in candidates
                        if not self._is_processed(conn, row["accession"])]
+            for accession in invalid:
+                row = conn.execute("SELECT form,entry_json FROM sec_pending_filings WHERE accession=?", (accession,)).fetchone()
+                entry = json.loads(row["entry_json"])
+                if row["form"] == "EFFECT" and "issuer_review" not in entry:
+                    entry["issuer_review"] = {"status": "retry_requested",
+                        "reason": "Archived SEC EFFECT issuer authority or source receipt requires revalidation."}
+                    conn.execute("UPDATE sec_pending_filings SET entry_json=? WHERE accession=?", (json.dumps(entry, sort_keys=True), accession))
             conn.executemany("UPDATE sec_pending_filings SET processed_at=NULL WHERE accession=?",
                              [(accession,) for accession in invalid])
         return len(invalid)
@@ -691,24 +731,62 @@ class SECCollector:
         return signal
 
     async def collect_entry(self, entry: dict[str, Any]) -> tuple[IPOEvidence | None, ListingSignal | None]:
-        parsed_url = urlparse(entry["source_url"])
+        known_filers = entry.get("catalogue_filers", [])
+        index_url = (min(known_filers, key=lambda filer: (int(filer["cik"]), filer["source_url"]))["source_url"]
+                     if len(known_filers) > 1 else entry["source_url"])
+        parsed_url = urlparse(index_url)
         if (parsed_url.scheme != "https" or parsed_url.hostname not in {"sec.gov", "www.sec.gov"}
                 or not parsed_url.path.startswith("/Archives/edgar/data/") or parsed_url.username is not None):
             raise ValueError("SEC entry does not reference an official EDGAR archive document")
-        index_html = await self._text(entry["source_url"])
+        index_html = await self._text(index_url)
         accepted = accepted_at_from_filing_index(index_html)
         source_filing_date = filing_date_from_filing_index(index_html)
         if accepted is not None and accepted > datetime.now(UTC):
             raise ValueError("SEC index acceptance timestamp is in the future")
         if source_filing_date is None and entry.get("filed_at_precision") == "date":
             source_filing_date = entry["filed_at"].date()
-        document_url = self.normalizer.primary_document_url(entry["source_url"], index_html, entry["form_type"])
-        if document_url == entry["source_url"] and "-index." in document_url:
+        document_url = self.normalizer.primary_document_url(index_url, index_html, entry["form_type"])
+        if document_url == index_url and "-index." in document_url:
             raise ValueError("No primary filing document found in SEC filing index")
-        text = index_html if document_url == entry["source_url"] else await self._text(document_url)
+        text = index_html if document_url == index_url else await self._text(document_url)
         enriched = {key: entry[key] for key in ("form_type", "accession", "issuer_name", "cik", "filed_at")}
+        index_filers = filing_index_filers(index_html, entry["accession"])
+        filers = list(known_filers)
+        if not filers:
+            filers.append({key: entry[key] for key in ("cik", "issuer_name", "source_url")})
+        for filer in index_filers:
+            if not any(str(int(previous["cik"])) == str(int(filer["cik"])) for previous in filers):
+                filers.append(filer)
+        review_needed = len(filers) > 1 or entry["form_type"] == "EFFECT"
+        registration_id = self.normalizer.registration_number(text)
+        # A durable catalogue value may describe a different co-filer's
+        # registration. Resolve scope from fresh source bytes. An index-only
+        # number is usable only for a single independently verified filer.
+        if registration_id is None and len(filers) == len(index_filers) == 1:
+            registration_id = self.normalizer.registration_number(index_html)
+        reference = None
+        if review_needed:
+            identity = primary_issuer(text, entry["form_type"])
+            resolved = identity is not None and any(identity["cik"] == f"{int(filer['cik']):010d}" for filer in filers)
+            reference = self._archive_documents(accession=entry["accession"], index_url=index_url,
+                index_html=index_html, document_url=document_url, document=text)
+            if self.catalog is None or reference is None:
+                raise ValueError("SEC issuer review requires a durable catalogue and source archive")
+            reason = ("Primary submission metadata uniquely resolves a listed base registrant; all official co-filer identities remain retained."
+                if resolved else "SEC submission issuer attribution is unresolved: primary metadata does not uniquely identify one listed registrant; IPO and listing assertions are withheld.")
+            self.catalog.record_issuer_review({**entry, "catalogue_filers": filers, "filing_index_filers": index_filers}, {
+                "status": "resolved" if resolved else "unresolved", "reason": reason,
+                "processed_document_at": datetime.now(UTC).isoformat(), "raw_archive_path": reference,
+                "raw_payload_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "source_url": document_url,
+                "index_sha256": hashlib.sha256(index_html.encode("utf-8")).hexdigest(), "index_url": index_url,
+                **({"resolved_issuer": {**identity, "registration_id": registration_id}} if resolved else {}),
+                **({"affected_registrations": effect_filer_registrations(text)} if entry["form_type"] == "EFFECT" else {}),
+            })
+            if not resolved:
+                return None, None
+            enriched.update(identity)
         enriched["source_url"] = document_url
-        enriched["registration_id"] = entry.get("registration_id") or self.normalizer.registration_number(text) or self.normalizer.registration_number(index_html)
+        enriched["registration_id"] = registration_id
         event = self.normalizer.tracking_document(text=text, **enriched)
         signal = self.normalizer.classify_document(text=text, **enriched)
         precision = entry.get("filed_at_precision", "second")
@@ -718,10 +796,11 @@ class SECCollector:
         if signal is not None:
             signal = signal.model_copy(update=temporal)
         if event is not None or signal is not None:
-            reference = self._archive_documents(
-                accession=entry["accession"], index_url=entry["source_url"], index_html=index_html,
-                document_url=document_url, document=text,
-            )
+            if reference is None:
+                reference = self._archive_documents(
+                    accession=entry["accession"], index_url=index_url, index_html=index_html,
+                    document_url=document_url, document=text,
+                )
             if event is not None and reference is not None:
                 event = event.model_copy(update={"raw_archive_path": reference})
         if signal is not None and signal.issuer_address is None:

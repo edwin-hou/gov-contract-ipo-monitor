@@ -1,6 +1,7 @@
 import gzip
 import json
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +12,7 @@ from contract_ipo_monitor.sources.sec_catalog import SECFilingCatalog, parse_mas
 
 
 NOW = datetime(2026, 10, 6, 15, tzinfo=UTC)
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def database(path):
@@ -28,9 +30,9 @@ def filing(identity, *, day=date(2026, 10, 5), form="8-K"):
 
 
 def master(entries):
-    lines = ["Description: Daily Index of EDGAR Dissemination Feed", "CIK|Company Name|Form Type|Date Filed|Filename", "-----------"]
+    lines = ["Description: Daily Index of EDGAR Dissemination Feed", "CIK|Company Name|Form Type|Date Filed|File Name", "-----------"]
     for value in entries:
-        lines.append(f"42|{value['issuer_name']}|{value['form_type']}|{value['filed_at'].date()}|edgar/data/42/{value['accession']}.txt")
+        lines.append(f"42|{value['issuer_name']}|{value['form_type']}|{value['filed_at'].date():%Y%m%d}|edgar/data/42/{value['accession']}.txt")
     return "\n".join(lines) + "\n"
 
 
@@ -48,13 +50,191 @@ class IndexSource:
             path = url.removeprefix("https://www.sec.gov").removesuffix("/index.json")
             year, quarter = int(path.split("/")[-2]), int(path[-1])
             names = [f"master.{day:%Y%m%d}.idx" for day in self.days if day.year == year and (day.month-1)//3+1 == quarter]
-            return json.dumps({"directory": {"name": path, "item": [{"name": name, "type": "file"} for name in names]}})
+            return json.dumps({"directory": {"name": path.removeprefix("/Archives/edgar/") + "/",
+                                               "item": [{"name": name, "type": "file"} for name in names]}})
         day = datetime.strptime(url.rsplit("/", 1)[-1], "master.%Y%m%d.idx").date()
         return master(self.days[day])
 
 
 def index_url(day):
     return f"https://www.sec.gov/Archives/edgar/daily-index/{day.year}/QTR{(day.month-1)//3+1}/master.{day:%Y%m%d}.idx"
+
+
+@pytest.mark.asyncio
+async def test_live_sec_directory_fixtures_discover_every_scoped_index_across_restart(tmp_path):
+    # Exact public QTR3/QTR4 JSON responses captured with the configured truthful
+    # SEC identity on 2026-10-07. Request headers and private state are excluded.
+    observed = datetime(2026, 10, 7, 15, tzinfo=UTC)
+    days = [date(2026, 9, 30), date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 5), date(2026, 10, 6)]
+    source = IndexSource({day: [filing(identity, day=day)] for identity, day in enumerate(days, 1)})
+    db_path = tmp_path / "monitor.db"
+    async def fetch(url):
+        if url.endswith("/index.json"):
+            source.calls.append(url)
+            quarter = 3 if "/QTR3/" in url else 4
+            return (FIXTURES / f"sec_daily_index_2026_qtr{quarter}.json").read_text(encoding="utf-8")
+        return await source(url)
+    subject = SECFilingCatalog(database(db_path))
+    first = await subject.sync(fetch, ("8-K",), observed_at=observed)
+    assert first["published_through"] == "2026-10-06"
+    assert first["captured_through"] == "2026-10-02"
+    assert first["indexes_captured_this_run"] == 3
+    assert first["status"] == "pending" and first["catchup_complete"] is False
+    restored = SECFilingCatalog(database(db_path))
+    second = await restored.sync(fetch, ("8-K",), observed_at=observed)
+    assert second["published_through"] == second["captured_through"] == "2026-10-06"
+    assert second["indexes_captured_this_run"] == 2
+    assert second["catchup_complete"] is True and second["pending_filings"] == 5
+    assert restored.verify_index_receipts() == 5
+    assert [url for url in source.calls if url.endswith(".idx")] == [index_url(day) for day in days]
+    assert [entry["accession"] for entry in restored.pending_entries("8-K")] == [filing(identity)["accession"] for identity in range(1, 6)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("directory_name", [
+    "daily-index/2026/QTR4/", "daily-index/2026/QTR4",
+    "/Archives/edgar/daily-index/2026/QTR4/", "/Archives/edgar/daily-index/2026/QTR4",
+])
+async def test_directory_identity_variants_keep_the_same_official_index_urls(directory_name, tmp_path):
+    source = IndexSource({date(2026, 10, 5): [filing(1)]})
+    async def fetch(url):
+        text = await source(url)
+        if "/QTR4/index.json" in url:
+            listing = json.loads(text)
+            listing["directory"]["name"] = directory_name
+            return json.dumps(listing)
+        return text
+    subject = SECFilingCatalog(database(tmp_path / "monitor.db"))
+    result = await subject.sync(fetch, ("8-K",), observed_at=NOW)
+    assert result["catchup_complete"] is True
+    assert subject.verify_index_receipts() == 1
+    assert source.calls[-1] == index_url(date(2026, 10, 5))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listing", [
+    [], {}, {"directory": []},
+    {"directory": {"name": "daily-index/2026/QTR3/", "item": []}},
+    {"directory": {"name": "daily-index/2025/QTR4/", "item": []}},
+    {"directory": {"name": "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR4/", "item": []}},
+    {"directory": {"name": "daily-index/2026/../2026/QTR4/", "item": []}},
+    {"directory": {"name": "daily-index/2026/QTR4//", "item": []}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": None}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": {"name": "master.20261005.idx"}}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": [None]}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": [{"name": 20261005}]}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": [{"name": "master.20261005.idx"}, {"name": "master.20261005.idx"}]}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": [{"name": "master.20260930.idx", "type": "file"}]}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": [{"name": "master.20261005.idx", "type": "dir"}]}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": [{"name": "master.2026105.idx"}]}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": [{"name": "master.20261032.idx"}]}},
+    {"directory": {"name": "daily-index/2026/QTR4/", "item": [{"name": "master.20261005.idx", "href": "https://evil.example/master.20261005.idx"}]}},
+])
+async def test_invalid_directory_listing_never_claims_coverage_or_discovers_filings(listing, tmp_path):
+    observed = datetime(2026, 10, 10, 15, tzinfo=UTC)
+    subject = SECFilingCatalog(database(tmp_path / "monitor.db"))
+    calls = []
+    async def fetch(url):
+        calls.append(url)
+        return json.dumps(listing)
+    with pytest.raises(ValueError):
+        await subject.sync(fetch, ("8-K",), observed_at=observed)
+    result = subject.coverage()
+    assert result["status"] == "error" and result["catchup_complete"] is False
+    assert result["listed_through"] is result["published_through"] is result["captured_through"] is None
+    assert result["pending_filings"] == result["captured_index_days"] == 0
+    assert len(calls) == 1 and calls[0].endswith("/QTR4/index.json")
+
+
+@pytest.mark.asyncio
+async def test_invalid_later_directory_preserves_preceding_coverage_and_retry_work(tmp_path):
+    day = date(2026, 9, 30)
+    source = IndexSource({day: [filing(1, day=day)]})
+    subject = SECFilingCatalog(database(tmp_path / "monitor.db"))
+    async def fetch(url):
+        if "/QTR4/index.json" in url:
+            return json.dumps({"directory": {"name": "daily-index/2026/QTR3/", "item": []}})
+        return await source(url)
+    with pytest.raises(ValueError, match="shape"):
+        await subject.sync(fetch, ("8-K",), observed_at=NOW)
+    failed = subject.coverage()
+    assert failed["listed_through"] == "2026-09-30"
+    assert failed["published_through"] is failed["captured_through"] is None
+    assert failed["catchup_complete"] is False and failed["status"] == "error"
+    retry = await subject.sync(source, ("8-K",), observed_at=NOW)
+    assert retry["catchup_complete"] is True and retry["captured_through"] == "2026-09-30"
+    assert retry["pending_filings"] == 1 and subject.verify_index_receipts() == 1
+
+
+def test_actual_sec_master_excerpt_preserves_compact_dates_repeated_rows_and_co_filers():
+    text = (FIXTURES / "sec_daily_master_20260930_excerpt.idx").read_text(encoding="utf-8")
+    entries = parse_master_index(text, day=date(2026, 9, 30), enabled_forms=("8-K", "S-1", "CORRESP", "ABS-15G"))
+    assert len(entries) == 5
+    by_accession = {entry["accession"]: entry for entry in entries}
+    registration = by_accession["0001193125-26-409268"]
+    assert registration["cik"] == "0001891856" and registration["issuer_name"] == "GEN Restaurant Group, Inc."
+    assert registration["filed_at"] == "2026-09-30T00:00:00+00:00" and registration["filed_at_precision"] == "date"
+    correspondence = by_accession["0001193125-26-140818"]
+    assert correspondence["filed_at"] == "2026-04-02T00:00:00+00:00"
+    assert correspondence["catalogue_index_day"] == "2026-09-30"
+    joint = by_accession["0001193125-26-408740"]
+    assert joint["catalogue_index_row_count"] == 2
+    assert [(filer["cik"], filer["issuer_name"]) for filer in joint["catalogue_filers"]] == [
+        ("0001755672", "Corteva, Inc."), ("0000030554", "EIDP, Inc.")]
+    assert all(filer["source_url"].endswith("/000119312526408740/0001193125-26-408740-index.htm") for filer in joint["catalogue_filers"])
+    repeated = by_accession["0001539497-26-002618"]
+    assert repeated["catalogue_index_row_count"] == 3 and len(repeated["catalogue_filers"]) == 1
+
+
+@pytest.mark.parametrize("header", [
+    "CIK|Company Name|Form Type|Date Filed|File Name",
+    "CIK|Company Name|Form Type|Date Filed|Filename",
+])
+@pytest.mark.parametrize("filed", ["20261005", "2026-10-05"])
+def test_master_header_and_date_variants_require_the_same_unambiguous_filing_day(header, filed):
+    row = f"42|Example Corp.|8-K|{filed}|edgar/data/42/0000000042-26-000001.txt"
+    entries = parse_master_index(header + "\n" + row, day=date(2026, 10, 5), enabled_forms=("8-K",))
+    assert entries[0]["filed_at"] == "2026-10-05T00:00:00+00:00"
+    duplicate_headers = "CIK|Company Name|Form Type|Date Filed|File Name\nCIK|Company Name|Form Type|Date Filed|Filename\n" + row
+    with pytest.raises(ValueError, match="unique expected header"):
+        parse_master_index(duplicate_headers, day=date(2026, 10, 5), enabled_forms=("8-K",))
+
+
+@pytest.mark.parametrize("form", ["8-K", "424B2"])
+@pytest.mark.parametrize("second_row", [
+    "43|Co-filer|S-1|20261005|edgar/data/43/0000000042-26-000001.txt",
+    "43|Co-filer|{form}|20261002|edgar/data/43/0000000042-26-000001.txt",
+    "42|Changed identity|{form}|20261005|edgar/data/42/0000000042-26-000001.txt",
+    "43|Co-filer|{form}|20261005|edgar/data/44/0000000042-26-000001.txt",
+])
+def test_shared_accession_rows_still_reject_contradictory_metadata_and_invalid_paths(form, second_row):
+    text = ("CIK|Company Name|Form Type|Date Filed|File Name\n"
+            f"42|Example Corp.|{form}|20261005|edgar/data/42/0000000042-26-000001.txt\n"
+            + second_row.format(form=form))
+    with pytest.raises(ValueError):
+        parse_master_index(text, day=date(2026, 10, 5), enabled_forms=("8-K",))
+
+
+@pytest.mark.asyncio
+async def test_co_filer_source_evidence_survives_atom_precision_updates_and_checkpoint(tmp_path):
+    text = (FIXTURES / "sec_daily_master_20260930_excerpt.idx").read_text(encoding="utf-8")
+    entries = parse_master_index(text, day=date(2026, 9, 30), enabled_forms=("8-K",))
+    joint = next(entry for entry in entries if len(entry["catalogue_filers"]) == 2)
+    subject = SECFilingCatalog(database(tmp_path / "monitor.db"))
+    # The Atom identity is the other actual source filer, with an exact instant.
+    atom = {**{key: value for key, value in joint.items() if not key.startswith("catalogue_")},
+            **joint["catalogue_filers"][1], "filed_at": NOW-timedelta(hours=1), "filed_at_precision": "second"}
+    subject.capture([atom], observed_at=NOW)
+    subject.capture([joint], observed_at=NOW)
+    subject.capture([atom], observed_at=NOW)
+    saved = subject.pending_entries("8-K")
+    assert len(saved) == 1 and saved[0]["cik"] == atom["cik"] and saved[0]["filed_at"] == atom["filed_at"]
+    assert saved[0]["catalogue_filers"] == joint["catalogue_filers"]
+    assert saved[0]["catalogue_index_row_count"] == 2
+    backup = tmp_path / "checkpoint" / "monitor.db"
+    checkpoint_database(subject.db, backup)
+    restored = SECFilingCatalog(database(backup))
+    assert restored.pending_entries("8-K")[0]["catalogue_filers"] == joint["catalogue_filers"]
 
 
 @pytest.mark.asyncio

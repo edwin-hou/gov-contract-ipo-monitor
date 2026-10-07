@@ -2,6 +2,7 @@
 import gzip
 import json
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
@@ -12,10 +13,13 @@ from contract_ipo_monitor.health import HealthRegistry
 from contract_ipo_monitor.service import MonitorService, SECSource
 from contract_ipo_monitor.sources.http import TransientHTTPError
 from contract_ipo_monitor.sources.sec import SECCollector
+from contract_ipo_monitor.sources.sec_catalog import parse_master_index
+from contract_ipo_monitor.tracking import IPOTracker
 
 
 NOW = datetime(2026, 10, 6, 15, tzinfo=UTC)
 DAY = date(2026, 10, 5)
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def filing(number, form="8-K", day=DAY):
@@ -41,14 +45,14 @@ class OfficialSources:
             year, quarter = int(path.split("/")[-2]), int(path[-1])
             days = sorted({row["day"] for row in self.indexed
                            if row["day"].year == year and (row["day"].month - 1) // 3 + 1 == quarter})
-            return json.dumps({"directory": {"name": path, "item": [
+            return json.dumps({"directory": {"name": path.removeprefix("/Archives/edgar/") + "/", "item": [
                 {"name": f"master.{day:%Y%m%d}.idx", "type": "file"} for day in days]}})
         if parsed.path.endswith(".idx"):
             day = datetime.strptime(parsed.path.rsplit("/", 1)[-1], "master.%Y%m%d.idx").date()
             rows = [row for row in self.indexed if row["day"] == day]
             return "\n".join(["Description: Daily Index of EDGAR Dissemination Feed",
-                "CIK|Company Name|Form Type|Date Filed|Filename", "----------", *[
-                    f"42|{row['issuer_name']}|{row['form_type']}|{day}|edgar/data/42/{row['accession']}.txt" for row in rows]])
+                "CIK|Company Name|Form Type|Date Filed|File Name", "----------", *[
+                    f"42|{row['issuer_name']}|{row['form_type']}|{day:%Y%m%d}|edgar/data/42/{row['accession']}.txt" for row in rows]])
         if parsed.path == "/cgi-bin/browse-edgar":
             params = kwargs["params"]
             start = params["start"]
@@ -214,3 +218,204 @@ async def test_full_excluded_prefix_window_is_a_visible_bound_not_false_complete
     assert collector.catalog.coverage()["pending_filings"] == 0
     assert service.last_report["health"]["collectors"]["sec"]["ok"]
     assert service.last_report["status"] == "degraded"
+
+
+def review_collector(tmp_path, *, index_html, document):
+    db = Database(tmp_path / "review.db")
+    db.initialize()
+    collector = SECCollector(None, db=db, request_interval=0)
+    calls = []
+    async def fetch(url, **kwargs):
+        calls.append(url)
+        return index_html if url.endswith("-index.htm") else document()
+    collector._text = fetch
+    return collector, calls
+
+
+def review_entry(number=1, *, form="S-1", cik="42", issuer_name="Example Corp."):
+    value = filing(number, form)
+    return {"accession": value["accession"], "form_type": form, "cik": cik, "issuer_name": issuer_name,
+            "filed_at": datetime.combine(DAY, datetime.min.time(), UTC), "filed_at_precision": "date",
+            "source_url": value["source_url"].replace("/data/42/", f"/data/{int(cik)}/")}
+
+
+def synthetic_filer(cik, name):
+    return (f'<div class="companyInfo"><span class="companyName">{name} (Filer) CIK: '
+            f'<a href="/cgi-bin/browse-edgar?action=getcompany&amp;CIK={cik}">{cik} '
+            '(see all company filings)</a></span></div>')
+
+
+def ambiguous_registration_index():
+    return ("<html>" + synthetic_filer("42", "Example Corp.") + synthetic_filer("43", "Co-filer Ltd")
+            + '<table><tr><td>1</td><td>Primary filing</td><td><a href="registration.htm">filing</a></td>'
+              '<td>S-1</td></tr></table></html>')
+
+
+def resolved_registration_document():
+    return '''<html xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+        xmlns:xbrli="http://www.xbrl.org/2003/instance" xmlns:dei="http://xbrl.sec.gov/dei/2026"><body>
+        <xbrli:context id="base"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">43</xbrli:identifier>
+        </xbrli:entity><xbrli:period><xbrli:instant>2026-10-05</xbrli:instant></xbrli:period></xbrli:context>
+        <ix:nonNumeric name="dei:EntityCentralIndexKey" contextRef="base">43</ix:nonNumeric>
+        <ix:nonNumeric name="dei:EntityRegistrantName" contextRef="base">Co-filer Ltd</ix:nonNumeric>
+        <ix:nonNumeric name="dei:DocumentType" contextRef="base">S-1</ix:nonNumeric>
+        <p>Registration No. 333-12345. This is our initial public offering. We are offering shares of common stock.
+        We intend to list our shares on Nasdaq under the symbol "COF". The initial public offering price is $4.00.</p>
+        </body></html>'''
+
+
+@pytest.mark.asyncio
+async def test_real_shared_8k_resolves_base_registrant_without_using_first_filer_or_archive_folder(tmp_path):
+    index = (FIXTURES / "sec_joint_corteva_eidp_8k_index_20260930.htm").read_text(encoding="utf-8")
+    body = (FIXTURES / "sec_joint_corteva_eidp_8k_primary_20260930.htm").read_text(encoding="utf-8")
+    collector, calls = review_collector(tmp_path, index_html=index, document=lambda: body)
+    entries = parse_master_index((FIXTURES / "sec_daily_master_20260930_excerpt.idx").read_text(encoding="utf-8"),
+                                 day=date(2026, 9, 30), enabled_forms=("8-K",))
+    joint = next(entry for entry in entries if len(entry["catalogue_filers"]) == 2)
+    # Deliberately represent EIDP, which is first in the index and in the
+    # document URL, while authoritative undimensioned DEI identifies Corteva.
+    joint.update(joint["catalogue_filers"][1])
+    collector.catalog.capture([joint], observed_at=NOW)
+    pending = collector.catalog.pending_entries("8-K")[0]
+    event, signal = await collector.collect_entry(pending)
+    assert event is None and signal is None  # This actual document is an ordinary 8-K.
+    collector.mark_processed(joint["accession"], observed_at=NOW)
+    with collector.db.connect() as conn:
+        saved = json.loads(conn.execute("SELECT entry_json FROM sec_pending_filings").fetchone()[0])
+    assert saved["issuer_review"]["status"] == "resolved"
+    assert saved["issuer_review"]["resolved_issuer"]["cik"] == "0001755672"
+    assert saved["issuer_review"]["resolved_issuer"]["issuer_name"] == "Corteva, Inc."
+    assert len(saved["catalogue_filers"]) == 2 and collector.is_processed(joint["accession"])
+    assert collector.catalog.coverage()["issuer_review_count"] == 0
+    assert len(calls) == 2 and "/data/30554/" in calls[0] and "/data/30554/" in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_registration_is_archived_once_and_requires_visible_review_until_deliberate_replay(tmp_path):
+    document = ["<html><body>Registration No. 333-12345. This is our initial public offering. "
+                "We intend to list our common stock on Nasdaq under the symbol COF.</body></html>"]
+    collector, calls = review_collector(tmp_path, index_html=ambiguous_registration_index(), document=lambda: document[0])
+    entry = review_entry()
+    collector.catalog.capture([entry], observed_at=NOW)
+    event, signal = await collector.collect_entry(collector.catalog.pending_entries("S-1")[0])
+    assert event is None and signal is None
+    collector.mark_processed(entry["accession"], observed_at=NOW)
+    assert collector.is_processed(entry["accession"]) and collector.catalog.pending_entries("S-1") == []
+    held = collector.catalog.coverage()
+    assert held["status"] == "review_required" and held["issuer_review_count"] == 1
+    assert held["pending_filings"] == 0 and held["catchup_complete"] is False
+    assert "require issuer review" in held["limitations"][-1]
+    with collector.db.connect() as conn:
+        row = conn.execute("SELECT entry_json,processed_at FROM sec_pending_filings").fetchone()
+        held_entry = json.loads(row["entry_json"])
+        assert row["processed_at"] is not None
+        assert conn.execute("SELECT COUNT(*) FROM sec_raw_documents").fetchone()[0] == 2
+    # A normal feed refresh preserves the held classification and does not
+    # repeat source processing. Explicit review replay retains original bytes
+    # and identities, then can resolve newly authoritative primary metadata.
+    collector.catalog.capture([entry], observed_at=NOW)
+    assert collector.is_processed(entry["accession"]) and len(calls) == 2
+    document[0] = resolved_registration_document()
+    collector.catalog.capture([entry], observed_at=NOW, requeue=True)
+    assert not collector.is_processed(entry["accession"])
+    reopened = collector.catalog.pending_entries("S-1")[0]
+    assert reopened["issuer_review"]["status"] == "retry_requested"
+    event, signal = await collector.collect_entry(reopened)
+    assert event.cik == signal.cik == "0000000043" and event.is_ipo is True and signal.active is True
+    assert event.issuer_name == signal.issuer_name == "Co-filer Ltd"
+    tracker = IPOTracker(collector.db)
+    tracker.initialize()
+    tracker.record(event, observed_at=NOW)
+    collector.mark_processed(entry["accession"], observed_at=NOW)
+    with collector.db.connect() as conn:
+        resolved = json.loads(conn.execute("SELECT entry_json FROM sec_pending_filings").fetchone()[0])
+        assert conn.execute("SELECT COUNT(*) FROM sec_raw_documents").fetchone()[0] == 3
+    review = resolved["issuer_review"]
+    assert review["status"] == "resolved" and review["resolved_issuer"]["registration_id"] == "333-12345"
+    assert resolved["catalogue_filers"] == held_entry["catalogue_filers"]
+    assert any(previous["status"] == "unresolved" for previous in resolved["issuer_review_history"])
+    assert collector.is_processed(entry["accession"]) and collector.catalog.coverage()["issuer_review_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unresolved_review_archive_corruption_requeues_and_repairs_actual_source_receipts(tmp_path):
+    body = "<html><body>Our initial public offering</body></html>"
+    collector, calls = review_collector(tmp_path, index_html=ambiguous_registration_index(), document=lambda: body)
+    entry = review_entry()
+    collector.catalog.capture([entry], observed_at=NOW)
+    await collector.collect_entry(collector.catalog.pending_entries("S-1")[0])
+    collector.mark_processed(entry["accession"], observed_at=NOW)
+    with collector.db.connect() as conn:
+        saved = json.loads(conn.execute("SELECT entry_json FROM sec_pending_filings").fetchone()[0])
+        digest = saved["issuer_review"]["raw_payload_hash"]
+        original = conn.execute("SELECT gzip_blob FROM sec_raw_documents WHERE sha256=?", (digest,)).fetchone()[0]
+        conn.execute("UPDATE sec_raw_documents SET gzip_blob=? WHERE sha256=?", (gzip.compress(b"damaged review source"), digest))
+    assert not collector.is_processed(entry["accession"])
+    assert collector.requeue_invalid_catalog_receipts() == 1
+    event, signal = await collector.collect_entry(collector.catalog.pending_entries("S-1")[0])
+    assert event is None and signal is None
+    collector.mark_processed(entry["accession"], observed_at=NOW)
+    assert collector.is_processed(entry["accession"]) and len(calls) == 4
+    with collector.db.connect() as conn:
+        repaired = conn.execute("SELECT gzip_blob FROM sec_raw_documents WHERE sha256=?", (digest,)).fetchone()[0]
+    assert repaired == original and collector.catalog.coverage()["issuer_review_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_actual_shared_effect_atom_only_identity_reopens_legacy_last_filer_assertion(tmp_path):
+    index = (FIXTURES / "sec_joint_cubebio_effect_index_20260930.htm").read_text(encoding="utf-8")
+    body = (FIXTURES / "sec_joint_cubebio_effect_primary_20260930.xml").read_text(encoding="utf-8")
+    collector, calls = review_collector(tmp_path, index_html=index, document=lambda: body)
+    accession = "9999999995-26-003117"
+    index_url = f"https://www.sec.gov/Archives/edgar/data/2058594/{accession.replace('-', '')}/{accession}-index.htm"
+    document_url = collector.normalizer.primary_document_url(index_url, index, "EFFECT")
+    entry = {"accession": accession, "form_type": "EFFECT", "cik": "2058594", "issuer_name": "Cubebio Co., Ltd",
+             "filed_at": datetime(2026, 9, 30, 12, tzinfo=UTC), "filed_at_precision": "second", "source_url": index_url}
+    collector.catalog.capture([entry], observed_at=NOW)
+    reference = collector._archive_documents(accession=accession, index_url=index_url, index_html=index,
+                                            document_url=document_url, document=body)
+    old = collector.normalizer.tracking_document(**{key: entry[key] for key in ("form_type", "accession", "issuer_name", "cik", "filed_at")},
+                                                source_url=document_url, text=body)
+    old = old.model_copy(update={"raw_archive_path": reference, "registration_id": "333-298262-01"})
+    tracker = IPOTracker(collector.db)
+    tracker.initialize()
+    tracker.record(old, observed_at=NOW)
+    collector.mark_processed(accession, observed_at=NOW)
+    assert not collector.is_processed(accession)
+    assert collector.requeue_invalid_catalog_receipts() == 1
+    reopened = collector.catalog.pending_entries("EFFECT")[0]
+    assert reopened["issuer_review"]["status"] == "retry_requested"
+    event, signal = await collector.collect_entry(reopened)
+    assert event is None and signal is None
+    collector.mark_processed(accession, observed_at=NOW)
+    assert collector.is_processed(accession) and len(calls) == 2
+    with collector.db.connect() as conn:
+        saved = json.loads(conn.execute("SELECT entry_json FROM sec_pending_filings").fetchone()[0])
+    assert len(saved["catalogue_filers"]) == 2
+    assert saved["issuer_review"]["affected_registrations"] == [
+        {"cik": "0002058261", "issuer_name": "CubeBio Holdings Ltd", "registration_id": "333-298262"},
+        {"cik": "0002058594", "issuer_name": "Cubebio Co., Ltd", "registration_id": "333-298262-01"}]
+    assert saved["issuer_review"]["status"] == "unresolved"
+    # Original audit evidence remains, while the read-time gate withholds it.
+    assert len(tracker.evidence()) == 1
+    assert collector.catalog.coverage()["issuer_review_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_has_registration", [True, False])
+async def test_resolved_shared_issuer_uses_fresh_primary_scope_and_discards_stale_or_index_co_filer_scope(primary_has_registration, tmp_path):
+    body = resolved_registration_document()
+    if not primary_has_registration:
+        body = body.replace("Registration No. 333-12345.", "")
+    index = ambiguous_registration_index().replace("</html>", "<p>File Number 333-99999</p></html>")
+    collector, _calls = review_collector(tmp_path, index_html=index, document=lambda: body)
+    entry = {**review_entry(), "registration_id": "333-11111"}
+    collector.catalog.capture([entry], observed_at=NOW)
+    event, signal = await collector.collect_entry(collector.catalog.pending_entries("S-1")[0])
+    expected = "333-12345" if primary_has_registration else None
+    assert event.cik == signal.cik == "0000000043"
+    assert event.registration_id == signal.registration_id == expected
+    with collector.db.connect() as conn:
+        saved = json.loads(conn.execute("SELECT entry_json FROM sec_pending_filings").fetchone()[0])
+    assert saved["issuer_review"]["resolved_issuer"]["registration_id"] == expected
+    assert saved["issuer_review"]["raw_payload_hash"] == event.raw_payload_hash == signal.raw_payload_hash
