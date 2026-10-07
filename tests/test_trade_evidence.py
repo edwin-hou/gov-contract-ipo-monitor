@@ -5,10 +5,12 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from contract_ipo_monitor.quotes import CurrentQuote
+from contract_ipo_monitor.dashboard import market_sections_html
+from contract_ipo_monitor.research import report_markdown
 from contract_ipo_monitor.sources.discourse import DiscourseEvidence, DiscourseBatch
 from contract_ipo_monitor.sentiment import score_evidence, summarize_sentiment
 from contract_ipo_monitor.trades import next_session_window, session_window
-from contract_ipo_monitor.universe import default_universe
+from contract_ipo_monitor.universe import default_universe, rank_universe
 from contract_ipo_monitor.worldnews import WorldEvent, relevant_world_events
 from test_trade_engine import NOW, assess, financials, history, instrument
 from test_market_integration import database, monitor, seed
@@ -56,6 +58,51 @@ def test_brief_figures_use_actual_comparable_primary_amounts_and_price_dates():
     assert briefs["financial"]["source_urls"] == [financials().source_url]
     assert all(set(item) == {"id", "evidence_type", "claim", "meaning", "relevance", "direction", "limitation", "source_urls"} for item in briefs.values())
     assert "internet-wide" in briefs["commentary"]["relevance"]
+
+
+@pytest.mark.parametrize("margin, action, explanation", [
+    (.046, "wait", "reported net margin 4.6% is below 5%"),
+    (.04999, "wait", "reported net margin is below 5% before rounding"),
+    (.05, "conditional_buy", "Meets the trade-entry screen"),
+])
+def test_profitable_growth_shortlist_and_stricter_trade_margin_boundary_are_distinct(margin, action, explanation):
+    fact = replace(financials(), net_income=financials().revenue*margin)
+    shortlisted = rank_universe({fact.symbol: fact}, now=NOW, instruments=(instrument(),))[0]
+    idea = assess(fact=fact)
+    assert shortlisted.eligible is True
+    assert idea["action"] == action
+    assert explanation in by_id(idea)["financial"]["meaning"]
+    if action == "wait":
+        assert idea["entry"] is idea["invalidation"] is idea["target"] is None
+        assert any(explanation in condition for condition in idea["conditions"])
+    else:
+        assert "at least 10% revenue growth, positive reported net income and at least 5% net margin" in by_id(idea)["financial"]["meaning"]
+
+
+def test_shortlist_and_trade_failure_labels_remain_clear_in_markdown_and_dashboard():
+    fact = replace(financials(), net_income=6_900_000)
+    company = rank_universe({fact.symbol: fact}, now=NOW, instruments=(instrument(),))[0].to_dict()
+    idea = assess(fact=fact)
+    report = {"completed_at": NOW.isoformat(), "status": "degraded", "health": {},
+              "listed_companies": [company], "trade_ideas": [idea]}
+    for rendered in (report_markdown(report), market_sections_html(report)):
+        assert "Passes research shortlist" in rendered
+        assert "Does not meet the trade-entry screen" in rendered
+        assert "reported net margin 4.6% is below 5%" in rendered
+        assert "Passes financial screen" not in rendered
+
+
+@pytest.mark.parametrize("changes, explanation", [
+    ({"revenue": 109_000_000}, "reported revenue growth 9.0% is below 10%"),
+    ({"revenue": 109_990_000}, "reported revenue growth is below 10% before rounding"),
+    ({"net_income": 0}, "reported net income USD 0 is not positive"),
+    ({"net_income": -1_000_000}, "reported net income USD -1,000,000 is not positive"),
+])
+def test_financial_brief_identifies_the_actual_failed_trade_requirement(changes, explanation):
+    idea = assess(fact=replace(financials(), **changes))
+    assert idea["action"] == "wait"
+    assert explanation in by_id(idea)["financial"]["meaning"]
+    assert any(explanation in condition for condition in idea["conditions"])
 
 
 def test_stale_or_wrong_issuer_facts_cannot_become_supporting_evidence():

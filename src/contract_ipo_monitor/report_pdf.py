@@ -160,10 +160,12 @@ def _styles() -> dict:
         "small": ParagraphStyle("ResearchSmall", **{**base, "fontSize": 7.8, "leading": 10.5, "textColor": _MUTED}),
         "audit": ParagraphStyle("ResearchAudit", **{**base, "fontSize": 6.8, "leading": 8.8, "textColor": _MUTED, "spaceAfter": 3}),
         "table": ParagraphStyle("ResearchTable", **{**base, "fontSize": 7.8, "leading": 10.5, "textColor": _MUTED, "spaceAfter": 0}),
-        "appendix_title": ParagraphStyle("ResearchAppendixTitle", **{**base, "fontName": _BOLD, "fontSize": 16, "leading": 21, "textColor": _NAVY, "spaceBefore": 10, "spaceAfter": 6}),
-        "heading": ParagraphStyle("ResearchHeading", **{**base, "fontName": _BOLD, "fontSize": 11.5, "leading": 15, "textColor": _NAVY, "spaceBefore": 6}),
-        "title": ParagraphStyle("ResearchTitle", **{**base, "fontName": _BOLD, "fontSize": 24, "leading": 29, "textColor": _NAVY, "spaceAfter": 8}),
-        "company": ParagraphStyle("ResearchCompany", **{**base, "fontName": _BOLD, "fontSize": 16, "leading": 21, "textColor": _NAVY, "spaceAfter": 4}),
+        # Keep headings attached to their first content flowable, including an
+        # evidence brief already grouped with its caveat and source links.
+        "appendix_title": ParagraphStyle("ResearchAppendixTitle", **{**base, "fontName": _BOLD, "fontSize": 16, "leading": 21, "textColor": _NAVY, "spaceBefore": 10, "spaceAfter": 6, "keepWithNext": True}),
+        "heading": ParagraphStyle("ResearchHeading", **{**base, "fontName": _BOLD, "fontSize": 11.5, "leading": 15, "textColor": _NAVY, "spaceBefore": 6, "keepWithNext": True}),
+        "title": ParagraphStyle("ResearchTitle", **{**base, "fontName": _BOLD, "fontSize": 24, "leading": 29, "textColor": _NAVY, "spaceAfter": 8, "keepWithNext": True}),
+        "company": ParagraphStyle("ResearchCompany", **{**base, "fontName": _BOLD, "fontSize": 16, "leading": 21, "textColor": _NAVY, "spaceAfter": 4, "keepWithNext": True}),
         "metric_label": ParagraphStyle("ResearchMetricLabel", **{**base, "fontSize": 7.5, "leading": 10, "spaceAfter": 4, "textColor": _MUTED}),
         "metric": ParagraphStyle("ResearchMetric", **{**base, "fontName": _BOLD, "fontSize": 11, "leading": 14, "spaceAfter": 2}),
         "badge": ParagraphStyle("ResearchBadge", **{**base, "fontName": _BOLD, "fontSize": 9, "textColor": _BLUE, "spaceAfter": 5}),
@@ -274,12 +276,16 @@ def report_pdf(report: dict, *, notice: str = "", test: bool = False) -> bytes:
                       p(f"Review model: {_text(review.get('model'), 50)} / {_text(review.get('reasoning_effort'), 20)}. A model view is not a measured probability of profit.", "small", 200)]
 
         briefs = [_dict(x) for x in _list(idea.get("evidence_briefs"))[:5]]
-        story.append(p("Why this is on the watchlist", "heading"))
+        evidence_heading = p("Why this is on the watchlist", "heading")
         if not briefs:
-            story.append(p("No concise linked evidence summary was saved. Missing evidence is a reason to wait; inspect the complete JSON audit.", limit=400))
-        for brief in briefs:
+            story += [evidence_heading, p("No concise linked evidence summary was saved. Missing evidence is a reason to wait; inspect the complete JSON audit.", limit=400)]
+        for index, brief in enumerate(briefs):
             sources = _links(brief.get("source_urls"), labels=["Price history", "Benchmark history"] if brief.get("evidence_type") == "completed_price_history" else None)
-            content = [Paragraph("<b>- " + escape(_text(brief.get("claim"), 500)) + "</b> " + escape(_text(brief.get("meaning"), 350)), styles["body"])]
+            # ReportLab's keepWithNext cannot join a heading to a following
+            # KeepTogether container. Put the first brief and its heading into
+            # the same flat group so they move across the page boundary together.
+            content = [evidence_heading] if index == 0 else []
+            content.append(Paragraph("<b>- " + escape(_text(brief.get("claim"), 500)) + "</b> " + escape(_text(brief.get("meaning"), 350)), styles["body"]))
             if brief.get("limitation"):
                 content.append(labelled("Caveat:", brief["limitation"], "small", 450))
             content.append(Paragraph("Sources: " + sources, styles["small"]) if sources else p("Coverage only: no linked source supports this summary.", "small"))

@@ -91,7 +91,7 @@ def market_sections_html(report: dict[str, Any], *, limit: int = 50) -> str:
             f"<td>{display_number(company.get('net_margin_percent'), decimals=1, suffix='%')}</td>"
             f"<td>{display_number(financials.get('net_income'), decimals=0)} {_text(financials.get('currency'), '')}</td>"
             f"<td>Period: {_text(financials.get('period_end'))}<br>Reported: {_text(financials.get('reported_at'))}<br>{_text(basis, '')}</td>"
-            f"<td>{'Passes financial screen' if company.get('eligible') is True else 'Does not pass financial screen'}{_list(company.get('reasons'))}</td>"
+            f"<td>{'Passes research shortlist' if company.get('eligible') is True else 'Does not pass research shortlist'}{_list(company.get('reasons'))}</td>"
             f"<td>{_link(financials.get('source_url'), 'Financial results')}{_list(financials.get('limitations'))}</td></tr>"
         )
     company_body = "".join(company_rows) or '<tr><td colspan="8">No sourced listed-company research is saved yet.</td></tr>'

@@ -164,7 +164,7 @@ def test_wait_state_never_displays_restored_setup_levels_and_partial_evidence_st
     html, text = market_sections_html(report), report_markdown(report)
     for result in (html, text):
         assert "777,777" not in result and "666,666" not in result and "999,999" not in result
-        assert "Unavailable" in result and "Does not pass financial screen" in result
+        assert "Unavailable" in result and "Does not pass research shortlist" in result
         assert "Usable verified native HKD price history is unavailable" in result
 
 

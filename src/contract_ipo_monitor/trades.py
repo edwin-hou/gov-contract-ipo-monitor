@@ -220,15 +220,35 @@ def _commentary_links(instrument, records, tones, *, now: datetime) -> list[str]
     return [item.source_url for item in selected]
 
 
+def _trade_entry_financial_failures(fact) -> list[str]:
+    def below(label, value, threshold):
+        displayed = f"{value*100:.1f}"
+        if float(displayed) >= threshold*100:
+            return f"reported {label} is below {threshold*100:g}% before rounding"
+        return f"reported {label} {displayed}% is below {threshold*100:g}%"
+
+    failures = []
+    if fact.growth < .10:
+        failures.append(below("revenue growth", fact.growth, .10))
+    if fact.net_income <= 0:
+        failures.append(f"reported net income {fact.currency} {fact.net_income:,.0f} is not positive")
+    if fact.net_margin < .05:
+        failures.append(below("net margin", fact.net_margin, .05))
+    return failures
+
+
 def _evidence_briefs(result, instrument, fact, history, company_evidence, now, fundamental_max_age_days, source_summary=None) -> list[dict]:
     briefs = []
     if (fact is not None and fact.symbol == instrument.symbol and _financial_source_reviewed(instrument, fact)
             and fact.accounting_standard in {"US GAAP", "IFRS", "Taiwan IFRS"}
             and (not instrument.reporting_currency or fact.currency == instrument.reporting_currency)
             and fact.is_fresh(now, max_age_days=fundamental_max_age_days)):
+        failures = _trade_entry_financial_failures(fact)
+        meaning = ("Does not meet the trade-entry screen: " + "; ".join(failures) + "." if failures else
+                   "Meets the trade-entry screen: at least 10% revenue growth, positive reported net income and at least 5% net margin.")
         briefs.append(_brief("financial", "primary_financial",
             f"{fact.period_type.title()} ended {fact.period_end.isoformat()}: total revenue {fact.currency} {fact.revenue:,.0f}, up {fact.growth*100:.1f}% YoY; reported net income {fact.currency} {fact.net_income:,.0f} ({fact.net_margin*100:.1f}% margin).",
-            "Growth and reported profit meet the financial screen." if fact.growth >= .10 and fact.net_income > 0 and fact.net_margin >= .05 else "These figures do not meet the required growth/profit screen.",
+            meaning,
             "Dated entity-wide issuer results for this security, using comparable reported periods.", "historical_fundamentals",
             "Reported " + fact.reported_at.isoformat() + "; historical growth is not fair valuation or a forecast. " + " ".join(fact.limitations[:1]), [fact.source_url]))
     values = result.get("indicators")
@@ -514,8 +534,9 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
             blockers.append("Financial reporting currency does not match the reviewed issuer")
         if not fact.is_fresh(now, max_age_days=fundamental_max_age_days):
             blockers.append("Company results are stale or dated in the future")
-        if fact.growth < .10 or fact.net_income <= 0 or fact.net_margin < .05:
-            blockers.append("Company no longer meets the 10% revenue growth / positive profit / 5% net margin screen")
+        financial_failures = _trade_entry_financial_failures(fact)
+        if financial_failures:
+            blockers.append("Company does not meet the trade-entry screen: " + "; ".join(financial_failures))
         result["reasons"].append(f"Reported revenue grew {fact.growth*100:.1f}% year over year with a {fact.net_margin*100:.1f}% net margin")
     if history is None or history.status != "ok" or len(history.bars) < 60:
         blockers.append("Usable verified price history is unavailable")

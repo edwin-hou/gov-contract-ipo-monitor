@@ -73,6 +73,31 @@ def test_pdf_bytes_are_deterministic_and_report_is_unchanged():
     assert report == before
 
 
+def test_section_heading_moves_with_first_evidence_across_real_page_break():
+    report = sample_report()
+    idea = report["trade_ideas"][0]
+    idea["strategy"]["entry_trigger"]["verification"] = ""
+    brief = idea["evidence_briefs"][0]
+    brief["claim"] = "Reported total company revenue increased, with positive reported net income. " * 7
+    brief["meaning"] = "These historical financial results support a watchlist review, not a valuation forecast. " * 4
+    brief["limitation"] = "Reported accounting profit differs from cash flow; growth cannot be extrapolated and valuation remains unverified. " * 4
+    idea["ai_review"] = {
+        "rationale": "Historical growth and a conditional price trigger support monitoring; verify costs and valuation. " * 3,
+        "counterargument": "Growth may already be reflected in the price; unresolved catalyst and liquidity checks can invalidate the entry. " * 3,
+        "model": "gpt-5.6-sol", "reasoning_effort": "medium",
+    }
+    pages = [page.extract_text() for page in reader(report).pages]
+    heading_pages = [index for index, content in enumerate(pages) if "Why this is on the watchlist" in content]
+    assert len(pages) >= 2 and len(heading_pages) == 1
+    evidence_page = heading_pages[0]
+    # This saved-report density previously left the heading alone at the bottom
+    # of page 1, while its indivisible claim/caveat/link group began on page 2.
+    assert evidence_page > 0
+    assert "Why this is on the watchlist" not in pages[evidence_page - 1]
+    for expected in ("Reported total company revenue increased", "Reported accounting profit differs from cash flow", "Sources: investors.micron.com"):
+        assert expected in pages[evidence_page]
+
+
 @pytest.mark.parametrize("action, expected", [
     ("wait", "WAIT - no entry suggested"),
     ("reduce_if_owned", "not a sell or short instruction"),

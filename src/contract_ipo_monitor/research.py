@@ -175,7 +175,7 @@ def report_markdown(report: dict[str, Any]) -> str:
             if not isinstance(financials, dict):
                 financials = {}
             basis = " ".join(items([financials.get("period_type"), financials.get("accounting_standard")]))
-            state = "Passes financial screen" if company.get("eligible") is True else "Does not pass financial screen"
+            state = "Passes research shortlist" if company.get("eligible") is True else "Does not pass research shortlist"
             lines.append(f"| {clean(company.get('name'))} / {clean(company.get('issuer_country'))} | {clean(company.get('symbol'))} / {clean(company.get('exchange'))} / {clean(company.get('trading_currency'))} | {display_number(company.get('revenue_growth_percent'), decimals=1, suffix='%')} | {display_number(company.get('net_margin_percent'), decimals=1, suffix='%')} | {display_number(financials.get('net_income'), decimals=0)} {clean(financials.get('currency', ''))} | {clean(financials.get('period_end'))} / {clean(financials.get('reported_at'))} / {clean(basis)} | {state}: {clean('; '.join(items(company.get('reasons'))))} | {link(financials.get('source_url'), 'Financial results')} |")
             for limitation in items(financials.get("limitations")):
                 financial_notes.append(f"{clean(company.get('symbol'))} financial limitation: {clean(limitation)}")
