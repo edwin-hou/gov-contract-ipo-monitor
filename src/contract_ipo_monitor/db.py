@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from .models import AlertPayload, Candidate, GateDecision
+from .report_history import original_report_bytes, report_history_rows
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -107,15 +108,20 @@ class Database:
                 conn.execute("COMMIT")
                 return
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='monitor_runs'").fetchone():
-                rows = conn.execute(
-                    """SELECT id,completed_at,
-                       CASE WHEN json_valid(report_json) THEN json_extract(report_json, '$.health.collectors.sec.error') END AS sec_error
-                       FROM monitor_runs ORDER BY id"""
-                )
+                rows = report_history_rows(conn)
                 known_forms = {"S-1", "S-1/A", "F-1", "F-1/A", "1-A", "1-A/A", "8-K", "8-K/A", "6-K", "6-K/A", "RW", "AW", "EFFECT", "424B4"}
                 pattern = re.compile(r"(?:^|[;:]\s+)([A-Z0-9][A-Z0-9/-]*):\s*feed page limit reached;\s*older filings may be missing")
                 for row in rows:
-                    error = row["sec_error"]
+                    # Invalid historical JSON remains preserved and cannot
+                    # imply coverage. A corrupted compressed receipt fails
+                    # the migration rather than hiding an unresolved gap.
+                    raw = original_report_bytes(row)
+                    try:
+                        error = json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    for key in ("health", "collectors", "sec", "error"):
+                        error = error.get(key) if isinstance(error, dict) else None
                     if not isinstance(error, str) or "feed page limit reached; older filings may be missing" not in error:
                         continue
                     forms = {match.group(1) for match in pattern.finditer(error) if match.group(1) in known_forms}

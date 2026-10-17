@@ -105,3 +105,13 @@ def test_workflow_uses_exact_selector_and_preserves_restore_validation():
     assert "require(process.env.GITHUB_WORKSPACE + '/scripts/select_checkpoint.cjs')" in workflow
     assert 'b.id-a.id' not in workflow and 'python scripts/restore_checkpoint.py' in workflow
     assert "'scripts/select_checkpoint.cjs'" in workflow
+
+
+def test_workflow_only_uploads_a_verified_complete_versioned_checkpoint():
+    workflow=(MODULE.parent.parent/'.github/workflows/monitor.yml').read_text()
+    assert 'python scripts/validate_checkpoint_export.py' in workflow
+    assert "steps.checkpoint.outputs.valid == 'true'" in workflow
+    assert 'work/checkpoint/checkpoint.json' in workflow and 'work/checkpoint/monitor.db.gz' in workflow
+    assert 'path: work/checkpoint/monitor.db\n' not in workflow
+    assert "if-no-files-found: error" in workflow
+    assert 'data.length > MAX_CHECKPOINT_ARCHIVE_BYTES' in workflow

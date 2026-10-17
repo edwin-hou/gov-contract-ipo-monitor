@@ -1,5 +1,8 @@
 'use strict';
 
+// This bounds the compressed artifact transfer, not the expanded SQLite file.
+const MAX_CHECKPOINT_ARCHIVE_BYTES = 250000000;
+
 // Artifact IDs identify objects; they do not establish upload chronology.
 // Keep the selector independently testable with actual API-shaped metadata.
 function timestamp(value, now) {
@@ -26,7 +29,7 @@ async function selectCheckpoint(artifacts, getRun, options) {
     && a.workflow_run?.head_branch === branch && String(a.workflow_run.id) !== String(currentRunId));
   const ordered = eligible.map(artifact => {
     if (!identifier(artifact.id) || !identifier(artifact.workflow_run.id)
-      || !Number.isSafeInteger(artifact.size_in_bytes) || artifact.size_in_bytes <= 0 || artifact.size_in_bytes > 250000000) {
+      || !Number.isSafeInteger(artifact.size_in_bytes) || artifact.size_in_bytes <= 0 || artifact.size_in_bytes > MAX_CHECKPOINT_ARCHIVE_BYTES) {
       throw new Error('Checkpoint artifact identity or size is invalid');
     }
     return {artifact, created: timestamp(artifact.created_at, now)};
@@ -55,4 +58,4 @@ async function selectCheckpoint(artifacts, getRun, options) {
   return chosen ? {artifact: chosen.artifact, run: chosen.run} : null;
 }
 
-module.exports = {selectCheckpoint};
+module.exports = {selectCheckpoint, MAX_CHECKPOINT_ARCHIVE_BYTES};

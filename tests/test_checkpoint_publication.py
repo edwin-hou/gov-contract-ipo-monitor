@@ -101,9 +101,10 @@ def test_original_schema_backup_is_validated_readonly_without_optional_migration
 
     monkeypatch.setattr(sqlite3, 'connect', connect)
     research.checkpoint_database(Database(source), destination)
-    assert len(readonly_connections) == 1
+    assert readonly_connections
     assert readonly_connections[0][0].endswith('.tmp?mode=ro')
-    assert readonly_connections[0][1] == {'uri': True}
+    assert all(path.endswith('?mode=ro') and options == {'uri': True}
+               for path, options in readonly_connections)
     assert source.read_bytes() == before
     validate_database(destination)
     assert not destination.with_suffix('.tmp').exists()

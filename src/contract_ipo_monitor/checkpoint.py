@@ -6,7 +6,9 @@ from contextlib import closing
 from pathlib import Path
 
 
-MAX_CHECKPOINT_BYTES = 250_000_000
+MAX_CHECKPOINT_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 250_000_000
+MAX_LEGACY_BYTES = 250_000_000
 SQLITE_HEADER = b"SQLite format 3\x00"
 # These tables and columns belong to the original monitor schema. Newer optional
 # collectors are initialized after restoration, so they cannot be prerequisites.
@@ -40,3 +42,10 @@ def validate_database(path: Path, *, max_bytes: int = MAX_CHECKPOINT_BYTES) -> N
                     raise ValueError(f"Checkpoint monitor schema is incomplete for table {table}")
     except sqlite3.DatabaseError as exc:
         raise ValueError("Checkpoint SQLite integrity check failed") from exc
+
+
+def validate_export(directory: Path) -> dict:
+    """Verify both portable files, expanded bytes and SQLite before publication."""
+    from .checkpoint_archive import validate_export as validate
+
+    return validate(directory)

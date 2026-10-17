@@ -86,10 +86,19 @@ elif sys.argv[1] == "download":
         response.raise_for_status()
     else:
         response.raise_for_status()
+    if len(response.content) > 250_000_000:
+        raise ValueError("Checkpoint/report ZIP exceeds the compressed transport bound")
     destination.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+        limits = {"latest.json": 30_000_000, "latest.md": 30_000_000,
+                  "monitor.db": 250_000_000, "checkpoint.json": 64_000,
+                  "monitor.db.gz": 250_000_000}
+        names = [item.filename for item in bundle.infolist()]
+        if len(names) != len(set(names)) or set(names) not in (
+                {"latest.json", "latest.md"}, {"monitor.db"}, {"checkpoint.json", "monitor.db.gz"}):
+            raise ValueError("Unexpected or incomplete artifact inventory")
         for item in bundle.infolist():
-            if item.filename not in {"latest.json", "latest.md", "monitor.db"} or item.file_size > 250_000_000:
+            if item.file_size > limits[item.filename]:
                 raise ValueError("Unexpected artifact file")
             (destination / item.filename).write_bytes(bundle.read(item))
     report = destination / "latest.json"
@@ -97,6 +106,6 @@ elif sys.argv[1] == "download":
         data = json.loads(report.read_text(encoding="utf-8"))
         print(json.dumps({key: data[key] for key in ("completed_at", "status", "counts", "ipo_summary")}, indent=2))
     else:
-        print("Saved verified checkpoint to " + str(destination))
+        print("Saved checkpoint files to " + str(destination) + "; validate before restoring.")
 else:
     raise ValueError("Unknown operation")

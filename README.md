@@ -58,7 +58,11 @@ gov-contract-ipo-monitor report --output data/reports
 gov-contract-ipo-monitor run
 ```
 
-`run-once` writes `latest.md` and `latest.json`, saves a durable run receipt, and returns exit code 3 if the required SEC or USAspending collector is incomplete. Optional source gaps remain visible in a degraded report. A SQLite backup captures committed WAL data for recovery. Publishing and restoring checkpoints enforce the same 250 MB bound, SQLite integrity and the original required schema; an invalid checkpoint cannot replace existing history.
+`run-once` writes `latest.md` and `latest.json`, saves a durable run receipt, and returns exit code 3 if the required SEC or USAspending collector is incomplete. Optional source gaps remain visible in a degraded report. Retained run reports use lossless gzip payloads with original-byte lengths and SHA-256 receipts; legacy JSON rows migrate transactionally, retaining their IDs, timestamps and exact original bytes. The existing 365-day report-history policy is unchanged. Source evidence, versions and raw SEC archives are retained independently.
+
+A SQLite backup captures committed WAL data and compacts only the backup copy. The readable local checkpoint remains `monitor.db`; the portable version-1 artifact contains `checkpoint.json` and `monitor.db.gz`. Its manifest binds both compressed and expanded sizes and SHA-256 hashes. Download/gzip transfer is bounded to 250 MB, while a validated expanded SQLite snapshot may use up to 2 GiB, subject to free disk space. These are separate resources. Restore streams and checks the payload before replacing existing state, including SQLite integrity and the original required schema. Legacy single-`monitor.db` ZIPs remain supported under their original 250 MB expanded limit.
+
+Size limits remain explicit safety guards. Each hosted run logs database/table allocation before collection and verified checkpoint-size diagnostics before publication, so storage growth is visible. This format does not claim unlimited storage; retained source history still needs adequate capacity.
 
 `run` polls configured sources continuously, publishes a report every minute, and serves:
 
@@ -75,10 +79,10 @@ The dashboard is intended for a trusted local/private environment. Bind `HEALTH_
 Each job:
 
 1. Restores the newest retained `ipo-monitor-state` artifact from this workflow on `main`.
-2. Validates and restores only the expected SQLite file; corrupt checkpoints fail visibly.
+2. Validates the exact expected legacy or versioned archive inventory and atomically installs verified SQLite state; corrupt checkpoints fail visibly.
 3. Collects evidence, records errors without erasing previous verified evidence, and writes a research report.
 4. Publishes the report to the Actions run summary and `ipo-monitor-report` artifact.
-5. Saves a consistent SQLite checkpoint as `ipo-monitor-state` for the next run, including runs with collection gaps.
+5. Verifies the completed manifest and gzip payload, then saves only that complete pair as `ipo-monitor-state` for the next run, including runs with collection gaps. Incomplete exports cannot replace a preceding durable artifact.
 
 The hosted job uses the supported 50 MiB SEC document bound so larger current filings can be archived; override `SEC_MAX_DOCUMENT_BYTES` through a repository variable if needed. Local defaults remain 20 MiB unless configured, and the maximum accepted bound is 50 MiB.
 

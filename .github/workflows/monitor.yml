@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ['src/**', 'pyproject.toml', '.github/workflows/monitor.yml', 'scripts/restore_checkpoint.py', 'scripts/select_checkpoint.cjs']
+    paths: ['src/**', 'pyproject.toml', '.github/workflows/monitor.yml', 'scripts/restore_checkpoint.py', 'scripts/select_checkpoint.cjs', 'scripts/checkpoint_capacity.py', 'scripts/validate_checkpoint_export.py']
 
 permissions:
   contents: read
@@ -54,7 +54,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const {selectCheckpoint} = require(process.env.GITHUB_WORKSPACE + '/scripts/select_checkpoint.cjs');
+            const {selectCheckpoint, MAX_CHECKPOINT_ARCHIVE_BYTES} = require(process.env.GITHUB_WORKSPACE + '/scripts/select_checkpoint.cjs');
             const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
               ...context.repo, name: 'ipo-monitor-state', per_page: 100
             });
@@ -65,7 +65,7 @@ jobs:
               const {artifact, run} = selected;
               const download = await github.rest.actions.downloadArtifact({...context.repo, artifact_id: artifact.id, archive_format:'zip'});
               const data = Buffer.from(download.data);
-              if (!data.length || data.length > 250000000) throw new Error('Checkpoint archive exceeds download bounds');
+              if (!data.length || data.length > MAX_CHECKPOINT_ARCHIVE_BYTES) throw new Error('Checkpoint archive exceeds download bounds');
               fs.mkdirSync('work', {recursive:true});
               fs.writeFileSync('work/checkpoint.zip', data);
               core.info(`Restoring checkpoint from run ${run.id}, artifact ${artifact.id}; artifact created ${artifact.created_at}, run created ${run.created_at}`);
@@ -74,7 +74,10 @@ jobs:
             core.info('No retained checkpoint exists. Starting a new collection history.');
       - name: Validate and install checkpoint
         run: python scripts/restore_checkpoint.py
+      - name: Record checkpoint capacity before collection
+        run: python scripts/checkpoint_capacity.py data/monitor.db --baseline work/checkpoint-baseline.json
       - name: Collect and write research report
+        id: collect
         run: gov-contract-ipo-monitor run-once --report-dir data/reports --checkpoint work/checkpoint/monitor.db
       - name: Publish report to run summary
         if: always()
@@ -85,13 +88,21 @@ jobs:
           else
             echo 'No completed research report. See the failed step; collection is not confirmed.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Preserve state for the next run
+      - name: Validate state for publication
+        id: checkpoint
         if: always()
+        env:
+          COLLECTION_OUTCOME: ${{ steps.collect.outcome }}
+        run: python scripts/validate_checkpoint_export.py
+      - name: Preserve state for the next run
+        if: always() && steps.checkpoint.outcome == 'success' && steps.checkpoint.outputs.valid == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ipo-monitor-state
-          path: work/checkpoint/monitor.db
-          if-no-files-found: warn
+          path: |
+            work/checkpoint/checkpoint.json
+            work/checkpoint/monitor.db.gz
+          if-no-files-found: error
           retention-days: 90
       - name: Preserve reviewable report
         if: always()

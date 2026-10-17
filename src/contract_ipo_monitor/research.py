@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import Database
+from .report_history import insert_report_payload, migrate_report_history, original_report_bytes, report_history_rows
 from .sources.discourse import DiscourseBatch, DiscourseEvidence, evidence_from_dict
 
 
@@ -39,6 +40,8 @@ class ResearchStore:
     def initialize(self) -> None:
         with closing(self.db.connect()) as conn:
             conn.executescript(SCHEMA)
+        with self.db.transaction() as conn:
+            migrate_report_history(conn)
 
     def record_batch(self, batch: DiscourseBatch) -> int:
         inserted = 0
@@ -82,14 +85,17 @@ class ResearchStore:
             return [json.loads(row[0]) for row in conn.execute("SELECT coverage_json FROM discourse_coverage ORDER BY source,source_url")]
 
     def save_run(self, report: dict[str, Any]) -> None:
+        raw = json.dumps(serializable(report)).encode("utf-8")
         with self.db.transaction() as conn:
-            conn.execute("INSERT INTO monitor_runs(completed_at,status,report_json) VALUES(?,?,?)", (report["completed_at"], report["status"], json.dumps(serializable(report))))
+            cursor = conn.execute("INSERT INTO monitor_runs(completed_at,status,report_json) VALUES(?,?,'')", (report["completed_at"], report["status"]))
+            insert_report_payload(conn, cursor.lastrowid, raw)
             conn.execute("DELETE FROM monitor_runs WHERE completed_at < ?", ((datetime.fromisoformat(report["completed_at"]) - timedelta(days=365)).isoformat(),))
 
     def latest_run(self) -> dict[str, Any] | None:
         with closing(self.db.connect()) as conn:
-            row = conn.execute("SELECT report_json FROM monitor_runs ORDER BY id DESC LIMIT 1").fetchone()
-        return json.loads(row[0]) if row else None
+            row = next(report_history_rows(conn, newest_first=True, limit=1), None)
+            raw = original_report_bytes(row) if row else None
+        return json.loads(raw) if raw is not None else None
 
 
 def report_markdown(report: dict[str, Any]) -> str:
@@ -308,21 +314,12 @@ def write_report(report: dict[str, Any], directory: Path) -> None:
         temporary.replace(target)
 
 
-MAX_CHECKPOINT_BYTES = 250_000_000
+from .checkpoint import MAX_CHECKPOINT_BYTES
 
 
 def checkpoint_database(db: Database, destination: Path) -> None:
     """SQLite backup includes committed WAL data; copying the .db alone does not."""
-    from .checkpoint import validate_database
+    from .checkpoint_archive import export_database
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(".tmp")
-    try:
-        with closing(db.connect()) as source, closing(sqlite3.connect(temporary)) as target:
-            source.backup(target)
-        # Match the portable artifact/restore contract before publication; an
-        # unusable backup must never replace the preceding usable checkpoint.
-        validate_database(temporary, max_bytes=MAX_CHECKPOINT_BYTES)
-        temporary.replace(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+    record = export_database(db, destination, max_database_bytes=MAX_CHECKPOINT_BYTES)
+    print("Checkpoint size: " + json.dumps(record["checkpoint_size"], sort_keys=True))
