@@ -339,7 +339,7 @@ def run_mail_worker(config, work: Path, *, reconcile_only=False):
 
 
 def process_notifications(monitor_config, *, now=None, worker=run_mail_worker):
-    from hermes_market_monitor import analysis_metadata, read_json, retire_ai_analysis, validate_report, timestamp, write_json
+    from hermes_market_monitor import analysis_metadata, read_json, report_publication_authorized, retire_ai_analysis, validate_report, timestamp, write_json
     now = now or datetime.now(UTC)
     work = monitor_config.work
     receipt = read_json(monitor_config.receipt)
@@ -351,7 +351,7 @@ def process_notifications(monitor_config, *, now=None, worker=run_mail_worker):
             receipt.update(email_status="ok", email_outcome="disabled", email_sent=[], mail_receipt_path=str(mail_path))
             write_json(monitor_config.receipt, receipt)
             return ""
-        verified = receipt.get("status") in {"ok", "degraded"} and receipt.get("outcome") != "failure"
+        verified = report_publication_authorized(receipt)
         queued = []
         if verified:
             report = read_json(Path(receipt["source_report"]))
@@ -369,7 +369,7 @@ def process_notifications(monitor_config, *, now=None, worker=run_mail_worker):
                                              outputs_root=monitor_config.base / "outputs")
         else:
             retire_ai_analysis(receipt, now=now, work=work,
-                               reason=receipt.get("failure_code") or "report_unverified", blocked=True)
+                               reason=receipt.get("failure_code") or "current_main_report_unverified", blocked=True)
         started = datetime.now(UTC)
         allow_send = verified and (config.get("notification_policy") != "ai_approved_only" or receipt.get("ai_analysis", {}).get("send_allowed") is True)
         worker(config, work, reconcile_only=not allow_send)

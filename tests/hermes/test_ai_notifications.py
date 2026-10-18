@@ -464,7 +464,9 @@ def test_process_ai_policy_only_reconciles_unknown_post_and_blocks_legacy_route(
     data = report()
     monitor.write_json(source, data)
     monitor.write_json(runtime.receipt, {"status":"degraded", "outcome":"no_change", "source_report":str(source),
-        "report_sha256":hashlib.sha256(source.read_bytes()).hexdigest()})
+        "report_sha256":hashlib.sha256(source.read_bytes()).hexdigest(), "publication_authorized":True,
+        "verified_run":"101", "head_sha":"a"*40, "main_sha":"a"*40,
+        "verification":"downloaded_actual_report_artifact; current_main_run_identity"})
     monitor.write_json(runtime.ledger, {})
     monitor.write_json(work / "market-delivery.json", config)
     original = notifications.stage_ai_notifications

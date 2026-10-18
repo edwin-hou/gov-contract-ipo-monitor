@@ -9,7 +9,7 @@ import pytest
 import hermes_market_monitor as monitor
 import market_notifications as mail
 from contract_ipo_monitor.notifications import EmailOutbox
-from test_hermes_market_monitor import report, setup, NOW
+from test_hermes_market_monitor import report, setup, NOW, SHA
 
 
 def configured(tmp_path):
@@ -21,7 +21,10 @@ def configured(tmp_path):
     source = config.outputs / "verified" / "latest.json"
     monitor.write_json(source, data)
     monitor.write_json(config.receipt, {"status": "degraded", "outcome": "no_change", "source_report": str(source),
-                                      "report_sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+                                      "report_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                                      "publication_authorized": True, "verified_run": "101", "main_sha": SHA,
+                                      "head_sha": SHA,
+                                      "verification": "downloaded_actual_report_artifact; current_main_run_identity"})
     delivery = {"enabled": True, "sender": mail.TARGET, "recipient": mail.TARGET, "holdings": [],
                 "outbox_path": str(config.work / "mail.sqlite3"), "hermes_home": str(tmp_path / "hermes"),
                 "notification_policy": "ai_approved_only",

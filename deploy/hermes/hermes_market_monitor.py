@@ -517,11 +517,26 @@ def retire_ai_analysis(receipt: dict, *, now: datetime, work: Path, reason: str,
                               "report_sha256": receipt.get("report_sha256")}
 
 
+def report_publication_authorized(receipt: dict) -> bool:
+    """A healthy baseline readback is separate from current-main publication."""
+    return (receipt.get("publication_authorized") is True
+            and receipt.get("status") in {"ok", "degraded"}
+            and receipt.get("outcome") in {"no_change", "no_newer_report", "published_change", "recovered_local_delivery"}
+            and re.fullmatch(r"[a-f0-9]{40}", str(receipt.get("main_sha"))) is not None
+            and receipt.get("head_sha") == receipt["main_sha"]
+            and re.fullmatch(r"[1-9][0-9]*", str(receipt.get("verified_run"))) is not None
+            and receipt.get("verification") in {
+                "downloaded_actual_report_artifact; current_main_run_identity",
+                "existing_notified_baseline_readback; current_main_run_identity",
+                "sealed_current_main_report_readback; current_main_run_identity"})
+
+
 def poll(config=Config(), *, now=None, github=None):
     now = (now or datetime.now(UTC)).astimezone(UTC)
     github = github or GitHubHelper(config)
     previous_receipt = read_json(config.receipt, optional=True)
-    receipt = {**previous_receipt, "completed_at": now.isoformat(), "outcome": "failure", "status": "error"}
+    receipt = {**previous_receipt, "poll_started_at": now.isoformat(), "completed_at": now.isoformat(),
+               "outcome": "failure", "status": "error", "publication_authorized": False}
     retire_ai_analysis(receipt, now=now, work=config.work, reason="report_verification_pending")
     # A receipt describes this invocation. Keep the prior failure only in the
     # deduplication state; recovered polls must not retain old failure details.
@@ -573,13 +588,15 @@ def poll(config=Config(), *, now=None, github=None):
             receipt.update(status="degraded" if source_gaps(report) else "ok", outcome="no_newer_report", source_report=str(source_path),
                            verified_run=run_id, head_sha=main_sha, report_sha256=sealed_hash,
                            report_completed_at=completed.isoformat(), verification="existing_notified_baseline_readback; current_main_run_identity",
-                           artifact_downloaded=False, source_gaps=source_gaps(report), last_failure_code=None)
+                           artifact_downloaded=False, source_gaps=source_gaps(report), last_failure_code=None,
+                           publication_authorized=True)
             return finish_quiet(config, receipt, report, now)
         if previous_receipt.get("verified_run") == run_id and previous_receipt.get("head_sha") == main_sha:
             report, sealed_hash = read_verified_report(source_path, previous_receipt, ledger)
             validate_report(report, now)
             receipt.update(status="degraded" if source_gaps(report) else "ok", outcome="no_newer_report", last_failure_code=None,
-                           report_sha256=sealed_hash, source_gaps=source_gaps(report))
+                           report_sha256=sealed_hash, source_gaps=source_gaps(report), publication_authorized=True,
+                           verification="sealed_current_main_report_readback; current_main_run_identity")
             return finish_quiet(config, receipt, report, now)
         run = github("run", run_id)
         if (str(run.get("id")) != run_id or run.get("path") != WORKFLOW_PATH or run.get("head_branch") != "main"
@@ -615,7 +632,7 @@ def poll(config=Config(), *, now=None, github=None):
                        verified_run=run_id, head_sha=main_sha, artifact_id=str(artifacts[0]["id"]),
                        report_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(), report_completed_at=completed.isoformat(),
                        verification="downloaded_actual_report_artifact; current_main_run_identity", artifact_downloaded=True,
-                       source_gaps=source_gaps(report), last_failure_code=None)
+                       source_gaps=source_gaps(report), last_failure_code=None, publication_authorized=True)
         notice = ""
         if changes or changed_ipos or maintenance:
             fingerprint = hashlib.sha256(json.dumps([run_id, changes, changed_ipos, maintenance], sort_keys=True).encode()).hexdigest()[:16]
@@ -637,7 +654,8 @@ def poll(config=Config(), *, now=None, github=None):
         write_json(config.receipt, receipt)
         return notice
     except CheckError as error:
-        receipt.update(status="error", outcome="failure", failure_code=error.code, message=error.message)
+        receipt.update(status="error", outcome="failure", failure_code=error.code, message=error.message,
+                       publication_authorized=False)
         retire_ai_analysis(receipt, now=now, work=config.work, reason=error.code, blocked=True)
         notice = ""
         if previous_receipt.get("last_failure_code") != error.code:
@@ -734,6 +752,12 @@ def main():
                 output = email_output
             else:
                 output += email_output
+            # The bridge reads this receipt only after the complete poll,
+            # quote/analysis and reconciliation/delivery work has returned.
+            # Source report dates and the poll's start remain unchanged.
+            receipt = read_json(config.receipt)
+            receipt["completed_at"] = datetime.now(UTC).isoformat()
+            write_json(config.receipt, receipt)
         if output:
             print(output, end="")
         return 0  # receipt errors are deduped; Hermes wrapper can mark native failure.
