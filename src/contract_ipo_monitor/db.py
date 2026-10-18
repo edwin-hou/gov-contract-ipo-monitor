@@ -11,7 +11,7 @@ from html import escape
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from .models import AlertPayload, Candidate, GateDecision
+from .models import AlertPayload, Candidate, ContractEvidence, GateDecision, contract_source_payload
 from .report_history import original_report_bytes, report_history_rows
 
 SCHEMA = """
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS outbox_messages(
 CREATE TABLE IF NOT EXISTS collector_state(name TEXT PRIMARY KEY, cursor TEXT, last_success_at TEXT, last_error TEXT, disabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS dead_letters(id INTEGER PRIMARY KEY, component TEXT NOT NULL, source TEXT, external_id TEXT, payload_json TEXT, error TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS contract_evidence_source_record ON contract_evidence(source_record_id);
+CREATE INDEX IF NOT EXISTS contract_evidence_award_version ON contract_evidence(award_id,id DESC);
 CREATE INDEX IF NOT EXISTS contract_evidence_source_identity_version ON contract_evidence(
  json_extract(version_json, '$.source'), json_extract(version_json, '$.source_record_id'), id DESC);
 CREATE INDEX IF NOT EXISTS listing_signals_source_record ON listing_signals(source_record_id);
@@ -184,7 +185,8 @@ class Database:
             if payload is not None:
                 # The write transaction fences classification changes during
                 # an awaited quote lookup. Recheck authority before queuing.
-                if not self.listing_is_current_authorized(candidate.listing):
+                if (not self.listing_is_current_authorized(candidate.listing)
+                        or not self.contract_is_current_authorized(candidate.contract)):
                     return False, False
             if payload is not None and conn.execute("SELECT 1 FROM alerts WHERE fingerprint=?", (payload.fingerprint,)).fetchone():
                 return False, True
@@ -243,7 +245,7 @@ class Database:
             while True:
                 row = conn.execute(
                 """
-                SELECT message.*,alert.signal_id,trace.listing_json FROM outbox_messages message
+                SELECT message.*,alert.signal_id,trace.listing_json,trace.contract_json FROM outbox_messages message
                 JOIN alerts alert ON alert.id=message.alert_id
                 LEFT JOIN candidate_matches trace ON trace.fingerprint=alert.fingerprint
                 WHERE message.status='pending'
@@ -259,6 +261,11 @@ class Database:
                 # its original trade claim and retain their independent lease.
                 if row["correction_key"] is not None:
                     break
+                try:
+                    contract_authorized = row["contract_json"] is not None and self.contract_is_current_authorized(
+                        ContractEvidence.model_validate_json(row["contract_json"]))
+                except (ValueError, TypeError):
+                    contract_authorized = False
                 if row["listing_json"] is not None:
                     from .models import ListingSignal
                     try:
@@ -269,9 +276,10 @@ class Database:
                     stored = [item for item in self.all_listing_signals() if item.signal_id == row["signal_id"]]
                     authorized = (not stored or any(item.signal_id == row["signal_id"] and item.active
                         for item in self.load_listing_signals())) and row["signal_id"] not in self.sec_issuer_reviews()
-                if authorized:
+                if authorized and contract_authorized:
                     break
-                conn.execute("UPDATE outbox_messages SET status='cancelled',lease_until=NULL,last_error='listing_authority_withheld' WHERE id=?", (row["id"],))
+                reason = "listing_authority_withheld" if not authorized else "contract_authority_withheld"
+                conn.execute("UPDATE outbox_messages SET status='cancelled',lease_until=NULL,last_error=? WHERE id=?", (reason, row["id"]))
                 conn.execute("UPDATE alerts SET status='withheld' WHERE id=? AND status='queued'", (row["alert_id"],))
             conn.execute(
                 "UPDATE outbox_messages SET status='leased', lease_until=? WHERE id=?",
@@ -364,25 +372,79 @@ class Database:
             )
             return int(cursor.lastrowid)
 
-    def load_contracts(self) -> list[Any]:
-        from .models import ContractEvidence
+    def _current_contract_versions(self, *, award_id: str | None = None) -> list[ContractEvidence]:
         with self.connect() as conn:
-            rows = conn.execute("SELECT version_json FROM contract_evidence ORDER BY id DESC").fetchall()
+            rows = (conn.execute("SELECT version_json FROM contract_evidence ORDER BY id DESC").fetchall()
+                    if award_id is None else conn.execute(
+                        "SELECT version_json FROM contract_evidence WHERE award_id=? ORDER BY id DESC", (award_id,)).fetchall())
         seen: set[tuple[str, str]] = set()
-        result: list[Any] = []
+        result: list[ContractEvidence] = []
         for row in rows:
             item = ContractEvidence.model_validate_json(row["version_json"])
             key = (item.source, item.source_record_id)
             if key not in seen:
                 seen.add(key)
                 result.append(item)
-        latest: dict[str, Any] = {}
-        for item in result:
+        return result
+
+    @staticmethod
+    def _latest_award_status(versions: Sequence[ContractEvidence]) -> dict[str, ContractEvidence]:
+        latest: dict[str, ContractEvidence] = {}
+        for item in versions:
+            # Deleting one transaction retracts that source record. It cannot
+            # assert that the whole award is active or lift another record's
+            # later cancellation. Keep the existing source timestamp ordering;
+            # newest stored versions retain the existing equal-time tiebreak.
+            if item.deleted or item.status.strip().lower() == "deleted":
+                continue
             previous = latest.get(item.award_id)
             if previous is None or (item.published_at or item.retrieved_at) > (previous.published_at or previous.retrieved_at):
                 latest[item.award_id] = item
+        return latest
+
+    def load_contracts(self, *, award_id: str | None = None) -> list[Any]:
+        result = self._current_contract_versions(award_id=award_id)
+        latest = self._latest_award_status(result)
         cancelled_awards = {key for key, item in latest.items() if item.cancelled or item.status.strip().lower() in {"cancelled", "rescinded"}}
         return [item for item in result if item.award_id not in cancelled_awards or item.cancelled or item.deleted or item.status.strip().lower() in {"cancelled", "deleted", "rescinded"}]
+
+    def contract_is_current_version(self, evidence: ContractEvidence) -> bool:
+        """Check source identity before applying either an award or a withdrawal."""
+        with self.connect() as conn:
+            stored = conn.execute("""SELECT version_json FROM contract_evidence
+                WHERE json_extract(version_json,'$.source')=? AND json_extract(version_json,'$.source_record_id')=?
+                ORDER BY id DESC LIMIT 1""", (evidence.source, evidence.source_record_id)).fetchone()
+            known_award = (conn.execute("SELECT 1 FROM contract_evidence WHERE award_id=? LIMIT 1", (evidence.award_id,)).fetchone()
+                           if stored is None else None)
+        # Direct gate evaluation remains supported for new evidence. Once an
+        # identity is stored, only the current stored source content authorizes.
+        if stored is None:
+            return known_award is None
+        return contract_source_payload(ContractEvidence.model_validate_json(stored[0])) == contract_source_payload(evidence)
+
+    def contract_is_current_authorized(self, evidence: ContractEvidence) -> bool:
+        """Do not revive a withdrawn source version by replaying its old bytes."""
+        if evidence.cancelled or evidence.deleted or evidence.status.strip().lower() in {"cancelled", "deleted", "rescinded"}:
+            return False
+        if not self.contract_is_current_version(evidence):
+            return False
+        expected = contract_source_payload(evidence)
+        current = self.load_contracts(award_id=evidence.award_id)
+        if not current:
+            return True  # Standalone gate evaluation of an unstored new award.
+        return any(contract_source_payload(item) == expected
+                   for item in current)
+
+    def contract_correction_is_current_authorized(self, evidence: ContractEvidence) -> bool:
+        """Use transaction scope for deletions and award chronology for cancellations."""
+        if not self.contract_is_current_version(evidence):
+            return False
+        if evidence.deleted or evidence.status.strip().lower() == "deleted":
+            return True
+        if not (evidence.cancelled or evidence.status.strip().lower() in {"cancelled", "rescinded"}):
+            return False
+        current = self._latest_award_status(self._current_contract_versions(award_id=evidence.award_id)).get(evidence.award_id)
+        return current is not None and contract_source_payload(current) == contract_source_payload(evidence)
 
     def load_listing_signals(self) -> list[Any]:
         result = self.all_listing_signals()
@@ -403,6 +465,10 @@ class Database:
             else item for item in result]
         return [item for item in result if not any(self.listing_is_superseded(item, other) for other in result)]
 
+    def listing_is_current_version(self, signal: Any) -> bool:
+        stored = [item for item in self.all_listing_signals() if item.signal_id == signal.signal_id]
+        return not stored or any(item == signal for item in stored)
+
     def listing_is_current_authorized(self, signal: Any) -> bool:
         if not signal.active or signal.status.strip().lower() in {"withdrawn", "terminated", "abandoned", "rejected", "closed"}:
             return False
@@ -410,8 +476,37 @@ class Database:
         if (self.sec_issuer_hold_reason(signal, reviews)
                 or (signal.cik, signal.registration_id) in self.sec_issuer_held_registrations(reviews)):
             return False
-        stored = [item for item in self.all_listing_signals() if item.signal_id == signal.signal_id]
+        current = self.all_listing_signals()
+        # A standalone gate trace may predate persisted listing ingestion. A
+        # later related/scoped withdrawal still revokes its authority, including
+        # a crash before correction publication.
+        if any(self.listing_is_superseded(signal, other) for other in current):
+            return False
+        stored = [item for item in current if item.signal_id == signal.signal_id]
         return not stored or any(item == signal and item.active for item in self.load_listing_signals())
+
+    def listing_correction_is_current_authorized(self, signal: Any, target_signal_id: str) -> bool:
+        """A current withdrawal may correct only the targets it still supersedes."""
+        inactive = not signal.active or signal.status.strip().lower() in {"withdrawn", "terminated", "abandoned", "rejected", "closed"}
+        if not inactive or not self.listing_is_current_version(signal):
+            return False
+        if target_signal_id == signal.signal_id:
+            return True
+        targets = [item for item in self.all_listing_signals() if item.signal_id == target_signal_id]
+        if not targets:
+            # Legacy standalone gates retain their original listing bytes in
+            # the alert trace. Missing current ingestion is not permission to
+            # retract a newer trace; all known target traces must be covered.
+            from .models import ListingSignal
+            with self.connect() as conn:
+                rows = conn.execute("""SELECT trace.listing_json FROM candidate_matches trace
+                    JOIN alerts alert ON alert.fingerprint=trace.fingerprint
+                    WHERE alert.signal_id=?""", (target_signal_id,)).fetchall()
+            try:
+                targets = [ListingSignal.model_validate_json(row[0]) for row in rows]
+            except (ValueError, TypeError):
+                return False
+        return bool(targets) and all(self.listing_is_superseded(item, signal) for item in targets)
 
     def sec_issuer_reviews(self) -> dict[str, dict[str, Any]]:
         """Read classification authority without altering original evidence."""
@@ -501,10 +596,16 @@ class Database:
             return True
         return bool(other.cik and item.cik and other.cik.lstrip("0") == item.cik.lstrip("0") and other.registration_id and other.registration_id == item.registration_id)
 
-    def enqueue_correction(self, *, signal_id: str | None = None, award_id: str | None = None, company_name: str | None = None, contract_record_id: str | None = None, contract_source: str | None = None, reason: str, source_url: str, created_at: datetime) -> int:
+    def enqueue_correction(self, *, signal_id: str | None = None, award_id: str | None = None, company_name: str | None = None, contract_record_id: str | None = None, contract_source: str | None = None, reason: str, source_url: str, created_at: datetime, contract_authority: ContractEvidence | None = None, listing_authority: Any = None) -> int:
         if not signal_id and not award_id:
             return 0
         with self.transaction() as conn:
+            # A replayed withdrawal cannot retract a later active source
+            # version. Hold the writer fence through the correction update.
+            if ((contract_authority is not None and not self.contract_correction_is_current_authorized(contract_authority))
+                    or (listing_authority is not None and (not signal_id
+                        or not self.listing_correction_is_current_authorized(listing_authority, signal_id)))):
+                return 0
             clauses: list[str] = []
             params: list[Any] = []
             if signal_id:

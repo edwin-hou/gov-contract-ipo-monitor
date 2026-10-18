@@ -65,6 +65,14 @@ class ContractEvidence(BaseModel):
     deleted: bool = False
 
 
+def contract_source_payload(evidence: ContractEvidence) -> dict[str, Any]:
+    """Identity of source content, independent of repeated request timestamps."""
+    payload = evidence.model_dump(mode="json")
+    payload.pop("retrieved_at", None)
+    payload.pop("published_at", None)
+    return payload
+
+
 class ListingSignal(BaseModel):
     model_config = ConfigDict(frozen=True)
 

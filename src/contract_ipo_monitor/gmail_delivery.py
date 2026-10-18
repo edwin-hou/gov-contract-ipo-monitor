@@ -315,8 +315,11 @@ class GmailOAuthTransport:
             return dict(receipt)
         return self._reconcile(identity, expected, expected_raw, token, after_send=True)
 
-    def deliver(self, raw_message: bytes, recipient: str, rfc822_id: str) -> dict:
+    def deliver(self, raw_message: bytes, recipient: str, rfc822_id: str, *,
+                not_after: datetime | None = None) -> dict:
         """POST at most once per identity; caller persists uncertainty across restart."""
+        if not_after is not None and (not isinstance(not_after, datetime) or not_after.utcoffset() is None):
+            raise DefinitiveDeliveryFailure("invalid_message_authorization_deadline")
         identity, expected = self._expected(raw_message, recipient, rfc822_id)
         if identity in self._verified:
             known = self._verified[identity]
@@ -334,6 +337,11 @@ class GmailOAuthTransport:
             return receipt
         if identity in self._attempted:
             raise UnknownDelivery("gmail_prior_attempt_unresolved")
+        # Credential refresh, profile validation and sent-mail reconciliation
+        # can consume the remainder of a quote's authority. Reconciliation is
+        # allowed after expiry, but an unaccepted message may no longer POST.
+        if not_after is not None and self._time() >= not_after:
+            raise DefinitiveDeliveryFailure("message_authorization_expired")
         # Fence BEFORE entering the network. A later timeout never clears it.
         self._attempted.add(identity)
         try:

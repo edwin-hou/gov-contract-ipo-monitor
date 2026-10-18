@@ -117,6 +117,27 @@ def test_daily_budget_bounds_calls_across_separate_store_instances(tmp_path):
     assert second.claim("two",DEFAULT_MODEL,NOW+timedelta(days=1),daily_limit=1)["cached"] is False
 
 
+@pytest.mark.parametrize("limit", [True, 0, 5, 8])
+def test_configuration_cannot_exceed_four_authorized_attempts_per_utc_day(tmp_path, limit):
+    store = AnalystStore(tmp_path / "analyst.db")
+    with pytest.raises(ValueError, match="Invalid daily analyst limit"):
+        store.claim("new", DEFAULT_MODEL, NOW, daily_limit=limit)
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM analyst_calls").fetchone()[0] == 0
+
+
+def test_cached_verdict_keeps_original_review_authorization_deadline(tmp_path):
+    store = AnalystStore(tmp_path / "analyst.db")
+    first = evaluate(report(), store, infer, now=NOW)
+    data = report()
+    later = NOW+timedelta(minutes=2)
+    data["completed_at"] = later.isoformat()
+    data["trade_ideas"][0]["current_quote"]["observed_at"] = later.isoformat()
+    cached = evaluate(data, store, lambda _: pytest.fail("Unchanged evidence repeated inference"), now=later)
+    assert cached["approved"] and not cached["model_called"]
+    assert cached["review_expires_at"] == first["review_expires_at"] == (NOW+timedelta(hours=6)).isoformat()
+
+
 @pytest.mark.parametrize("offset", [-5, 9])
 def test_daily_claim_budget_uses_utc_day_for_aware_local_input(tmp_path, offset):
     store = AnalystStore(tmp_path / "analyst.db")

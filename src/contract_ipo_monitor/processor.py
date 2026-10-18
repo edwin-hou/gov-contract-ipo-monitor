@@ -8,19 +8,7 @@ from .archive import EvidenceArchive
 from .db import Database
 from .entity import EntityResolver
 from .gate import AlertGate, GateResult
-from .models import Candidate, ContractEvidence, ListingSignal, MarketSnapshot
-
-
-def _stable_contract_payload(evidence: ContractEvidence) -> dict:
-    """Return the source-content identity without observation timestamps.
-
-    `retrieved_at`/`published_at` may be synthesized at collection time. The raw payload hash
-    and normalized substantive fields are what determine whether a source record changed.
-    """
-    payload = evidence.model_dump(mode="json")
-    payload.pop("retrieved_at", None)
-    payload.pop("published_at", None)
-    return payload
+from .models import Candidate, ContractEvidence, ListingSignal, MarketSnapshot, contract_source_payload as _stable_contract_payload
 
 
 class EvidenceProcessor:
@@ -58,16 +46,18 @@ class EvidenceProcessor:
             if self.db.listing_is_superseded(previous, signal):
                 targets.add(previous.signal_id)
         for signal_id in targets:
-            self.db.enqueue_correction(signal_id=signal_id, reason=f"Listing signal changed to {signal.status}.", source_url=signal.source_url, created_at=observed)
+            self.db.enqueue_correction(signal_id=signal_id, reason=f"Listing signal changed to {signal.status}.", source_url=signal.source_url, created_at=observed, listing_authority=signal)
 
     def _contract_correction(self, evidence: ContractEvidence, observed: datetime) -> None:
+        if not self.db.contract_correction_is_current_authorized(evidence):
+            return
         deleted = evidence.deleted or evidence.status.strip().lower() == "deleted"
         self.db.enqueue_correction(
             award_id=evidence.award_id,
             contract_record_id=evidence.source_record_id if deleted else None,
             contract_source=evidence.source if deleted else None,
             reason=f"Contract {'transaction' if deleted else 'status'} changed to {evidence.status}.",
-            source_url=evidence.source_url, created_at=observed,
+            source_url=evidence.source_url, created_at=observed, contract_authority=evidence,
         )
 
     def ingest_contract(self, evidence: ContractEvidence) -> list[GateResult]:
@@ -79,8 +69,12 @@ class EvidenceProcessor:
             self.archive.write(evidence.source, evidence.source_record_id, source_payload, observed_at=observed)
         if needs_storage:
             self.db.store_contract_evidence(evidence, source_record_id=inserted.row_id, created_at=observed)
+        if not self.db.contract_is_current_version(evidence):
+            return []
         if evidence.cancelled or evidence.deleted or evidence.status.lower() in {"cancelled", "deleted", "rescinded"}:
             self._contract_correction(evidence, observed)
+            return []
+        if not self.db.contract_is_current_authorized(evidence):
             return []
         results: list[GateResult] = []
         for signal in self.db.load_listing_signals():
@@ -99,6 +93,8 @@ class EvidenceProcessor:
             self.archive.write(signal.source, external_id, signal.model_dump(mode="json"), observed_at=observed)
         if needs_storage:
             self.db.store_listing_signal(signal, source_record_id=inserted.row_id, created_at=observed)
+        if not self.db.listing_is_current_version(signal):
+            return []
         if not signal.active or signal.status.lower() in {"withdrawn", "terminated", "abandoned", "rejected"}:
             self._listing_correction(signal, observed)
             return []
@@ -121,8 +117,12 @@ class EvidenceProcessor:
             self.archive.write(evidence.source, evidence.source_record_id, source_payload, observed_at=observed)
         if needs_storage:
             self.db.store_contract_evidence(evidence, source_record_id=inserted.row_id, created_at=observed)
+        if not self.db.contract_is_current_version(evidence):
+            return []
         if evidence.cancelled or evidence.deleted or evidence.status.lower() in {"cancelled", "deleted", "rescinded"}:
             self._contract_correction(evidence, observed)
+            return []
+        if not self.db.contract_is_current_authorized(evidence):
             return []
         results: list[GateResult] = []
         for signal in self.db.load_listing_signals():
@@ -139,6 +139,8 @@ class EvidenceProcessor:
             self.archive.write(signal.source, external_id, signal.model_dump(mode="json"), observed_at=observed)
         if needs_storage:
             self.db.store_listing_signal(signal, source_record_id=inserted.row_id, created_at=observed)
+        if not self.db.listing_is_current_version(signal):
+            return []
         if not signal.active or signal.status.lower() in {"withdrawn", "terminated", "abandoned", "rejected"}:
             self._listing_correction(signal, observed)
             return []

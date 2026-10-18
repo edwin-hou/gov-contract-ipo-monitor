@@ -4,14 +4,16 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from contract_ipo_monitor.sources.http import TransientHTTPError
+from contract_ipo_monitor.sources.http import PermanentHTTPError, TransientHTTPError
 from contract_ipo_monitor.sources.usaspending import (
     IncompleteUSAspendingCollection,
     USAspendingCollector,
+    USAspendingRecipientResolver,
 )
 from contract_ipo_monitor.config import Settings
 from contract_ipo_monitor.db import Database
 from contract_ipo_monitor.health import HealthRegistry
+from contract_ipo_monitor.research import report_markdown
 from contract_ipo_monitor.service import MonitorService
 
 
@@ -37,8 +39,10 @@ def response(rows, *, more=False):
 class Client:
     def __init__(self, outcomes):
         self.outcomes = iter(outcomes)
+        self.calls = []
 
     async def request_json(self, *_args, **_kwargs):
+        self.calls.append(dict(_kwargs.get("json", {})))
         value = next(self.outcomes)
         if isinstance(value, Exception):
             raise value
@@ -122,6 +126,159 @@ async def test_duplicate_rows_do_not_create_duplicate_partial_observations():
     assert len(raised.value.records) == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", (None, {}, {"hasNext": None}, {"hasNext": 0}, {"hasNext": "false"}, []))
+async def test_missing_or_invalid_pagination_receipt_retains_awards_without_claiming_completion(metadata):
+    payload = {"results": [award(1)]}
+    if metadata is not None:
+        payload["page_metadata"] = metadata
+    collector = USAspendingCollector(Client([payload]))
+    with pytest.raises(IncompleteUSAspendingCollection, match="pagination") as raised:
+        await collector.collect(observed_at=NOW)
+    assert [record.source_record_id for record in raised.value.records] == ["RECORD-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_page", (3, True, 2.9, "2.5", "not-a-page"))
+async def test_next_page_must_be_the_immediate_integer_successor(next_page):
+    payload = response([award(1)], more=True)
+    payload["page_metadata"]["next"] = next_page
+    collector = USAspendingCollector(Client([payload, response([])]))
+    with pytest.raises(IncompleteUSAspendingCollection, match="pagination") as raised:
+        await collector.collect(observed_at=NOW)
+    assert raised.value.page == 1
+    assert len(raised.value.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_response_page_mismatch_cannot_be_used_as_a_completion_receipt():
+    payload = response([award(1)])
+    payload["page_metadata"]["page"] = 2
+    collector = USAspendingCollector(Client([payload]))
+    with pytest.raises(IncompleteUSAspendingCollection, match="pagination"):
+        await collector.collect(observed_at=NOW)
+
+
+@pytest.mark.asyncio
+async def test_documented_search_after_cursor_avoids_capped_total_false_completion():
+    calls = []
+
+    class CappedEndpoint:
+        async def request_json(self, *_args, **kwargs):
+            payload = dict(kwargs["json"])
+            calls.append(payload)
+            cursor = payload.get("last_record_unique_id")
+            if payload["page"] == 1:
+                identity, more = 1, True
+            elif cursor is None:
+                # Same source defect as the 10,000-record cap: an offset page
+                # says false while a sequential cursor still has more rows.
+                identity, more = 2, False
+            else:
+                identity = cursor + 1
+                more = identity < 3
+            return {"results": [award(identity)], "page_metadata": {
+                "page": payload["page"], "hasNext": more,
+                "last_record_unique_id": identity if more else None,
+                "last_record_sort_value": f"2026-10-0{6-identity}" if more else "None",
+            }}
+
+    collector = USAspendingCollector(CappedEndpoint())
+    records = await collector.collect(observed_at=NOW, limit=1)
+    assert [record.award_id for record in records] == ["AWARD-1", "AWARD-2", "AWARD-3"]
+    assert [call.get("last_record_unique_id") for call in calls] == [None, 1, 2]
+    assert [call.get("last_record_sort_value") for call in calls] == [None, "2026-10-05", "2026-10-04"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_full_page_false_requires_a_bounded_tail_probe():
+    collector = USAspendingCollector(Client([response([award(1)]), response([award(2)]), response([])]))
+    records = await collector.collect(observed_at=NOW, limit=1)
+    assert [record.award_id for record in records] == ["AWARD-1", "AWARD-2"]
+
+
+@pytest.mark.asyncio
+async def test_full_page_false_at_budget_cannot_be_claimed_as_complete():
+    collector = USAspendingCollector(Client([response([award(1)])]))
+    with pytest.raises(IncompleteUSAspendingCollection, match="refusing to truncate silently") as raised:
+        await collector.collect(observed_at=NOW, limit=1, max_pages=1)
+    assert len(raised.value.records) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity,value", ((True, "2026-10-05"), (-1, "2026-10-05"), (1, None), (None, "2026-10-05"), (1, [])))
+async def test_malformed_cursor_never_silently_falls_back_to_offset_paging(identity, value):
+    payload = response([award(1)], more=True)
+    payload["page_metadata"].update(last_record_unique_id=identity, last_record_sort_value=value)
+    collector = USAspendingCollector(Client([payload]))
+    with pytest.raises(IncompleteUSAspendingCollection, match="cursor"):
+        await collector.collect(observed_at=NOW)
+    assert len(collector.partial_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_cursor_preserves_new_rows_without_claiming_progress():
+    pages = [response([award(1)], more=True), response([award(2)], more=True)]
+    for page in pages:
+        page["page_metadata"].update(last_record_unique_id=1, last_record_sort_value="2026-10-05")
+    pages[1]["page_metadata"]["next"] = 3
+    collector = USAspendingCollector(Client(pages))
+    with pytest.raises(IncompleteUSAspendingCollection, match="cursor"):
+        await collector.collect(observed_at=NOW, limit=1)
+    assert len(collector.partial_records) == 2
+
+
+@pytest.mark.asyncio
+async def test_recipient_identity_must_be_unique_across_all_source_pages():
+    source = Client([
+        response([{"name": "Example Manufacturing Inc.", "uei": "FIRST"}], more=True),
+        response([{"name": "Example Manufacturing Corporation", "uei": "SECOND"}]),
+    ])
+    assert await USAspendingRecipientResolver(source).resolve_uei("Example Manufacturing Inc.") is None
+
+
+@pytest.mark.asyncio
+async def test_incomplete_recipient_lookup_never_caches_a_positive_or_missing_identity():
+    source = Client([
+        response([{"name": "Example Manufacturing Inc.", "uei": "FIRST"}], more=True),
+        response([{"name": "Example Manufacturing Inc.", "uei": "VERIFIED"}]),
+    ])
+    resolver = USAspendingRecipientResolver(source, max_pages=1)
+    with pytest.raises(RuntimeError, match="page budget"):
+        await resolver.resolve_uei("Example Manufacturing Inc.")
+    assert await resolver.resolve_uei("Example Manufacturing Inc.") == "VERIFIED"
+
+
+@pytest.mark.asyncio
+async def test_transient_cursor_outage_uses_same_endpoint_offset_scan_with_tail_proof_and_warning():
+    first = response([award(1)], more=True)
+    first["page_metadata"].update(last_record_unique_id=1, last_record_sort_value="2026-10-05")
+    source = Client([first, TransientHTTPError("HTTP 503"), response([award(2)]), response([]), response([])])
+    collector = USAspendingCollector(source)
+    records = await collector.collect(observed_at=NOW, limit=1)
+    assert [record.award_id for record in records] == ["AWARD-1", "AWARD-2"]
+    assert [call["page"] for call in source.calls] == [1, 2, 2, 3]
+    assert [call.get("last_record_unique_id") for call in source.calls] == [None, 1, None, None]
+    assert len(collector.pagination_warnings) == 1
+    assert "HTTP 503" in collector.pagination_warnings[0] and "tail verification" in collector.pagination_warnings[0]
+    assert await collector.collect(observed_at=NOW) == []
+    assert collector.pagination_warnings == []
+
+
+@pytest.mark.asyncio
+async def test_cursor_auth_denial_never_switches_request_shape_or_claims_completion():
+    first = response([award(1)], more=True)
+    first["page_metadata"].update(last_record_unique_id=1, last_record_sort_value="2026-10-05")
+    denial = PermanentHTTPError(403, "Forbidden")
+    source = Client([first, denial])
+    collector = USAspendingCollector(source)
+    with pytest.raises(IncompleteUSAspendingCollection, match="HTTP 403") as failure:
+        await collector.collect(observed_at=NOW, limit=1)
+    assert len(source.calls) == 2 and source.calls[1]["last_record_unique_id"] == 1
+    assert failure.value.__cause__ is denial
+    assert len(collector.partial_records) == 1 and collector.pagination_warnings == []
+
+
 def service(tmp_path, source, *, timeout=600):
     class EmptySEC:
         async def collect(self, **_kwargs):
@@ -194,3 +351,63 @@ async def test_repeated_partial_run_versions_do_not_duplicate_retained_awards(tm
     assert subject.db.count("contract_evidence") == 1
     assert subject.db.count("source_records") == 1
     assert subject.last_report["history"]["contract_records"] == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_offset_recovery_saves_warning_without_losing_success_watermark_and_next_clean_run_resets_it(tmp_path):
+    first = response([award(1)], more=True)
+    first["page_metadata"].update(last_record_unique_id=1, last_record_sort_value="2026-10-05")
+    collector = USAspendingCollector(Client([
+        first, TransientHTTPError("HTTP 503"), response([award(2)]), response([]),
+    ]))
+    subject = service(tmp_path, collector)
+    counts = await subject.run_once()
+    report = subject.research.latest_run()
+    assert counts["contracts"] == 2 and subject.db.count("contract_evidence") == 2
+    assert report["status"] == "degraded"
+    assert report["health"]["collectors"]["usaspending"]["ok"] is True
+    assert report["health"]["ready"] is True
+    receipt = report["usaspending_collection"]
+    assert receipt["status"] == "degraded" and receipt["scan_completed"] is True
+    assert receipt["error"] is None and len(receipt["warnings"]) == 1
+    assert "HTTP 503" in receipt["warnings"][0]
+    coverage = next(item for item in report["coverage"] if item["source"] == "usaspending")
+    assert coverage["status"] == "degraded" and coverage["limitations"] == receipt["warnings"]
+    with subject.db.connect() as conn:
+        state = conn.execute("SELECT * FROM collector_state WHERE name='usaspending'").fetchone()
+    assert state["last_success_at"] == NOW.isoformat() and state["cursor"] == NOW.date().isoformat()
+    assert state["last_error"] is None
+    readable = report_markdown(report)
+    assert "USAspending pagination" in readable and "HTTP 503" in readable
+    assert "The award scan completed" in readable
+    await subject.run_once()
+    clean = subject.research.latest_run()
+    assert clean["status"] == "ok" and clean["usaspending_collection"]["warnings"] == []
+    assert clean["usaspending_collection"]["status"] == "ok"
+    assert "HTTP 503" not in report_markdown(clean)
+    assert len(receipt["warnings"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_offset_recovery_saves_warning_and_error_without_advancing_success(tmp_path):
+    first = response([award(1)], more=True)
+    first["page_metadata"].update(last_record_unique_id=1, last_record_sort_value="2026-10-05")
+    collector = USAspendingCollector(Client([
+        first, TransientHTTPError("HTTP 503"), TransientHTTPError("HTTP 502"),
+    ]))
+    subject = service(tmp_path, collector)
+    previous = NOW - timedelta(days=2)
+    subject.db.update_collector_state("usaspending", cursor="previous-complete-window", success_at=previous)
+    await subject.run_once()
+    report = subject.research.latest_run()
+    receipt = report["usaspending_collection"]
+    assert receipt["status"] == "error" and receipt["scan_completed"] is False
+    assert len(receipt["warnings"]) == 1 and "HTTP 502" in receipt["error"]
+    assert report["health"]["collectors"]["usaspending"]["ok"] is False
+    with subject.db.connect() as conn:
+        state = conn.execute("SELECT * FROM collector_state WHERE name='usaspending'").fetchone()
+    assert state["last_success_at"] == previous.isoformat() and state["cursor"] == "previous-complete-window"
+    assert subject.db.count("contract_evidence") == 1
+    readable = report_markdown(report)
+    assert "HTTP 503" in readable and "HTTP 502" in readable
+    assert "The award scan completed" not in readable

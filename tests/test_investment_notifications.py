@@ -157,7 +157,7 @@ def test_uncertain_post_preserves_partial_receipt_and_no_resend(tmp_path):
     calls = []
 
     class Transport:
-        def deliver(self, *args):
+        def deliver(self, *args, not_after):
             calls.append(args)
             raise UnknownDelivery("timeout", partial_receipt={"gmail_message_id": "accepted-but-unread"})
 
@@ -197,7 +197,7 @@ def test_known_preflight_failure_can_retry_but_expired_research_cannot_send(tmp_
     identifier = enqueue(outbox)
 
     class Transport:
-        def deliver(self, *args):
+        def deliver(self, *args, not_after):
             raise DefinitiveDeliveryFailure("preflight_unavailable", safe_to_retry=True)
 
     assert outbox.deliver_once(Transport(), now=NOW)["status"] == "pending"
@@ -206,12 +206,36 @@ def test_known_preflight_failure_can_retry_but_expired_research_cannot_send(tmp_
     assert outbox.get(identifier)["status"] == "expired"
 
 
+def test_expiry_during_provider_preflight_is_normal_expiration_not_rejection(tmp_path):
+    import httpx
+    from types import SimpleNamespace
+    from contract_ipo_monitor.gmail_delivery import GmailOAuthTransport
+    outbox = EmailOutbox(tmp_path / "mail.db")
+    expiry = NOW+timedelta(seconds=10)
+    identifier = enqueue(outbox, expiry=expiry)
+    clock, calls = [NOW], []
+    def handler(request):
+        calls.append(request.method)
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"emailAddress": ADDRESS})
+        assert request.method == "GET" and request.url.path.endswith("/messages")
+        clock[0] = expiry
+        return httpx.Response(200, json={"messages": []})
+    sender = GmailOAuthTransport(expected_sender=ADDRESS, allowed_recipient=ADDRESS,
+        credentials_loader=lambda: SimpleNamespace(token="offline-fixture", granted_scopes=None,
+            scopes=["https://www.googleapis.com/auth/gmail.modify"]),
+        client=httpx.Client(transport=httpx.MockTransport(handler)), now=lambda: clock[0])
+    assert outbox.deliver_once(sender, now=NOW)["status"] == "expired"
+    assert outbox.get(identifier)["error_code"] == "report_expired" and calls == ["GET", "GET"]
+    assert outbox.states() == {"expired": 1}
+
+
 def test_unverified_acceptance_is_not_sent(tmp_path):
     outbox = EmailOutbox(tmp_path / "mail.db")
     identifier = enqueue(outbox)
 
     class Transport:
-        def deliver(self, *args):
+        def deliver(self, *args, not_after):
             return {"gmail_message_id": "accepted"}
 
     assert outbox.deliver_once(Transport(), now=NOW)["status"] == "unknown"
@@ -245,7 +269,7 @@ def test_partial_or_contradictory_provider_receipt_never_marks_sent(tmp_path, ch
     outbox = EmailOutbox(tmp_path / "mail.db")
     identifier = enqueue(outbox)
     class Transport:
-        def deliver(self, *args):
+        def deliver(self, *args, not_after):
             return {**proof(outbox.get(identifier)), **change}
     assert outbox.deliver_once(Transport(), now=NOW)["status"] == "unknown"
     assert outbox.get(identifier)["sent_at"] is None

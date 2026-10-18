@@ -13,6 +13,7 @@ from typing import Any
 
 from .db import Database
 from .report_history import insert_report_payload, migrate_report_history, original_report_bytes, report_history_rows
+from .report_packs import prune_unreferenced_packs
 from .sources.discourse import DiscourseBatch, DiscourseEvidence, evidence_from_dict
 
 
@@ -90,6 +91,7 @@ class ResearchStore:
             cursor = conn.execute("INSERT INTO monitor_runs(completed_at,status,report_json) VALUES(?,?,'')", (report["completed_at"], report["status"]))
             insert_report_payload(conn, cursor.lastrowid, raw)
             conn.execute("DELETE FROM monitor_runs WHERE completed_at < ?", ((datetime.fromisoformat(report["completed_at"]) - timedelta(days=365)).isoformat(),))
+            prune_unreferenced_packs(conn)
 
     def latest_run(self) -> dict[str, Any] | None:
         with closing(self.db.connect()) as conn:
@@ -121,6 +123,15 @@ def report_markdown(report: dict[str, Any]) -> str:
              "## Collection", "", "| Source | Status | Details |", "|---|---|---|"]
     for name, state in report.get("health", {}).get("collectors", {}).items():
         lines.append(f"| {clean(name)} | {'ok' if state.get('ok') else 'degraded'} | {clean(state.get('error') or state.get('last_success_at') or '')} |")
+    usaspending_collection = report.get("usaspending_collection")
+    if isinstance(usaspending_collection, dict) and usaspending_collection.get("warnings"):
+        lines += ["", "### USAspending pagination", "",
+                  "The award scan completed through a verified alternate pagination route. Its successful collection watermark is retained; the route failure below keeps this report degraded."
+                  if usaspending_collection.get("scan_completed") is True else
+                  "The award scan did not complete. Validated partial observations were retained; its previous successful collection watermark was preserved.",
+                  "", *[f"- {clean(warning)}" for warning in items(usaspending_collection.get("warnings"))]]
+        if usaspending_collection.get("error"):
+            lines += ["", "Collection error: " + clean(usaspending_collection["error"])]
     counts = report.get("counts", {})
     if counts:
         activity_labels = {

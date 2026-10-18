@@ -48,6 +48,9 @@ class AlertGate:
 
     def evaluate(self, candidate: Candidate) -> GateResult:
         contract_result = ContractValidator(now=self.now).validate(candidate.contract)
+        if contract_result.passed and not self.db.contract_is_current_authorized(candidate.contract):
+            contract_result = ValidationResult(passed=False, code="contract_authority_withheld",
+                reason="Stored contract evidence has superseded or withdrawn this source version.")
         entity = EntityResolver().resolve(candidate.contract, candidate.listing)
         listing_result = ListingValidator(now=self.now).validate(candidate.listing)
         small_result = SmallCompanyValidator(

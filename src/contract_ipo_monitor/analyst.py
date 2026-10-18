@@ -202,7 +202,7 @@ class AnalystStore:
         return connection
 
     def claim(self, identity: str, model: str, now: datetime, *, daily_limit: int = 4):
-        if type(daily_limit) is not int or not 1 <= daily_limit <= 8:
+        if type(daily_limit) is not int or not 1 <= daily_limit <= 4:
             raise ValueError("Invalid daily analyst limit")
         now = stamp(now)
         with self.connect() as connection:
@@ -211,7 +211,9 @@ class AnalystStore:
             if row:
                 if not timedelta(0) <= now - stamp(row["claimed_at"]) <= timedelta(hours=6):
                     return {"status": "review_expired", "cached": True, "result": None}
-                return {"status": row["status"], "cached": True, "result": json.loads(row["result_json"]) if row["result_json"] else None}
+                return {"status": row["status"], "cached": True,
+                        "review_expires_at": (stamp(row["claimed_at"])+timedelta(hours=6)).isoformat(),
+                        "result": json.loads(row["result_json"]) if row["result_json"] else None}
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             end = start + timedelta(days=1)
             # Old claims may contain an aware local offset. ISO strings cannot
@@ -226,7 +228,8 @@ class AnalystStore:
                 return {"status": "daily_limit", "cached": True, "result": None}
             connection.execute("INSERT INTO analyst_calls(identity,model,claimed_at,status) VALUES(?,?,?,?)",
                                (identity, model, now.isoformat(), "claimed"))
-        return {"status": "claimed", "cached": False, "result": None}
+        return {"status": "claimed", "cached": False, "result": None,
+                "review_expires_at": (now+timedelta(hours=6)).isoformat()}
 
     def settle(self, identity: str, result: dict, *, status: str):
         if status not in {"complete", "unavailable", "invalid_response"}:
@@ -317,4 +320,5 @@ def evaluate(report: dict, store: AnalystStore, infer: Callable, *, now: datetim
                                  "interpretation": "Model judgement about a conditional opportunity, not a calibrated profit prediction."}})
     return {"status": result.get("status", claim["status"]), "approved": approved, "withheld": withheld,
             "model_called": not claim["cached"], "review_identity": identity, "model": model,
+            "review_expires_at": claim.get("review_expires_at"),
             "reviews": result.get("decisions", []), "usage": result.get("usage", {}), "error_code": result.get("error_code")}

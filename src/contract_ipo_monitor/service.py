@@ -156,16 +156,24 @@ class SECSource:
 class SAMSource:
     def __init__(self, collector: SAMCollector):
         self.collector = collector
+        self.partial_records: list[Any] = []
 
     async def collect(self, *, observed_at: datetime) -> list[Any]:
-        records = []
+        self.partial_records = []
         for deleted in (False, True):
-            records.extend(await self.collector.collect(
-                observed_at=observed_at,
-                last_modified_start=observed_at.date() - timedelta(days=2),
-                deleted=deleted,
-            ))
-        return records
+            try:
+                records = await self.collector.collect(
+                    observed_at=observed_at,
+                    last_modified_start=observed_at.date() - timedelta(days=2),
+                    deleted=deleted,
+                )
+            except BaseException:
+                # Preserve completed earlier phases as well as this phase's
+                # validated pages, including on wait_for cancellation.
+                self.partial_records.extend(getattr(self.collector, "partial_records", ()))
+                raise
+            self.partial_records.extend(records)
+        return self.partial_records
 
 
 class MonitorService:
@@ -375,17 +383,13 @@ class MonitorService:
 
         if self.sam_source is not None:
             try:
-                records = await asyncio.wait_for(self.sam_source.collect(observed_at=self.now()), timeout=self.settings.source_timeout_seconds)
-                summary["sam_records"] = len(records)
-                for evidence in records:
-                    results = await self.processor.ingest_contract_async(evidence)
-                    summary["alerts_created"] += sum(int(result.alert_created) for result in results)
-                self.health.mark_success("sam")
-                self.db.update_collector_state("sam", success_at=self.now())
+                await self._poll_sam()
             except Exception as exc:
                 self.health.mark_error("sam", f"{type(exc).__name__}: {exc}", disabled=isinstance(exc, PermanentHTTPError))
                 self.db.update_collector_state("sam", error=f"{type(exc).__name__}: {exc}")
                 logger.exception("SAM collection failed")
+            finally:
+                summary["sam_records"] = self.last_sam_count
 
         for name, source, poll in (("markets", self.markets.price_source, self._poll_markets),
                                    ("world_news", self.markets.world_source, self._poll_world)):
@@ -623,6 +627,24 @@ class MonitorService:
             sentiment.append(summary)
         health = self.health.snapshot()
         coverage = self.research.coverage()
+        usaspending_health = health["collectors"].get("usaspending", {})
+        usaspending_warnings = [item for item in getattr(self.usaspending_source, "pagination_warnings", ())
+                               if isinstance(item, str) and item]
+        usaspending_completed = usaspending_health.get("ok") is True
+        usaspending_status = ("degraded" if usaspending_warnings else "ok") if usaspending_completed else (
+            "error" if usaspending_health.get("error") else "not_attempted")
+        usaspending_collection = {
+            "source": "usaspending", "source_url": USAspendingCollector.URL,
+            "status": usaspending_status, "scan_completed": usaspending_completed,
+            "warnings": usaspending_warnings, "error": usaspending_health.get("error"),
+            "last_success_at": usaspending_health.get("last_success_at"),
+            "collected_count": getattr(self, "last_usaspending_count", 0),
+            "limitations": usaspending_warnings,
+        }
+        # A fully traversed offset scan retains its success watermark. Keep the
+        # failed route visible in the saved report without redefining success
+        # or erasing an actual incomplete-scan error from collector health.
+        coverage.append(usaspending_collection)
         catalog = getattr(getattr(self.sec_source, "collector", None), "catalog", None)
         sec_coverage = catalog.coverage() if catalog is not None else None
         if sec_coverage is not None:
@@ -650,10 +672,11 @@ class MonitorService:
         market_report = self.markets.report(sentiment)
         return serializable({
             **market_report,
-            "completed_at": self.now(), "status": "ok" if health["ready"] and not historic_gaps and (sec_coverage is None or sec_coverage.get("status") == "ok" and not sec_coverage.get("current_feed_truncated_forms")) and all(item.get("ok") for item in health["collectors"].values()) and (not self.settings.markets_enabled or market_report.get("world_coverage_ready") and market_report.get("price_coverage") and not market_report.get("market_restore_errors")) else "degraded",
+            "completed_at": self.now(), "status": "ok" if health["ready"] and not historic_gaps and not usaspending_warnings and (sec_coverage is None or sec_coverage.get("status") == "ok" and not sec_coverage.get("current_feed_truncated_forms")) and all(item.get("ok") for item in health["collectors"].values()) and (not self.settings.markets_enabled or market_report.get("world_coverage_ready") and market_report.get("price_coverage") and not market_report.get("market_restore_errors")) else "degraded",
             "counts": counts or {}, "history": history, "health": health, "ipo_summary": self.tracker.summary(),
             "ipos": self.tracker.candidates(limit=100), "sentiment": sentiment, "coverage": coverage,
             "sec_collection": sec_coverage,
+            "usaspending_collection": usaspending_collection,
             "watchlist": [company.name for company in self.companies()],
             "historic_coverage_gaps": historic_gaps,
             "evidence": [{"source_url": item.source_url, "source_kind": item.source_kind, "text_kind": item.text_kind, "title": item.title, "excerpt": item.text[:300], "company_names": item.company_names, "published_at": item.published_at, "bias_flags": item.bias_flags} for item in records[:100]],
@@ -680,19 +703,35 @@ class MonitorService:
 
     async def _report_loop(self) -> None:
         from .research import write_report
+        # Preserve the prompt startup view, including partial collector status.
+        delay = min(60, self.settings.report_interval_seconds)
         while not self.stop_event.is_set():
             try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=60)
+                # Report assembly creates dated history and trade-idea versions,
+                # even when only evaluation clocks or quote ages have changed.
+                # Keep that explicit cadence separate from collector polling.
+                await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
             except TimeoutError:
                 report = self.create_report()
                 self.markets.store.save_ideas(report["trade_ideas"], observed_at=self.now())
                 self.research.save_run(report)
                 write_report(report, self.settings.database_path.parent / "reports")
+                delay = self.settings.report_interval_seconds
 
     async def _poll_sam(self) -> None:
         if self.sam_source is None:
             return
-        records = await asyncio.wait_for(self.sam_source.collect(observed_at=self.now()), timeout=self.settings.source_timeout_seconds)
+        self.last_sam_count = 0
+        error: Exception | None = None
+        try:
+            records = await asyncio.wait_for(self.sam_source.collect(observed_at=self.now()), timeout=self.settings.source_timeout_seconds)
+        except Exception as exc:
+            error = exc
+            records = getattr(self.sam_source, "partial_records", getattr(exc, "records", ()))
         for record in records:
             await self.processor.ingest_contract_async(record)
+            self.last_sam_count += 1
+        if error is not None:
+            raise error
         self.health.mark_success("sam")
+        self.db.update_collector_state("sam", success_at=self.now(), error=None)

@@ -1,5 +1,5 @@
 import base64
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -89,6 +89,39 @@ def test_verified_send_preserves_semantic_content_despite_delivery_headers_and_i
     assert result["recipient"] == RECIPIENT and result["delivered_label"] == "SENT"
     assert sender.deliver(raw, RECIPIENT, IDENTITY) == result
     assert calls.count("POST") == 1
+
+
+def test_authorization_expiring_during_read_only_preflight_cannot_post():
+    clock, requests = [NOW], []
+    deadline = NOW+timedelta(seconds=10)
+    def handler(request):
+        requests.append(request.method)
+        response = common(request)
+        if request.url.path.endswith("/messages"):
+            clock[0] = deadline
+        assert response is not None, "Expired authorization reached a provider POST"
+        return response
+    sender = transport(handler)
+    sender.now = lambda: clock[0]
+    with pytest.raises(DefinitiveDeliveryFailure) as error:
+        sender.deliver(mime(), RECIPIENT, IDENTITY, not_after=deadline)
+    assert error.value.code == "message_authorization_expired" and not error.value.safe_to_retry
+    assert requests == ["GET", "GET"]
+
+
+def test_expired_send_authorization_still_permits_read_only_delivery_reconciliation():
+    raw, requests = mime(), []
+    def handler(request):
+        requests.append(request.method)
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"emailAddress": SENDER})
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(200, json={"messages": [{"id": "gmail123"}]})
+        assert request.method == "GET"
+        return httpx.Response(200, json=received(raw))
+    sender = transport(handler)
+    assert sender.deliver(raw, RECIPIENT, IDENTITY, not_after=NOW)["gmail_message_id"] == "gmail123"
+    assert requests == ["GET", "GET", "GET"]
 
 
 @pytest.mark.parametrize("failure", ["timeout", "server", "invalid_ack"])

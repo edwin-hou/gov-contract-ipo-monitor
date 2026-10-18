@@ -8,7 +8,7 @@ from urllib.parse import quote
 from typing import Any
 
 from ..models import ContractEvidence, EvidenceClass
-from .http import ResilientClient
+from .http import ResilientClient, TransientHTTPError
 
 
 def _first(row: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -32,6 +32,61 @@ def _normalize_name(value: str | None) -> str:
     return re.sub(r"[^A-Z0-9]", "", value)
 
 
+def _next_source_page(data: dict[str, Any], *, current_page: int, row_count: int,
+                      page_limit: int, require_full_page_probe: bool = False) -> int | None:
+    """Completion is an explicit source receipt, never a missing field default.
+
+    The award endpoint uses integer page numbers. A jump or a coercion such as
+    ``int(2.9)`` could silently skip awards while advancing the durable success
+    watermark. Keep already validated rows, but fail the scan on that ambiguity.
+    """
+    metadata = data.get("page_metadata")
+    if not isinstance(metadata, dict) or type(metadata.get("hasNext")) is not bool:
+        raise ValueError("USAspending pagination lacks an explicit boolean hasNext receipt")
+    receipt_page = metadata.get("page")
+    if receipt_page is not None and (type(receipt_page) is not int or receipt_page != current_page):
+        raise ValueError("USAspending pagination response page does not match the requested page")
+    next_page = metadata.get("next")
+    if not metadata["hasNext"]:
+        if next_page is not None:
+            raise ValueError("USAspending pagination reports conflicting completion and next-page receipts")
+        # Offset responses derive hasNext from an OpenSearch total capped at
+        # 10,000. A full offset page is not end-of-results proof. Prefer the
+        # documented search_after cursor; a legacy response needs a tail read.
+        # Cursor responses use an actual limit+1 look-ahead, unlike offsets.
+        if row_count == page_limit and require_full_page_probe:
+            return current_page + 1
+        return None
+    if next_page is None:
+        # Some API responses omit `next`; hasNext still proves continuation.
+        next_page = current_page + 1
+    if type(next_page) is not int or next_page != current_page + 1 or not row_count:
+        raise ValueError("USAspending pagination did not advance to the immediate next nonempty page")
+    return next_page
+
+
+def _award_search_cursor(metadata: dict[str, Any]) -> tuple[int, str] | None:
+    """Read the paired, documented source cursor without inventing sort values.
+
+    https://github.com/fedspendingtransparency/usaspending-api/blob/master/usaspending_api/search/v2/views/spending_by_award.py
+    Cursor paging uses the source's stable sort plus unique award-ID tie break,
+    and avoids the capped hit-count/offset window reported in upstream #4793.
+    """
+    keys = {"last_record_unique_id", "last_record_sort_value"}
+    present = keys.intersection(metadata)
+    if not present:
+        return None
+    if present != keys:
+        raise ValueError("USAspending pagination cursor requires both source fields")
+    identity, value = metadata["last_record_unique_id"], metadata["last_record_sort_value"]
+    # The upstream endpoint serializes its absent terminal sort value as "None".
+    if identity is None and value in (None, "None") and metadata["hasNext"] is False:
+        return None
+    if type(identity) is not int or identity <= 0 or not isinstance(value, str) or not value or len(value) > 1024 or value == "None":
+        raise ValueError("USAspending pagination cursor fields are malformed or unavailable")
+    return identity, value
+
+
 class USAspendingRecipientResolver:
     """Resolve an exact recipient legal name to a unique UEI using USAspending's recipient API.
 
@@ -40,8 +95,11 @@ class USAspendingRecipientResolver:
 
     URL = "https://api.usaspending.gov/api/v2/recipient/"
 
-    def __init__(self, client: ResilientClient):
+    def __init__(self, client: ResilientClient, *, max_pages: int = 5):
+        if type(max_pages) is not int or not 1 <= max_pages <= 20:
+            raise ValueError("Recipient identity lookup permits 1-20 source pages")
         self.client = client
+        self.max_pages = max_pages
         self._cache: dict[str, str | None] = {}
 
     async def resolve_uei(self, legal_name: str) -> str | None:
@@ -59,15 +117,31 @@ class USAspendingRecipientResolver:
             "sort": "name",
             "order": "asc",
         }
-        data = await self.client.request_json("POST", self.URL, json=payload)
-        exact_ueis = {
-            str(row.get("uei")).strip()
-            for row in (data or {}).get("results", [])
-            if _normalize_name(row.get("name")) == key and row.get("uei")
-        }
-        resolved = next(iter(exact_ueis)) if len(exact_ueis) == 1 else None
-        self._cache[key] = resolved
-        return resolved
+        exact_ueis: set[str] = set()
+        for page in range(1, self.max_pages + 1):
+            payload["page"] = page
+            data = await self.client.request_json("POST", self.URL, json=payload)
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                raise ValueError("USAspending recipient response does not contain a results list")
+            rows = data["results"]
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+                    raise ValueError("USAspending recipient response has an invalid identity")
+                if _normalize_name(row["name"]) == key and row.get("uei"):
+                    exact_ueis.add(str(row["uei"]).strip())
+            next_page = _next_source_page(data, current_page=page, row_count=len(rows), page_limit=100)
+            if len(exact_ueis) > 1:
+                # Ambiguity is already proven; further pages cannot make two
+                # independently observed identities unique.
+                self._cache[key] = None
+                return None
+            if next_page is None:
+                resolved = next(iter(exact_ueis), None)
+                self._cache[key] = resolved
+                return resolved
+        # A positive identity and a negative cache entry both require a complete
+        # lookup. A later attempt can retry instead of freezing this partial view.
+        raise RuntimeError("USAspending recipient pagination reached its page budget; identity remains unresolved")
 
 
 class USAspendingNormalizer:
@@ -143,6 +217,7 @@ class USAspendingCollector:
         self.normalizer = USAspendingNormalizer()
         self.recipient_resolver = recipient_resolver
         self.partial_records: list[ContractEvidence] = []
+        self.pagination_warnings: list[str] = []
 
     async def collect(
         self,
@@ -159,6 +234,7 @@ class USAspendingCollector:
         # Retain completed observations even if a later page fails or the
         # caller's deadline cancels the request. This is never a success cursor.
         self.partial_records = []
+        self.pagination_warnings = []
         start = start_date or (observed_at.date() - lookback)
         end = end_date or observed_at.date()
         if start > end or page < 1 or not 1 <= limit <= 100 or max_pages < 1:
@@ -166,6 +242,9 @@ class USAspendingCollector:
         current_page = page
         records = self.partial_records
         seen: set[tuple[str, str]] = set()
+        search_cursor: tuple[int, str] | None = None
+        seen_cursors: set[tuple[int, str]] = set()
+        cursor_disabled = False
 
         try:
             while True:
@@ -185,10 +264,32 @@ class USAspendingCollector:
                     "sort": "Start Date",
                     "order": "desc",
                 }
-                data = await self.client.request_json("POST", self.URL, json=payload)
+                cursor_used = search_cursor is not None
+                if cursor_used:
+                    payload.update(last_record_unique_id=search_cursor[0], last_record_sort_value=search_cursor[1])
+                try:
+                    data = await self.client.request_json("POST", self.URL, json=payload)
+                except TransientHTTPError as exc:
+                    if not cursor_used:
+                        raise
+                    # The documented cursor route can be unavailable while the
+                    # same authorized endpoint still serves offset pages. This
+                    # is an independent bounded traversal, not a success claim
+                    # for the failed request. Authentication/403 is never retried
+                    # through a different request shape.
+                    self.pagination_warnings.append(
+                        f"USAspending search_after request failed ({exc}); using offset pagination with full-page tail verification for this scan."
+                    )
+                    cursor_disabled = True
+                    cursor_used = False
+                    search_cursor = None
+                    payload.pop("last_record_unique_id", None)
+                    payload.pop("last_record_sort_value", None)
+                    data = await self.client.request_json("POST", self.URL, json=payload)
                 if not isinstance(data, dict) or not isinstance(data.get("results"), list):
                     raise ValueError("USAspending response does not contain a results list")
                 rows = data["results"]
+                before = len(records)
                 for row in rows:
                     record = self.normalizer.normalize(row, observed_at=observed_at)
                     if not record.award_id or not record.recipient_name:
@@ -202,18 +303,27 @@ class USAspendingCollector:
                         seen.add(key)
                         records.append(record)
 
-                metadata = (data or {}).get("page_metadata") or {}
-                if not metadata.get("hasNext"):
+                next_page = _next_source_page(data, current_page=current_page, row_count=len(rows),
+                                              page_limit=limit, require_full_page_probe=not cursor_used)
+                next_cursor = _award_search_cursor(data["page_metadata"])
+                if len(rows) > limit:
+                    raise RuntimeError("USAspending pagination returned more rows than the requested page limit")
+                if rows and len(records) == before:
+                    raise RuntimeError("USAspending pagination repeated previously observed rows instead of advancing")
+                if next_page is None:
                     break
                 if current_page - page + 1 >= max_pages:
                     raise RuntimeError(
                         f"USAspending pagination exceeded max_pages={max_pages} for {start.isoformat()}..{end.isoformat()}; refusing to truncate silently."
                     )
-                next_page = metadata.get("next")
-                proposed_page = int(next_page) if next_page is not None else current_page + 1
-                if proposed_page <= current_page or not rows:
-                    raise RuntimeError("USAspending pagination did not advance; refusing incomplete collection")
-                current_page = proposed_page
+                if search_cursor is not None and next_cursor is None:
+                    raise ValueError("USAspending pagination lost its search_after continuation cursor")
+                if next_cursor is not None:
+                    if next_cursor in seen_cursors:
+                        raise RuntimeError("USAspending pagination repeated its source cursor instead of advancing")
+                    seen_cursors.add(next_cursor)
+                search_cursor = None if cursor_disabled else next_cursor
+                current_page = next_page
 
         except Exception as exc:
             if records:

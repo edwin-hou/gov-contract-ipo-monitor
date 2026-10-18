@@ -218,6 +218,35 @@ def _epoch(value: Any) -> datetime:
     return datetime.fromtimestamp(seconds, UTC)
 
 
+def quote_valid_until(value: CurrentQuote, at: datetime, *, max_open_age_seconds: int = 300,
+                      max_observation_age_seconds: int = 300) -> datetime:
+    """Earliest static boundary at which a currently fresh reference loses authority.
+
+    Retrieval does not renew the provider's trade timestamp. Intraday quotes
+    also cease to describe the regular session at its close; a labelled prior
+    close stops qualifying when the next regular session opens. Callers must
+    enforce this deadline immediately before publishing, not only before slow
+    analysis or delivery preflight. This never authorizes a broker execution.
+    """
+    freshness = quote_freshness(value, at, max_open_age_seconds=max_open_age_seconds,
+                                max_observation_age_seconds=max_observation_age_seconds)
+    if freshness["status"] != "fresh":
+        raise ValueError("Only a currently verified fresh quote can authorize publication")
+    deadlines = [value.observed_at + timedelta(seconds=max_observation_age_seconds)]
+    if value.quote_type == "session_close":
+        from .trades import next_session_window
+        window = next_session_window(value.exchange, at)
+        deadlines.append(datetime.fromisoformat(window["exchange_open"]))
+    else:
+        deadlines.append(value.quote_at + timedelta(seconds=value.delay_seconds+max_open_age_seconds))
+        if _venue_group(value.exchange) in _US_VENUES:
+            _, _, _, end = _us_context(value.exchange, at)
+        else:
+            end = value.regular_session_end
+        deadlines.append(end)
+    return min(deadlines).astimezone(UTC)
+
+
 def _nasdaq_time(raw: Any):
     if not isinstance(raw, str) or len(raw) > 100:
         raise ValueError("Nasdaq provider timestamp is missing")

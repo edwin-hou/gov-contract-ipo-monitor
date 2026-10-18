@@ -130,7 +130,8 @@ class SimulatedTransport:
             "content_sha256": message_content_sha256(raw), "content_sha256_version": "mime-tree-v2", "raw_content_sha256": hashlib.sha256(raw).hexdigest(),
             "readback_raw_sha256": hashlib.sha256(raw).hexdigest()}
 
-    def deliver(self, raw, recipient, rfc822_id):
+    def deliver(self, raw, recipient, rfc822_id, *, not_after):
+        assert not_after.utcoffset() is not None
         self.deliveries.append((raw, recipient, rfc822_id))
         if self.ambiguous:
             raise UnknownDelivery("Simulated ambiguous POST")
@@ -189,6 +190,70 @@ def test_quote_expiring_during_model_latency_never_queues(tmp_path, elapsed_seco
     queued, result = stage(config, box, work, report(), model=model, finished=NOW+timedelta(seconds=elapsed_seconds))
     assert len(model.calls) == 1 and queued == [] and box.states() == {}
     assert result["status"] == "quotes_expired_during_analysis" and not result["send_allowed"]
+
+
+@pytest.mark.parametrize("kind", ["provider_age", "session_close", "session_open", "report_age"])
+def test_mail_authority_ends_at_earliest_quote_or_report_boundary(tmp_path, kind):
+    config, box, work = configured(tmp_path)
+    at = NOW.replace(hour=16)
+    if kind == "session_close":
+        at = NOW.replace(hour=19, minute=59, second=50)
+    elif kind == "session_open":
+        at = NOW.replace(hour=13, minute=29, second=50)
+    data = report()
+    data["completed_at"] = (at - timedelta(hours=5, minutes=59, seconds=50)
+                            if kind == "report_age" else at).isoformat()
+    quote = data["trade_ideas"][0]["current_quote"]
+    quote.update(observed_at=at.isoformat(), session_date=at.date().isoformat())
+    if kind == "session_open":
+        quote.update(quote_at="2026-10-02T20:00:02+00:00", session_date="2026-10-02")
+    else:
+        quote.update(quote_type="live", market_phase="regular", provider_market_status="Open",
+                     quote_at=(at-timedelta(seconds=295) if kind == "provider_age" else at).isoformat())
+    queued, result = stage(config, box, work, data, now=at, refresh=lambda data, now: data)
+    assert result["send_allowed"] and len(queued) == 1
+    expected = at+timedelta(seconds=5 if kind == "provider_age" else 10)
+    assert datetime.fromisoformat(box.get(queued[0])["expires_at"]) == expected
+    transport = SimulatedTransport()
+    assert box.deliver_once(transport, now=expected) is None
+    assert box.get(queued[0])["status"] == "expired" and transport.deliveries == []
+
+
+def test_new_report_cannot_extend_original_cached_review_authority(tmp_path):
+    config, box, work = configured(tmp_path)
+    first, original = stage(config, box, work, report())
+    later = NOW+timedelta(hours=5, minutes=59, seconds=50)
+    data = report()
+    data["completed_at"] = later.isoformat()
+    queued, current = stage(config, box, work, data, now=later,
+                            model=lambda _: pytest.fail("Unchanged evidence repeated inference"))
+    assert len(queued) == 1 and current["review_identity"] == original["review_identity"]
+    assert box.get(first[0])["status"] in {"expired", "cancelled"}
+    assert datetime.fromisoformat(box.get(queued[0])["expires_at"]) == NOW+timedelta(hours=6)
+
+
+def test_older_pending_sealed_quote_is_revalidated_and_its_deadline_cannot_be_renewed(tmp_path):
+    config, box, work = configured(tmp_path)
+    at = NOW.replace(hour=16)
+    data = report()
+    data["completed_at"] = at.isoformat()
+    quote = data["trade_ideas"][0]["current_quote"]
+    quote.update(observed_at=at.isoformat(), quote_type="live", market_phase="regular", provider_market_status="Open",
+                 quote_at=(at-timedelta(seconds=295)).isoformat())
+    first, _ = stage(config, box, work, data, now=at, refresh=lambda data, now: deepcopy(data))
+    original_bytes = box.get(first[0])["raw_message"]
+    # Simulate a pending publication created by the older observed_at+5m rule.
+    with box.connect() as connection:
+        connection.execute("UPDATE investment_mail SET expires_at=? WHERE id=?", ((at+timedelta(minutes=5)).isoformat(), first[0]))
+    later = at+timedelta(seconds=2)
+    newer = deepcopy(data)
+    newer["trade_ideas"][0]["current_quote"].update(quote_at=later.isoformat(), observed_at=later.isoformat())
+    queued, result = stage(config, box, work, newer, now=later, refresh=lambda data, now: deepcopy(data),
+                           model=lambda _: pytest.fail("Unchanged price bucket repeated inference"))
+    assert queued == [] and result["notification"] == "pending"
+    assert box.get(first[0])["raw_message"] == original_bytes
+    assert datetime.fromisoformat(box.get(first[0])["expires_at"]) == at+timedelta(seconds=5)
+    assert box.deliver_once(SimulatedTransport(), now=at+timedelta(seconds=5)) is None
 
 
 @pytest.mark.parametrize("reason", ["unavailable", "above_cap", "below_stop"])

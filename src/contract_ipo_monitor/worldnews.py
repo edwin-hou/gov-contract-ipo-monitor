@@ -17,7 +17,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .sources.discourse import SourceCoverage, plain_text
+from .sources.discourse import SourceCoverage, feed_article_link, feed_text, plain_text
 from .sources.http import ResilientClient
 
 
@@ -288,12 +288,10 @@ class WorldNewsCollector:
                 for item in items[:self.max_items_per_feed]:
                     values = {child.tag.rsplit("}", 1)[-1]: child for child in item}
                     def content(name: str) -> str:
-                        element = values.get(name)
-                        return "".join(element.itertext()).strip() if element is not None else ""
+                        return feed_text(values.get(name))
                     try:
                         title = plain_text(content("title"), limit=500)
-                        link_node = values.get("link")
-                        raw_link = content("link") or (link_node.get("href", "") if link_node is not None else "")
+                        raw_link = feed_article_link(item)
                         url = _public_url(raw_link, feed.article_hosts)
                         if not title:
                             raise ValueError("World feed headline is empty")

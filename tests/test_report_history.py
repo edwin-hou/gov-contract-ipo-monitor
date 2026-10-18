@@ -99,7 +99,8 @@ def test_repeated_saves_keep_each_report_and_reduce_large_history_without_changi
     assert store.latest_run() == data
     with db.connect() as conn:
         assert conn.execute("SELECT SUM(length(report_json)) FROM monitor_runs").fetchone()[0] == 0
-        compressed_bytes = conn.execute("SELECT SUM(length(payload_gzip)) FROM monitor_run_payloads").fetchone()[0]
+        compressed_bytes = conn.execute("""SELECT COALESCE((SELECT SUM(length(payload_gzip)) FROM monitor_run_payloads),0)
+            +COALESCE((SELECT SUM(length(payload_xz)) FROM monitor_report_packs),0)""").fetchone()[0]
         assert compressed_bytes < len(expected)*3*.05
 
 

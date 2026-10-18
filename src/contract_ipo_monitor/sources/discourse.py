@@ -261,6 +261,41 @@ def _xml(value: str) -> ET.Element:
     return ET.fromstring(value)
 
 
+def feed_text(element: ET.Element | None) -> str:
+    """Read plain/HTML/XHTML feed fields without losing nested visible text."""
+    if element is None:
+        return ""
+    parts: list[str] = []
+    pending = [(element, False)]
+    while pending:
+        node, tail = pending.pop()
+        if tail:
+            if node.tail:
+                parts.append(node.tail)
+            continue
+        if node.tag.split("}")[-1] in {"script", "style", "template", "noscript"}:
+            continue
+        if node.text:
+            parts.append(node.text)
+        for child in reversed(list(node)):
+            pending.extend(((child, True), (child, False)))
+    return " ".join(parts).strip()
+
+
+def feed_article_link(item: ET.Element) -> str:
+    """Select the article relation, never Atom's self, edit, or enclosure URL."""
+    links = [child for child in item if child.tag.split("}")[-1] == "link"]
+    # RSS links contain text; Atom links contain href and may occur repeatedly.
+    rss = [feed_text(node) for node in links if not node.get("href") and feed_text(node)]
+    if rss:
+        return rss[0]
+    alternates = [node for node in links if node.get("rel", "alternate") == "alternate" and node.get("href")]
+    if not alternates:
+        return ""
+    reader = min(alternates, key=lambda node: node.get("type", "text/html") not in {"text/html", "application/xhtml+xml"})
+    return reader.get("href", "").strip()
+
+
 def video_id(url: str) -> str:
     parts = urlsplit(_safe_url(url))
     host = (parts.hostname or "").lower()
@@ -650,9 +685,9 @@ class DiscourseCollector:
         results: list[DiscourseEvidence] = []
         for item in items[:self.config.max_items_per_source]:
             fields = {child.tag.split("}")[-1]: child for child in item}
-            get = lambda key: fields[key].text or "" if key in fields else ""
+            get = lambda key: feed_text(fields.get(key))
             title = get("title")
-            url = get("link") or (fields["link"].get("href", "") if "link" in fields else "")
+            url = feed_article_link(item)
             if not url:
                 continue
             try:

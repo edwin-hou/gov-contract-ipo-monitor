@@ -152,10 +152,10 @@ def summarize_sentiment(company_name: str, evidence: Iterable[DiscourseEvidence]
             reason = None
             if (published is not None and published.tzinfo is None) or retrieved.tzinfo is None:
                 reason = "Evidence timestamp lacks timezone"
-            elif published and (published < now - timedelta(days=max_age_days) or published > now + timedelta(hours=24)):
+            elif published and (published < now - timedelta(days=max_age_days) or published > now):
                 reason = "Publication date is stale or in the future"
                 flags.add("stale_or_invalid_publication_date")
-            elif retrieved < now - timedelta(days=max_age_days) or retrieved > now + timedelta(hours=24):
+            elif retrieved < now - timedelta(days=max_age_days) or retrieved > now:
                 reason = "Retrieval date is stale or in the future"
             elif record.source_url in seen_urls or digest in seen_text:
                 reason = "Duplicate URL or identical text; counted once"

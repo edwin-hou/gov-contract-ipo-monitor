@@ -2,8 +2,10 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -30,12 +32,110 @@ def api(path):
     return response.json()
 
 
+def _json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate report JSON key")
+        result[key] = value
+    return result
+
+
+def _install_files(staging, destination, names):
+    """Publish only after every member passed validation; retain the old generation on I/O failure."""
+    targets = [destination / name for name in names]
+    if any(path.is_symlink() or path.exists() and not path.is_file() for path in targets):
+        raise ValueError("Artifact publication target must be a regular file")
+    previous, installed = {}, []
+    try:
+        for target in targets:
+            if target.exists():
+                backup = staging / ("previous-" + target.name)
+                # Keep the existing path readable while preparing recovery.
+                # In particular, no interrupted download may remove the old
+                # sealed report JSON before its replacement is complete.
+                with target.open("rb") as source, backup.open("xb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+                previous[target] = backup
+        # Readers use report JSON or the checkpoint manifest as authority.
+        # Install that marker only after the other complete member is present.
+        for name in sorted(names, key=lambda name: name in {"latest.json", "checkpoint.json"}):
+            target = destination / name
+            (staging / name).replace(target)
+            installed.append(target)
+    except Exception:
+        try:
+            for target in reversed(installed):
+                if target in previous:
+                    previous[target].replace(target)
+                else:
+                    target.unlink(missing_ok=True)
+        except Exception as rollback_error:
+            # Preserve recovery files instead of deleting the previous bytes.
+            raise RuntimeError("Artifact publication rollback failed; previous files are retained at " + str(staging)) from rollback_error
+        raise
+
+
+def extract_artifact(raw, destination):
+    """Stage the complete bounded ZIP and validate report JSON before replacing cached bytes."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Explicit cleanup keeps recovery backups if rollback itself fails.
+    staging = Path(tempfile.mkdtemp(prefix=".artifact-", dir=destination.parent))
+    keep_recovery = False
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as bundle:
+            limits = {"latest.json": 30_000_000, "latest.md": 30_000_000,
+                      "monitor.db": 250_000_000, "checkpoint.json": 64 * 1024,
+                      "monitor.db.gz": 250_000_000}
+            names = [item.filename for item in bundle.infolist()]
+            if len(names) != len(set(names)) or set(names) not in (
+                    {"latest.json", "latest.md"}, {"monitor.db"}, {"checkpoint.json", "monitor.db.gz"}):
+                raise ValueError("Unexpected or incomplete artifact inventory")
+            if any(item.is_dir() or not 0 < item.file_size <= limits[item.filename] for item in bundle.infolist()):
+                raise ValueError("Unexpected artifact file")
+            for item in bundle.infolist():
+                written = 0
+                with bundle.open(item) as source, (staging / item.filename).open("wb") as output:
+                    while chunk := source.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > item.file_size or written > limits[item.filename]:
+                            raise ValueError("Artifact member exceeds its declared byte bound")
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+                if written != item.file_size:
+                    raise ValueError("Artifact member is truncated")
+        summary = None
+        report = staging / "latest.json"
+        if report.exists():
+            data = json.loads(report.read_text(encoding="utf-8"), object_pairs_hook=_json_pairs,
+                              parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Nonfinite report JSON")))
+            if not isinstance(data, dict) or not {"completed_at", "status", "counts", "ipo_summary"} <= data.keys():
+                raise ValueError("Downloaded report has no complete summary")
+            summary = {key: data[key] for key in ("completed_at", "status", "counts", "ipo_summary")}
+        destination.mkdir(parents=True, exist_ok=True)
+        try:
+            _install_files(staging, destination, names)
+        except RuntimeError:
+            keep_recovery = any(path.name.startswith("previous-") for path in staging.iterdir())
+            raise
+        return summary
+    finally:
+        if not keep_recovery:
+            shutil.rmtree(staging)
+
+
 if sys.argv[1] == "dispatch":
     response = httpx.post(BASE + "/actions/workflows/monitor.yml/dispatches", headers=headers(), json={"ref": "main"}, timeout=30)
     response.raise_for_status()
     print("Requested one verification collection on current main.")
 elif sys.argv[1] == "runs":
-    path = "/actions/runs?per_page=15"
+    # Scope discovery to the collector so CI/container pushes cannot push the
+    # last successful collection out of a small mixed-workflow page.
+    path = "/actions/workflows/monitor.yml/runs?per_page=100&branch=main"
     if len(sys.argv) > 2:
         path += "&head_sha=" + sys.argv[2]
     data = api(path)
@@ -88,23 +188,9 @@ elif sys.argv[1] == "download":
         response.raise_for_status()
     if len(response.content) > 250_000_000:
         raise ValueError("Checkpoint/report ZIP exceeds the compressed transport bound")
-    destination.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
-        limits = {"latest.json": 30_000_000, "latest.md": 30_000_000,
-                  "monitor.db": 250_000_000, "checkpoint.json": 64 * 1024,
-                  "monitor.db.gz": 250_000_000}
-        names = [item.filename for item in bundle.infolist()]
-        if len(names) != len(set(names)) or set(names) not in (
-                {"latest.json", "latest.md"}, {"monitor.db"}, {"checkpoint.json", "monitor.db.gz"}):
-            raise ValueError("Unexpected or incomplete artifact inventory")
-        for item in bundle.infolist():
-            if item.file_size > limits[item.filename]:
-                raise ValueError("Unexpected artifact file")
-            (destination / item.filename).write_bytes(bundle.read(item))
-    report = destination / "latest.json"
-    if report.exists():
-        data = json.loads(report.read_text(encoding="utf-8"))
-        print(json.dumps({key: data[key] for key in ("completed_at", "status", "counts", "ipo_summary")}, indent=2))
+    summary = extract_artifact(response.content, destination)
+    if summary is not None:
+        print(json.dumps(summary, indent=2))
     else:
         print("Saved checkpoint files to " + str(destination) + "; validate before restoring.")
 else:

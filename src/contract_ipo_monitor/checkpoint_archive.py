@@ -93,11 +93,14 @@ def _diagnostics(path: Path, before: dict) -> dict:
         result = {"before_compaction": before, "after_compaction": _page_stats(conn),
                   "database_bytes": path.stat().st_size}
         for table, key in (("monitor_runs", "retained_report_count"),
-                           ("monitor_run_payloads", "compressed_report_count")):
+                           ("monitor_run_payloads", "compressed_report_count"),
+                           ("monitor_run_pack_refs", "packed_report_count"),
+                           ("monitor_report_packs", "report_pack_count")):
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                 result[key] = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
             else:
                 result[key] = 0
+        result["compressed_report_count"] += result["packed_report_count"]
         try:
             result["table_allocation"] = [dict(zip(("name", "page_bytes", "payload_bytes", "unused_bytes"), row))
                 for row in conn.execute("""SELECT name,SUM(pgsize),SUM(payload),SUM(unused)

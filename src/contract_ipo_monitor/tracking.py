@@ -6,6 +6,7 @@ an unrelated resale registration must never change an issuer's IPO status.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import re
 from contextlib import closing
 from datetime import UTC, date, datetime
@@ -121,6 +122,55 @@ def _filing_order(left: IPOEvidence, right: IPOEvidence) -> int | None:
     return None
 
 
+class _FilingChronology:
+    """Replay source-proven ordering, including its transitive closure.
+
+    Date placeholders and arrival IDs are stable display keys, not filing
+    chronology. Accepted times and distinct official filing dates form a
+    partial order. Stable topological replay honors all known comparisons;
+    incomparable filings remain unproven in ``order`` even after replay.
+    """
+
+    def __init__(self, events: list[IPOEvidence]):
+        self._indices = {(event.source, event.event_id): index for index, event in enumerate(events)}
+        self._ancestors = [0] * len(events)
+        successors: list[list[int]] = [[] for _ in events]
+        indegree = [0] * len(events)
+        for left in range(len(events)):
+            for right in range(left + 1, len(events)):
+                relation = _filing_order(events[left], events[right])
+                if relation not in {-1, 1}:
+                    continue
+                before, after = (left, right) if relation == -1 else (right, left)
+                successors[before].append(after)
+                indegree[after] += 1
+        ready = [index for index, count in enumerate(indegree) if count == 0]
+        heapq.heapify(ready)
+        ordered = []
+        while ready:
+            index = heapq.heappop(ready)
+            ordered.append(events[index])
+            for after in successors[index]:
+                self._ancestors[after] |= self._ancestors[index] | (1 << index)
+                indegree[after] -= 1
+                if indegree[after] == 0:
+                    heapq.heappush(ready, after)
+        self.conflicted = len(ordered) != len(events)
+        self.ordered = events if self.conflicted else ordered
+
+    def order(self, left: IPOEvidence, right: IPOEvidence) -> int | None:
+        direct = _filing_order(left, right)
+        if direct is not None or self.conflicted:
+            return direct
+        left_index = self._indices[(left.source, left.event_id)]
+        right_index = self._indices[(right.source, right.event_id)]
+        if self._ancestors[left_index] & (1 << right_index):
+            return 1
+        if self._ancestors[right_index] & (1 << left_index):
+            return -1
+        return None
+
+
 class IPOTracker:
     def __init__(self, db: Database):
         self.db = db
@@ -194,7 +244,8 @@ class IPOTracker:
                             if (reason := self.db.sec_issuer_hold_reason(event, reviews))]
             if (reason := held_registrations.get((events[0].cik, scope))):
                 issuer_holds.append(reason)
-            authoritative = [event for event in events if event.authoritative]
+            chronology = _FilingChronology([event for event in events if event.authoritative])
+            authoritative = chronology.ordered
             registration_events = [event for event in authoritative if event.event_type in {"registration", "amendment", "prospectus"}]
             # Resale and generic lifecycle notices remain audit evidence, not IPO candidates.
             eligible = [event for event in registration_events if event.offering_kind not in {"resale", "follow_on"}]
@@ -213,7 +264,7 @@ class IPOTracker:
                 status = "amended" if first_confirmation.event_type == "amendment" else "filed"
                 # Only replay notices sharing this exact registration scope and issuer.
                 for event in authoritative:
-                    order = _filing_order(event, first_confirmation)
+                    order = chronology.order(event, first_confirmation)
                     if order is None and event.event_type in {"withdrawn", "effective", "prospectus"}:
                         ambiguous_notices.append(event)
                         continue
@@ -231,7 +282,7 @@ class IPOTracker:
             elif eligible and scope != "unverified":
                 for event in authoritative:
                     if event.event_type == "withdrawn":
-                        order = _filing_order(event, eligible[0])
+                        order = chronology.order(event, eligible[0])
                         if order is None:
                             ambiguous_notices.append(event)
                         elif order >= 0:
@@ -240,6 +291,8 @@ class IPOTracker:
             # other uncertain stage. Otherwise date-only lifecycle overlap
             # with the registration withholds an active-state assertion.
             if ambiguous_notices and active:
+                status, active = "chronology_unresolved", False
+            if chronology.conflicted:
                 status, active = "chronology_unresolved", False
             if issuer_holds:
                 status, active, confidence = "issuer_unresolved", False, "issuer_unresolved"
@@ -266,7 +319,8 @@ class IPOTracker:
                 "limitations": [
                     "Public filings do not prove the offering completed or shares began trading.",
                     *list(dict.fromkeys(issuer_holds)),
-                    *(["Date-only SEC filing evidence does not establish the order of a registration and its lifecycle notice; active status is withheld until official Accepted timestamps resolve it."] if status == "chronology_unresolved" else []),
+                    *(["Official SEC timestamp and filing-date comparisons imply conflicting lifecycle order; active status is withheld pending source review."] if chronology.conflicted else
+                      ["Date-only SEC filing evidence does not establish the order of a registration and its lifecycle notice; active status is withheld until official Accepted timestamps resolve it."] if status == "chronology_unresolved" else []),
                     *(["At least one source reports only a filing date; its midnight placeholder is not an actual filing time."] if any(event.filed_at_precision == "date" for event in events) else []),
                     *(["SEC registration file number missing; lifecycle cannot be linked safely."] if scope.startswith("unscoped:") else []),
                     *(["Commentary or reporting is unverified and cannot confirm an IPO."] if not authoritative else []),

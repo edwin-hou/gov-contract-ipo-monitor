@@ -21,6 +21,13 @@ def capacity(path: Path) -> dict:
             result.update(retained_reports=count, legacy_report_text_bytes=raw)
         if "monitor_run_payloads" in names:
             result["compressed_report_rows"] = conn.execute("SELECT COUNT(*) FROM monitor_run_payloads").fetchone()[0]
+        if "monitor_run_pack_refs" in names:
+            result["packed_report_rows"] = conn.execute("SELECT COUNT(*) FROM monitor_run_pack_refs").fetchone()[0]
+            result["compressed_report_rows"] = result.get("compressed_report_rows", 0) + result["packed_report_rows"]
+        if "monitor_report_packs" in names:
+            count, compressed, expanded = conn.execute("SELECT COUNT(*),COALESCE(SUM(length(payload_xz)),0),COALESCE(SUM(original_bytes),0) FROM monitor_report_packs").fetchone()
+            result.update(report_pack_count=count, report_pack_compressed_bytes=compressed,
+                          report_pack_expanded_bytes=expanded)
         try:
             result["largest_tables_bytes"] = dict(conn.execute("SELECT name,SUM(pgsize) AS bytes FROM dbstat GROUP BY name ORDER BY bytes DESC LIMIT 10"))
         except sqlite3.OperationalError:

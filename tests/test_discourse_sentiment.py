@@ -121,6 +121,45 @@ async def test_atom_and_missing_dates_do_not_invent_publication():
         await source.client.aclose()
 
 
+def test_forum_atom_chooses_reader_alternate_link_instead_of_last_self_or_enclosure():
+    atom = '''<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <title>Anduril company discussion</title>
+      <link rel="alternate" type="text/html" href="https://forum.example/thread/123"/>
+      <link rel="self" type="application/atom+xml" href="https://forum.example/api/entry/123"/>
+      <link rel="enclosure" href="https://forum.example/attachment.mp3"/>
+      <content>Anduril has promising technology and strong commercial prospects.</content>
+    </entry></feed>'''
+    source = collector(lambda request: httpx.Response(500))
+    records = source._parse_feed(atom, "https://forum.example/feed", COMPANIES, NOW, forum=True)
+    assert len(records) == 1
+    assert records[0].source_url == "https://forum.example/thread/123"
+
+
+def test_forum_atom_xhtml_preserves_visible_text_and_excludes_hidden_content():
+    atom = '''<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <title>Anduril company discussion</title><link href="https://forum.example/thread/123"/>
+      <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">
+        <p>Anduril is <strong>promising</strong> with strong commercial prospects.</p>
+        <script>Anduril is a dangerous fraudulent scam.</script><style>.weak {}</style>
+        <p>Its research is innovative.</p>
+      </div></content>
+    </entry></feed>'''
+    source = collector(lambda request: httpx.Response(500))
+    records = source._parse_feed(atom, "https://forum.example/feed", COMPANIES, NOW, forum=True)
+    assert len(records) == 1
+    assert records[0].text == "Anduril is promising with strong commercial prospects. Its research is innovative."
+    assert score_evidence(records[0], "Anduril").label == "positive"
+
+
+def test_atom_self_link_alone_is_not_presented_as_a_source_article():
+    atom = '''<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <title>Anduril company discussion</title>
+      <link rel="self" href="https://forum.example/api/entry/123"/>
+    </entry></feed>'''
+    source = collector(lambda request: httpx.Response(500))
+    assert source._parse_feed(atom, "https://forum.example/feed", COMPANIES, NOW, forum=True) == []
+
+
 @pytest.mark.asyncio
 async def test_feed_sampling_receipt_discloses_inspected_and_available_count():
     rss = '<rss><channel>' + ''.join(f'<item><title>Anduril IPO {index}</title><link>https://example.com/{index}</link></item>' for index in range(5)) + '</channel></rss>'
@@ -415,6 +454,28 @@ def test_duplicates_stale_and_future_records_are_excluded():
     assert summary.excluded_count == 3
     assert summary.label == "unknown"
     assert "duplicates_removed" in summary.bias_flags
+
+
+@pytest.mark.parametrize("field", ("published_at", "retrieved_at"))
+def test_future_timestamp_within_one_day_is_not_current_sentiment(field):
+    record = replace(evidence(), **{field: NOW + timedelta(minutes=1)})
+    summary = summarize_sentiment("Anduril", [record], now=NOW)
+    assert summary.scored_count == 0 and summary.excluded_count == 1
+    assert "future" in summary.evidence_tones[0].excluded_reason
+
+
+def test_future_negative_opinions_cannot_change_present_sample_tone():
+    current = [evidence(index, origin=f"news:publisher{index}",
+        text=f"Anduril has promising strong commercial prospects after reported research update {index}.") for index in range(1, 4)]
+    future = [replace(evidence(index, kind="reddit", origin=f"reddit:reader{index}",
+        text=f"Anduril is risky weak and overvalued after the controversial announcement {index}."),
+        published_at=NOW + timedelta(hours=1)) for index in range(4, 7)]
+    baseline = summarize_sentiment("Anduril", current, now=NOW)
+    summary = summarize_sentiment("Anduril", [*current, *future], now=NOW)
+    assert summary.label == baseline.label == "positive"
+    assert summary.score == baseline.score
+    assert summary.negative_count == 0 and summary.scored_count == 3
+    assert summary.excluded_count == 3
 
 
 def test_multiple_companies_unsupported_language_and_bias_are_explicit():

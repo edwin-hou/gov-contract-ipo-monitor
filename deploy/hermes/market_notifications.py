@@ -77,6 +77,16 @@ def refresh_analysis_quotes(report: dict, now: datetime) -> dict:
     return report
 
 
+def publication_expiry(report, ideas, at, review_expires_at):
+    """Bind sealed bytes to all original source and review freshness limits."""
+    from contract_ipo_monitor.quotes import quote_from_dict, quote_valid_until
+    return min(
+        datetime.fromisoformat(report["completed_at"].replace("Z", "+00:00")) + timedelta(hours=6),
+        datetime.fromisoformat(review_expires_at),
+        *(quote_valid_until(quote_from_dict(idea["current_quote"]), at) for idea in ideas),
+    )
+
+
 def stage_ai_notifications(config, outbox, receipt, report, now, *, work: Path,
                            infer=None, refresh=refresh_analysis_quotes, clock=None):
     from contract_ipo_monitor.analyst import AnalystStore, DEFAULT_MODEL, evaluate, fingerprint, prepare_candidates
@@ -113,7 +123,19 @@ def stage_ai_notifications(config, outbox, receipt, report, now, *, work: Path,
                 message = BytesParser(policy=mail_policy.default).parsebytes(bytes(row["raw_message"]))
                 original = next(json.loads(part.get_payload(decode=True)) for part in message.iter_attachments() if part.get_filename() == "research-report.json")
                 original_ideas = original["trade_ideas"]
-                valid = all(idea["symbol"] in authorized and idea["ai_review"]["review_identity"] == result.get("review_identity") for idea in original_ideas)
+                original_candidates, _ = prepare_candidates(original, now=refreshed_at)
+                valid = (bool(original_ideas)
+                         and {idea["symbol"] for idea in original_candidates} == {idea["symbol"] for idea in original_ideas}
+                         and all(idea["symbol"] in authorized and idea["ai_review"]["review_identity"] == result.get("review_identity") for idea in original_ideas))
+                if valid:
+                    deadline = publication_expiry(original, original_ideas, refreshed_at, result["review_expires_at"])
+                    valid = refreshed_at < deadline
+                    # Upgrade pending messages from older delivery versions by
+                    # shortening authority, never replacing sealed bytes or
+                    # extending a prior deadline with a newly refreshed quote.
+                    if valid:
+                        connection.execute("UPDATE investment_mail SET expires_at=MIN(expires_at,?) WHERE id=? AND status='pending'",
+                                           (deadline.isoformat(), row["id"]))
             except Exception:
                 valid = False
             if not valid:
@@ -130,7 +152,7 @@ def stage_ai_notifications(config, outbox, receipt, report, now, *, work: Path,
         with outbox.connect() as connection:
             connection.execute("UPDATE investment_mail SET status='cancelled',error_code='quote_expired_during_review' WHERE status='pending' AND event_key LIKE 'ai-reviewed:%'")
         return [], {**result, "status": "quotes_expired_during_analysis", "send_allowed": False}
-    expiry = min(datetime.fromisoformat(x["current_quote"]["observed_at"].replace("Z", "+00:00")) + timedelta(minutes=5) for x in approved)
+    expiry = publication_expiry(report, approved, completed_analysis, result["review_expires_at"])
     if expiry <= completed_analysis:
         with outbox.connect() as connection:
             connection.execute("UPDATE investment_mail SET status='cancelled',error_code='quote_expired_during_review' WHERE status='pending' AND event_key LIKE 'ai-reviewed:%'")

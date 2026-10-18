@@ -60,6 +60,23 @@ def test_brief_figures_use_actual_comparable_primary_amounts_and_price_dates():
     assert "internet-wide" in briefs["commentary"]["relevance"]
 
 
+@pytest.mark.parametrize("future_field", ["published_at", "retrieved_at"])
+def test_future_negative_commentary_cannot_block_a_current_trade_setup(future_field):
+    records = tuple(article(title=f"Test issuer discussion {index}",
+        text=f"Test issuer appears bearish, weak and risky to this skeptical reviewer number {index}.",
+        evidence_id=f"opinion-{index}", source_kind="hackernews", text_kind="comment",
+        source_url=f"https://news.ycombinator.com/item?id={index}", origin_key=f"author:{index}")
+        for index in range(3))
+    current = summarize_sentiment("Test issuer", records, now=NOW)
+    assert current.label == "negative" and assess(sentiment=asdict(current), company_evidence=records)["action"] == "wait"
+    future = tuple(replace(record, **{future_field: NOW+timedelta(seconds=1)}) for record in records)
+    summary = summarize_sentiment("Test issuer", future, now=NOW)
+    idea = assess(sentiment=asdict(summary), company_evidence=future)
+    assert summary.scored_count == 0 and summary.label == "unknown"
+    assert idea["action"] == "conditional_buy" and idea["sentiment"]["label"] == "unknown"
+    assert not by_id(idea)["commentary"]["source_urls"]
+
+
 @pytest.mark.parametrize("margin, action, explanation", [
     (.046, "wait", "reported net margin 4.6% is below 5%"),
     (.04999, "wait", "reported net margin is below 5% before rounding"),

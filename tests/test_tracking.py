@@ -141,3 +141,59 @@ def test_known_follow_on_is_retained_as_evidence_but_not_ipo_candidate(tracker):
     tracker.record(event(is_ipo=False, offering_kind="follow_on"))
     assert tracker.candidates() == []
     assert tracker.summary()["evidence"] == 1
+
+
+def test_accepted_order_overrides_ingestion_ties_between_lifecycle_stages(tracker):
+    tracker.record(event("first", accepted_at=NOW))
+    day = (NOW + timedelta(days=1)).replace(hour=0)
+    # Both daily-index entries carry midnight placeholders, so source arrival
+    # order must not overrule the official filing index's Accepted timestamps.
+    tracker.record(event("prospectus", "prospectus", at=day, filed_at_precision="date",
+                         accepted_at=day + timedelta(hours=15), is_ipo=False))
+    tracker.record(event("effect", "effective", at=day, filed_at_precision="date",
+                         accepted_at=day + timedelta(hours=14), is_ipo=False))
+    result = tracker.candidates()[0]
+    assert result["status"] == "prospectus_filed"
+    assert result["active"] is True
+    assert len(tracker.evidence()) == 3
+
+
+def test_latest_amendment_price_uses_official_accepted_order(tracker):
+    tracker.record(event("first", accepted_at=NOW, proposed_price=10))
+    day = (NOW + timedelta(days=1)).replace(hour=0)
+    tracker.record(event("newer", "amendment", at=day, filed_at_precision="date",
+                         accepted_at=day + timedelta(hours=15), proposed_price=15))
+    tracker.record(event("older", "amendment", at=day, filed_at_precision="date",
+                         accepted_at=day + timedelta(hours=14), proposed_price=12))
+    assert tracker.candidates()[0]["proposed_price"] == 15
+
+
+def test_mixed_official_chronology_retains_transitive_order(tracker):
+    day = NOW.replace(hour=0)
+    # A and B have actual Accepted times; B and C have distinct official filing
+    # dates. A and C are incomparable directly, but A < B < C is established.
+    tracker.record(event("prospectus", "prospectus", at=day, filed_at_precision="date",
+                         source_filing_date=(NOW + timedelta(days=2)).date(), is_ipo=False))
+    tracker.record(event("effect", "effective", at=day, filed_at_precision="date",
+                         source_filing_date=(NOW + timedelta(days=1)).date(),
+                         accepted_at=NOW + timedelta(days=1), is_ipo=False))
+    tracker.record(event("first", at=day, filed_at_precision="date", accepted_at=NOW))
+    result = tracker.candidates()[0]
+    assert result["status"] == "prospectus_filed"
+    assert result["active"] is True
+
+
+def test_inconsistent_official_order_withholds_active_lifecycle_and_preserves_all_sources(tracker):
+    day = NOW.replace(hour=0)
+    # Accepted times prove first < effect; legal dates prove effect < prospectus
+    # < first. Neither chronological source basis can safely win this cycle.
+    tracker.record(event("first", at=day, filed_at_precision="date", accepted_at=NOW,
+                         source_filing_date=(NOW + timedelta(days=2)).date()))
+    tracker.record(event("effect", "effective", at=day, filed_at_precision="date", is_ipo=False,
+                         accepted_at=NOW + timedelta(days=1), source_filing_date=NOW.date()))
+    tracker.record(event("prospectus", "prospectus", at=day, filed_at_precision="date", is_ipo=False,
+                         source_filing_date=(NOW + timedelta(days=1)).date()))
+    result = tracker.candidates()[0]
+    assert result["status"] == "chronology_unresolved" and result["active"] is False
+    assert any("conflicting lifecycle order" in value for value in result["limitations"])
+    assert len(tracker.evidence()) == result["evidence_count"] == 3

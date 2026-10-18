@@ -27,10 +27,18 @@ class EntityResolver:
             return EntityMatch(matched=True, method="uei", explanation="Award recipient UEI is explicitly linked to the issuer.")
         if contract.parent_uei and contract.parent_uei in listing.linked_ueis:
             return EntityMatch(matched=True, method="parent_uei", explanation="Award recipient parent UEI is explicitly linked to the issuer.")
+        # Distinct subsidiary/parent legal entities legitimately have different
+        # UEIs, but that connection needs its own verified primary evidence.
+        if listing.relationship_verified and contract.recipient_name.upper() in (listing.relationship_description or "").upper():
+            return EntityMatch(matched=True, method="documented_relationship", explanation="Primary listing evidence documents the contractor-to-issuer relationship.")
+        if listing.linked_ueis and contract.recipient_uei:
+            return EntityMatch(matched=False, method="conflicting_official_identity",
+                               explanation="Award recipient UEI differs from the issuer's linked official identities; a similar name, address or CAGE cannot override that conflict.")
         if contract.recipient_cage and contract.recipient_cage in listing.linked_cages:
             return EntityMatch(matched=True, method="cage", explanation="Award recipient CAGE code is explicitly linked to the issuer.")
 
-        exact_name = _normalize(contract.recipient_name) == _normalize(listing.issuer_name)
+        normalized_name = _normalize(contract.recipient_name)
+        exact_name = bool(normalized_name) and normalized_name == _normalize(listing.issuer_name)
         exact_address = (
             bool(contract.recipient_address and listing.issuer_address)
             and _normalize_address(contract.recipient_address) == _normalize_address(listing.issuer_address)
@@ -44,9 +52,6 @@ class EntityResolver:
                 method="official_recipient_identity",
                 explanation="Exact normalized award-recipient/issuer legal name is independently anchored to a unique official USAspending UEI.",
             )
-
-        if listing.relationship_verified and contract.recipient_name.upper() in (listing.relationship_description or "").upper():
-            return EntityMatch(matched=True, method="documented_relationship", explanation="Primary listing evidence documents the contractor-to-issuer relationship.")
 
         return EntityMatch(
             matched=False,

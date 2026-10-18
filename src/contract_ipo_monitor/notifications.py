@@ -258,13 +258,16 @@ class EmailOutbox:
         if row is None:
             return None
         try:
-            receipt = transport.deliver(bytes(row["raw_message"]), row["recipient"], row["rfc822_id"])
+            receipt = transport.deliver(bytes(row["raw_message"]), row["recipient"], row["rfc822_id"],
+                                        not_after=datetime.fromisoformat(row["expires_at"]))
             if not self._receipt_matches(row, receipt):
                 raise UnknownDelivery("Provider acceptance has no verified readback")
         except DefinitiveDeliveryFailure as error:
             retry = error.safe_to_retry and row["attempts"] < 5
-            self._settle(row, status="pending" if retry else "rejected", now=now,
-                         error=type(error).__name__, next_attempt_at=now + timedelta(minutes=min(60, 2 ** row["attempts"])))
+            expired = error.code == "message_authorization_expired"
+            self._settle(row, status="expired" if expired else "pending" if retry else "rejected", now=now,
+                         error="report_expired" if expired else type(error).__name__,
+                         next_attempt_at=now + timedelta(minutes=min(60, 2 ** row["attempts"])))
         except UnknownDelivery as error:
             self._settle(row, status="unknown", now=now, error=type(error).__name__,
                          receipt=getattr(error, "partial_receipt", None))

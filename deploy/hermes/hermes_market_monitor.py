@@ -659,23 +659,57 @@ def request_due_collection(config, *, now=None, github=None):
     """
     now, github = now or datetime.now(UTC), github or GitHubHelper(config)
     receipt = read_json(config.receipt)
-    if (receipt.get("status") not in {"ok", "degraded"}
+    recoverable_stale = receipt.get("status") == "error" and receipt.get("failure_code") == "report_stale"
+    if (receipt.get("status") not in {"ok", "degraded"} and not recoverable_stale
             or receipt.get("newest_run_status") not in {None, "completed"}
-            or receipt.get("newest_run_conclusion") not in {None, "success"}
-            or now - timestamp(receipt.get("report_completed_at"), "Source report") < timedelta(hours=2)):
+            or receipt.get("newest_run_conclusion") not in {None, "success"}):
         return
-    key = str(receipt.get("main_sha")) + ":" + str(receipt["report_completed_at"])
+    main_sha = receipt.get("main_sha")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(main_sha)):
+        return
+    # A stale receipt is evidence that trading must wait, not that collection
+    # must stop. Verify the original sealed bytes without renewing their age.
+    # Never authorize a catch-up from an editable timestamp alone.
+    try:
+        if (receipt.get("report_completed_at") is not None
+                and now - timestamp(receipt["report_completed_at"], "Source report") < timedelta(hours=2)):
+            return
+        ledger = read_json(config.ledger)
+        source_path = Path(receipt.get("source_report") or ledger.get("source_report", ""))
+        report, _ = read_verified_report(source_path, receipt, ledger)
+        completed = timestamp(report.get("completed_at"), "Source report")
+        if completed > now or now - completed < timedelta(hours=2):
+            return
+    except CheckError:
+        return
+    key = main_sha + ":" + completed.isoformat()
     if receipt.get("catchup_claim", {}).get("key") == key:
         return
+    try:
+        # The poll and dispatch are separate operations. Refresh both the
+        # workflow identity and run queue before claiming a new remote request.
+        if github("main").get("sha") != main_sha:
+            receipt["catchup_claim"] = {"key": key, "claimed_at": now.isoformat(),
+                                        "outcome": "main_changed_no_dispatch"}
+            write_json(config.receipt, receipt)
+            return
+        workflow = github("workflow")
+        if workflow.get("path") != WORKFLOW_PATH or workflow.get("state") != "active":
+            return
+        runs = [item for item in github("runs", main_sha)
+                if item.get("name") == workflow.get("name") and item.get("head_branch") == "main"
+                and item.get("head_sha") == main_sha]
+        runs.sort(key=lambda item: int(item["id"]), reverse=True)
+        if (any(item.get("status") != "completed" for item in runs)
+                or runs and runs[0].get("conclusion") != "success"):
+            return
+    except CheckError:
+        return  # A read failure cannot establish that the live queue is clear.
     receipt["catchup_claim"] = {"key": key, "claimed_at": now.isoformat(), "outcome": "dispatch_unknown"}
     write_json(config.receipt, receipt)
     try:
-        # Recheck immediately before the authorized mutation.
-        if github("main").get("sha") != receipt.get("main_sha"):
-            receipt["catchup_claim"]["outcome"] = "main_changed_no_dispatch"
-        else:
-            github("dispatch")
-            receipt["catchup_claim"]["outcome"] = "requested"
+        github("dispatch")
+        receipt["catchup_claim"]["outcome"] = "requested"
     except CheckError:
         pass  # Existing pre-POST claim fences an uncertain accepted request.
     write_json(config.receipt, receipt)

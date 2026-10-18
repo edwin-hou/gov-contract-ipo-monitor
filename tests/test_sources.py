@@ -162,11 +162,11 @@ async def test_usaspending_collector_follows_all_pages():
         pages.append(page)
         if page == 1:
             return httpx.Response(200, json={"results": [award(1)], "page_metadata": {"page": 1, "next": 2, "hasNext": True}})
-        return httpx.Response(200, json={"results": [award(2)], "page_metadata": {"page": 2, "next": None, "hasNext": False}})
+        return httpx.Response(200, json={"results": [award(2)] if page == 2 else [], "page_metadata": {"page": page, "next": None, "hasNext": False}})
 
     client = ResilientClient(transport=httpx.MockTransport(handler), max_attempts=1)
     records = await USAspendingCollector(client).collect(observed_at=NOW, limit=1)
-    assert pages == [1, 2]
+    assert pages == [1, 2, 3]
     assert [record.award_id for record in records] == ["AWD-1", "AWD-2"]
     await client.aclose()
 
@@ -191,11 +191,11 @@ async def test_usaspending_pagination_refuses_silent_truncation():
 @pytest.mark.asyncio
 async def test_recipient_resolver_returns_only_unique_exact_uei():
     responses = [
-        {"results": [
+        {"page_metadata": {"hasNext": False}, "results": [
             {"name": "Acme Quantum, Inc.", "uei": "UEI-ACME"},
             {"name": "Acme Quantum Research LLC", "uei": "UEI-OTHER"},
         ]},
-        {"results": [
+        {"page_metadata": {"hasNext": False}, "results": [
             {"name": "Duplicate Corp", "uei": "UEI-1"},
             {"name": "Duplicate Corporation", "uei": "UEI-2"},
         ]},

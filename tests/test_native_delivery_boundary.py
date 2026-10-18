@@ -57,7 +57,8 @@ raw = message.as_bytes()
 outbox = EmailOutbox(Path(sys.argv[2]))
 identifier = outbox.enqueue("native-fixture", raw, address, now=now, expires_at=now + timedelta(minutes=5))
 class ProviderDouble:
-    def deliver(self, original, recipient, identity):
+    def deliver(self, original, recipient, identity, *, not_after):
+        assert not_after.utcoffset() is not None
         assert original == raw and recipient == address and identity == message["Message-ID"]
         digest = hashlib.sha256(original).hexdigest()
         return {"gmail_message_id":"fixture-one", "thread_id":"fixture-thread", "delivered_label":"INBOX",

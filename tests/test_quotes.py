@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from contract_ipo_monitor.market import DailyPriceCollector
-from contract_ipo_monitor.quotes import CurrentQuote, CurrentQuoteCollector, quote_freshness, quote_from_dict, quote_to_dict
+from contract_ipo_monitor.quotes import CurrentQuote, CurrentQuoteCollector, quote_freshness, quote_from_dict, quote_to_dict, quote_valid_until
 from contract_ipo_monitor.sources.http import ResilientClient
 from contract_ipo_monitor.sources.market import TwelveDataNormalizer
 
@@ -234,6 +234,33 @@ def test_open_quote_known_delay_boundary_and_no_freshness_renewal_on_readback():
     restored = quote_from_dict(stored)
     assert restored.observed_at == OPEN
     assert quote_freshness(restored, OPEN+timedelta(minutes=28))["status"] == "stale"
+
+
+def test_delayed_provider_timestamp_limits_publication_before_retrieval_tolerance():
+    quote = live_quote(OPEN-timedelta(seconds=1195), delay=900)
+    assert quote_freshness(quote, OPEN)["status"] == "fresh"
+    assert quote_valid_until(quote, OPEN) == OPEN+timedelta(seconds=5)
+
+
+def test_early_close_limits_intraday_publication_authority():
+    at = datetime(2026, 11, 27, 17, 59, 50, tzinfo=UTC)
+    quote = replace(live_quote(at), observed_at=at)
+    assert quote_valid_until(quote, at) == datetime(2026, 11, 27, 18, tzinfo=UTC)
+
+
+def test_hong_kong_delayed_quote_authority_ends_at_provider_regular_session_boundary():
+    at = datetime(2026, 10, 5, 7, 59, 50, tzinfo=UTC)
+    quote = replace(live_quote(at-timedelta(minutes=15), delay=900), source="yahoo", exchange="HKEX",
+        exchange_timezone="Asia/Hong_Kong", observed_at=at, currency="HKD",
+        source_url="https://query1.finance.yahoo.com/v8/finance/chart/0700.HK",
+        regular_session_start=at.replace(hour=1, minute=30, second=0), regular_session_end=at.replace(hour=8, minute=0, second=0))
+    assert quote_freshness(quote, at)["status"] == "fresh"
+    assert quote_valid_until(quote, at) == at+timedelta(seconds=10)
+
+
+def test_unknown_or_stale_quote_cannot_produce_a_publication_deadline():
+    with pytest.raises(ValueError, match="currently verified fresh"):
+        quote_valid_until(live_quote(), OPEN+timedelta(minutes=6))
 
 
 def test_intraday_quote_cannot_be_reclassified_as_a_completed_close_on_readback():

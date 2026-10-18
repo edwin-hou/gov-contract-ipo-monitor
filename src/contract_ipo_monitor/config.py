@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -43,6 +44,7 @@ class Settings(BaseModel):
     listed_discovery_max_candidates: int = 25
     watch_symbols: tuple[str, ...] = ()
     market_interval_seconds: int = 3600
+    report_interval_seconds: int = 3600
     fundamental_refresh_days: int = 7
     fundamental_max_age_days: int = 120
     price_max_age_business_days: int = 1
@@ -114,6 +116,7 @@ class Settings(BaseModel):
             listed_discovery_max_candidates=int(os.getenv("LISTED_DISCOVERY_MAX_CANDIDATES", "25")),
             watch_symbols=values("WATCH_SYMBOLS"),
             market_interval_seconds=int(os.getenv("MARKET_INTERVAL_SECONDS", "3600")),
+            report_interval_seconds=int(os.getenv("REPORT_INTERVAL_SECONDS", "3600")),
             fundamental_refresh_days=int(os.getenv("FUNDAMENTAL_REFRESH_DAYS", "7")),
             fundamental_max_age_days=int(os.getenv("FUNDAMENTAL_MAX_AGE_DAYS", "120")),
             price_max_age_business_days=int(os.getenv("PRICE_MAX_AGE_BUSINESS_DAYS", "1")),
@@ -157,9 +160,10 @@ class Settings(BaseModel):
             errors.append("USASPENDING_OVERLAP_DAYS cannot be negative.")
         if self.usaspending_max_pages < 1:
             errors.append("USASPENDING_MAX_PAGES must be at least 1.")
-        if self.max_price <= 0 or self.max_market_cap <= 0 or self.quote_max_age_hours <= 0:
-            errors.append("Qualification thresholds and quote age must be positive.")
-        for name in ("sec_interval_seconds", "usaspending_interval_seconds", "sam_interval_seconds", "smtp_poll_seconds", "discourse_interval_seconds", "source_timeout_seconds", "sec_max_pages", "market_interval_seconds", "fundamental_refresh_days", "fundamental_max_age_days"):
+        if (any(not math.isfinite(value) or value <= 0 for value in (self.max_price, self.max_market_cap))
+                or self.quote_max_age_hours <= 0):
+            errors.append("Qualification thresholds must be finite and positive, and quote age must be positive.")
+        for name in ("sec_interval_seconds", "usaspending_interval_seconds", "sam_interval_seconds", "smtp_poll_seconds", "discourse_interval_seconds", "source_timeout_seconds", "sec_max_pages", "market_interval_seconds", "report_interval_seconds", "fundamental_refresh_days", "fundamental_max_age_days"):
             if getattr(self, name) < 1:
                 errors.append(f"{name.upper()} must be positive.")
         if not 1 <= self.discourse_max_companies <= 50:

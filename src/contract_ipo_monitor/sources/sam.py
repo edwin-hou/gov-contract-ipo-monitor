@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -82,6 +83,16 @@ class SAMNormalizer:
         )
 
 
+class IncompleteSAMCollection(RuntimeError):
+    """A failed source scan with validated observations but no success cursor."""
+
+    def __init__(self, reason: str, *, records: list[ContractEvidence], page: int):
+        super().__init__(reason)
+        self.reason = reason
+        self.records = tuple(records)
+        self.page = page
+
+
 class SAMCollector:
     URL = "https://api.sam.gov/contract-awards/v1/search"
 
@@ -89,8 +100,15 @@ class SAMCollector:
         self.client = client
         self.api_key = api_key
         self.normalizer = SAMNormalizer()
+        self.partial_records: list[ContractEvidence] = []
 
     async def collect(self, *, observed_at: datetime, last_modified_start: date, deleted: bool = False, limit: int = 100, max_pages: int = 250) -> list[ContractEvidence]:
+        # One call covers either active or deleted records. The service adapter
+        # combines the two calls and retains this list on failure/cancellation.
+        self.partial_records = []
+        if observed_at.utcoffset() is None:
+            raise ValueError("SAM observation timestamp must include a timezone")
+        observed_at = observed_at.astimezone(UTC)
         if not 1 <= limit <= 100 or max_pages < 1 or last_modified_start > observed_at.date():
             raise ValueError("invalid SAM collection window or pagination limits")
         params = {
@@ -102,19 +120,50 @@ class SAMCollector:
         }
         if deleted:
             params["deletedStatus"] = "yes"
-        records: list[ContractEvidence] = []
-        for offset in range(max_pages):
-            params["offset"] = offset  # SAM offset is a page index, not a row offset.
-            data = await self.client.request_json("GET", self.URL, params=params)
-            if not isinstance(data, dict) or not isinstance(data.get("awardSummary"), list):
-                raise ValueError("SAM response does not contain an awardSummary list")
-            rows = data["awardSummary"]
-            records.extend(self.normalizer.normalize(row, observed_at=observed_at, deleted=deleted) for row in rows)
-            total = int(data["totalRecords"]) if data.get("totalRecords") is not None else None
-            if total is not None and len(records) >= total:
-                return records
-            if not rows or len(rows) < limit:
-                if total is not None and len(records) < total:
-                    raise RuntimeError("SAM returned an incomplete page before totalRecords was reached")
-                return records
-        raise RuntimeError(f"SAM pagination exceeded max_pages={max_pages}; refusing to truncate silently")
+        records = self.partial_records
+        seen: set[tuple[str, str | None]] = set()
+        first_total: int | None = None
+        total_presence: bool | None = None
+        offset = 0
+        try:
+            for offset in range(max_pages):
+                params["offset"] = offset  # SAM offset is a page index, not a row offset.
+                data = await self.client.request_json("GET", self.URL, params=params)
+                if not isinstance(data, dict) or not isinstance(data.get("awardSummary"), list):
+                    raise ValueError("SAM response does not contain an awardSummary list")
+                rows = data["awardSummary"]
+                before = len(records)
+                for row in rows:
+                    record = self.normalizer.normalize(row, observed_at=observed_at, deleted=deleted)
+                    key = (record.source_record_id, record.raw_payload_hash)
+                    if key not in seen:
+                        seen.add(key)
+                        records.append(record)
+                raw_total = data.get("totalRecords")
+                total = None
+                if raw_total is not None:
+                    if (type(raw_total) is not int and not (isinstance(raw_total, str) and re.fullmatch(r"\d+", raw_total))) or int(raw_total) < 0:
+                        raise ValueError("SAM totalRecords must be an exact nonnegative integer")
+                    total = int(raw_total)
+                if total_presence is None:
+                    total_presence = total is not None
+                    first_total = total
+                elif (total is not None) != total_presence or total != first_total:
+                    raise RuntimeError("SAM totalRecords changed during pagination; source completeness is unproven")
+                if len(rows) > limit:
+                    raise RuntimeError("SAM pagination returned more rows than the requested page limit")
+                if rows and len(records) == before:
+                    raise RuntimeError("SAM pagination repeated previously observed rows instead of advancing")
+                if total is not None and len(records) > total:
+                    raise RuntimeError("SAM totalRecords is smaller than the validated source observations")
+                if total is not None and len(records) == total:
+                    return records
+                if not rows or len(rows) < limit:
+                    if total is not None and len(records) < total:
+                        raise RuntimeError("SAM returned an incomplete page before totalRecords was reached")
+                    return records
+            raise RuntimeError(f"SAM pagination exceeded max_pages={max_pages}; refusing to truncate silently")
+        except Exception as exc:
+            if records:
+                raise IncompleteSAMCollection(str(exc), records=records, page=offset) from exc
+            raise

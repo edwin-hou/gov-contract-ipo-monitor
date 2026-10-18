@@ -57,6 +57,28 @@ def client(handler, **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_world_atom_uses_reader_link_and_visible_xhtml_summary():
+    atom = '''<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <title>Chipmaker supply chain update</title>
+      <link rel="alternate" type="text/html" href="https://news.example/article/1"/>
+      <link rel="self" href="https://news.example/api/item/1"/>
+      <summary type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">
+        <p>New <strong>export controls</strong> affect semiconductors.</p>
+        <script>nuclear war is guaranteed</script>
+      </div></summary><published>2026-10-05T20:00:00Z</published>
+    </entry></feed>'''
+    connection = client(lambda request: httpx.Response(200, text=atom))
+    feed = WorldFeed("Example", "https://news.example/feed", ("news.example",))
+    async with connection.client:
+        batch = await WorldNewsCollector(connection, feeds=(feed,)).collect(observed_at=NOW)
+    assert len(batch.events) == 1
+    event = batch.events[0]
+    assert event.source_url == "https://news.example/article/1"
+    assert event.text == "New export controls affect semiconductors."
+    assert "export_controls" in event.themes and "geopolitics" not in event.themes
+
+
+@pytest.mark.asyncio
 async def test_nasdaq_history_validates_listing_and_retains_explicit_provenance():
     connection = client(nasdaq_handler())
     async with connection.client:
