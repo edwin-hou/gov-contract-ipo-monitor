@@ -91,7 +91,7 @@ elif sys.argv[1] == "download":
     destination.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
         limits = {"latest.json": 30_000_000, "latest.md": 30_000_000,
-                  "monitor.db": 250_000_000, "checkpoint.json": 64_000,
+                  "monitor.db": 250_000_000, "checkpoint.json": 64 * 1024,
                   "monitor.db.gz": 250_000_000}
         names = [item.filename for item in bundle.infolist()]
         if len(names) != len(set(names)) or set(names) not in (

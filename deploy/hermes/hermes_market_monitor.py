@@ -13,10 +13,11 @@ import json
 import math
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from html import escape
@@ -463,11 +464,65 @@ def finish_quiet(config, receipt, report, now):
     return notice
 
 
+def ai_review_claimed_at(analysis: dict, work: Path):
+    """Read the attempt's original timestamp; never renew it from a poll clock."""
+    identity = analysis.get("review_identity")
+    path = work / "market-analyst.sqlite3"
+    if not re.fullmatch(r"[0-9a-f]{64}", str(identity)) or not path.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            row = connection.execute("SELECT claimed_at FROM analyst_calls WHERE identity=?", (identity,)).fetchone()
+        return timestamp(row[0], "Analyst claim").isoformat() if row else None
+    except (OSError, sqlite3.Error, CheckError, ValueError, TypeError):
+        # Diagnostics are optional and cannot authorize or block a delivery.
+        return None
+
+
+def analysis_metadata(analysis: dict, receipt: dict, *, now: datetime, work: Path):
+    return {**analysis, "checked_at": now.isoformat(),
+            "report_completed_at": receipt.get("report_completed_at"),
+            "report_sha256": receipt.get("report_sha256"),
+            "model_claimed_at": ai_review_claimed_at(analysis, work),
+            "result_reused": bool(analysis.get("review_identity") and analysis.get("reviews")
+                                  and analysis.get("model_called") is False)}
+
+
+def retire_ai_analysis(receipt: dict, *, now: datetime, work: Path, reason: str, blocked=False):
+    """Separate historical decisions from this invocation's verification state."""
+    previous = receipt.get("ai_analysis")
+    if isinstance(previous, dict) and previous and previous.get("status") not in {"not_run", "blocked"}:
+        receipt["last_ai_analysis"] = {
+            "historical": True, "analysis": previous,
+            # Older polls could advance the outer report while retaining a
+            # previous AI result. Only embedded metadata binds that decision.
+            "report_completed_at": previous.get("report_completed_at"),
+            "report_sha256": previous.get("report_sha256"),
+            "binding_status": "analysis_metadata" if (previous.get("report_completed_at")
+                                                       and previous.get("report_sha256")) else "legacy_receipt_context_only",
+            "receipt_report_context": {"report_completed_at": receipt.get("report_completed_at"),
+                                       "report_sha256": receipt.get("report_sha256")},
+            # Legacy receipts did not record the check's time. Keep it unknown;
+            # the durable claim is the attempt's start, not its completion.
+            "analysis_checked_at": previous.get("checked_at", previous.get("evaluated_at")),
+            "model_claimed_at": previous.get("model_claimed_at") or ai_review_claimed_at(previous, work),
+            "result_reused": bool(previous.get("result_reused") or
+                                  (previous.get("review_identity") and previous.get("reviews")
+                                   and previous.get("model_called") is False)),
+        }
+    receipt["ai_analysis"] = {"status": "blocked" if blocked else "not_run", "reason": reason,
+                              "checked_at": now.isoformat(), "model_called": False,
+                              "send_allowed": False, "result_reused": False,
+                              "report_completed_at": receipt.get("report_completed_at"),
+                              "report_sha256": receipt.get("report_sha256")}
+
+
 def poll(config=Config(), *, now=None, github=None):
     now = (now or datetime.now(UTC)).astimezone(UTC)
     github = github or GitHubHelper(config)
     previous_receipt = read_json(config.receipt, optional=True)
     receipt = {**previous_receipt, "completed_at": now.isoformat(), "outcome": "failure", "status": "error"}
+    retire_ai_analysis(receipt, now=now, work=config.work, reason="report_verification_pending")
     # A receipt describes this invocation. Keep the prior failure only in the
     # deduplication state; recovered polls must not retain old failure details.
     for key in ("failure_code", "internal_error_type", "missing_module", "message", "pending_reason"):
@@ -583,6 +638,7 @@ def poll(config=Config(), *, now=None, github=None):
         return notice
     except CheckError as error:
         receipt.update(status="error", outcome="failure", failure_code=error.code, message=error.message)
+        retire_ai_analysis(receipt, now=now, work=config.work, reason=error.code, blocked=True)
         notice = ""
         if previous_receipt.get("last_failure_code") != error.code:
             digest_path = config.outputs / ("failure-" + hashlib.sha256(error.code.encode()).hexdigest()[:16] + ".md")

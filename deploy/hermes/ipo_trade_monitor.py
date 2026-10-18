@@ -149,7 +149,7 @@ def run() -> int:
             "status", "outcome", "newest_run", "source_report", "main_sha", "verified_run",
             "head_sha", "artifact_id", "report_sha256", "report_completed_at", "source_gaps",
             "digest_path", "digest_sha256", "failure_code", "message",
-            "email_status", "email_sent", "mail_receipt_path", "email_outcome", "ai_analysis",
+            "email_status", "email_sent", "mail_receipt_path", "email_outcome", "ai_analysis", "last_ai_analysis",
         ) if key in value})
         result["poller_exit_code"] = proc.returncode
         if value.get("email_status") == "degraded" and result["status"] == "ok":
