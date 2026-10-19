@@ -247,3 +247,98 @@ def test_oversized_packet_does_not_claim_usage_or_call_model(tmp_path):
     value=evaluate(data,store,lambda _:pytest.fail('oversized input posted'),now=NOW)
     assert value['status']=='packet_oversized' and value['model_called'] is False
     with store.connect() as connection: assert connection.execute('SELECT COUNT(*) FROM analyst_calls').fetchone()[0]==0
+
+
+def _multi_report(*symbols):
+    data = report()
+    template = data["trade_ideas"][0]
+    data["trade_ideas"] = []
+    for symbol in symbols:
+        idea = deepcopy(template)
+        idea["symbol"] = idea["current_quote"]["symbol"] = symbol
+        idea["current_quote"]["provider_symbol"] = symbol
+        idea["current_quote"]["source_url"] = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        data["trade_ideas"].append(idea)
+    return data
+
+
+def _all_notify(request):
+    return {"status": "ok", "provider": "openai-codex", "model": request["model"],
+            "text": json.dumps({"decisions": [decisions(idea["symbol"])["decisions"][0]
+                                               for idea in request["payload"]["candidates"]]}), "usage": {}}
+
+
+def test_reordering_the_same_candidates_reuses_the_review(tmp_path):
+    data = _multi_report("MU", "NVDA")
+    calls = []
+    store = AnalystStore(tmp_path / "analyst.db")
+    first = evaluate(data, store, lambda request: calls.append(request) or _all_notify(request), now=NOW)
+    data["trade_ideas"].reverse()
+    second = evaluate(data, store, lambda _: pytest.fail("Reordered evidence repeated inference"), now=NOW)
+    assert first["review_identity"] == second["review_identity"]
+    assert {item["symbol"] for item in second["approved"]} == {"MU", "NVDA"}
+    assert len(calls) == 1 and second["model_called"] is False
+
+
+def test_delivered_unchanged_setup_does_not_spend_a_new_review_on_context_changes(tmp_path):
+    data = report()
+    store = AnalystStore(tmp_path / "analyst.db")
+    store.save_notice(data["trade_ideas"][0])
+    data["trade_ideas"][0]["risks"] = ["A changed context sentence without a material notice change."]
+    result = evaluate(data, store, lambda _: pytest.fail("Unchanged delivered setup repeated inference"), now=NOW)
+    assert result["status"] == "no_material_notice_change" and not result["model_called"]
+    assert result["approved"] == [] and result["withheld"]["MU"] == "already_notified_unchanged"
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM analyst_calls").fetchone()[0] == 0
+
+
+def test_mixed_delivered_and_pending_candidates_keep_the_original_cached_authority(tmp_path):
+    data = _multi_report("MU", "NVDA")
+    store = AnalystStore(tmp_path / "analyst.db")
+    first = evaluate(data, store, _all_notify, now=NOW)
+    store.save_notice(next(item for item in first["approved"] if item["symbol"] == "MU"))
+    data["trade_ideas"].reverse()
+    second = evaluate(data, store, lambda _: pytest.fail("Mixed cached batch was split and repeated"), now=NOW)
+    assert [item["symbol"] for item in second["approved"]] == ["NVDA"]
+    assert second["review_identity"] == first["review_identity"]
+    assert second["review_expires_at"] == first["review_expires_at"] and not second["model_called"]
+
+
+def test_model_upgrade_preserves_all_four_prior_model_claims_in_the_daily_budget(tmp_path):
+    store = AnalystStore(tmp_path / "analyst.db")
+    for index in range(4):
+        assert store.claim(f"old-model-{index}", "gpt-5.6-sol", NOW)["cached"] is False
+    result = evaluate(report(), store, lambda _: pytest.fail("Model upgrade reset the daily budget"), now=NOW)
+    assert result["status"] == "daily_limit" and not result["model_called"] and not result["approved"]
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM analyst_calls").fetchone()[0] == 4
+
+
+def test_model_upgrade_does_not_replay_a_delivered_notice_or_spend_usage(tmp_path):
+    store = AnalystStore(tmp_path / "analyst.db")
+    first = evaluate(report(), store, _all_notify, now=NOW, model="gpt-5.6-sol")
+    store.save_notice(first["approved"][0])
+    current = evaluate(report(), store, lambda _: pytest.fail("Model upgrade replayed a delivered setup"), now=NOW)
+    assert current["status"] == "no_material_notice_change" and not current["model_called"]
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM analyst_calls").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("changed", ["price", "evidence"])
+def test_delivered_setup_with_a_material_change_still_gets_a_new_review(tmp_path, changed):
+    data = report()
+    store = AnalystStore(tmp_path / "analyst.db")
+    store.save_notice(data["trade_ideas"][0])
+    if changed == "price":
+        data["trade_ideas"][0]["current_quote"]["price"] = 101.1
+    else:
+        data["trade_ideas"][0]["evidence_briefs"][0]["meaning"] = "New issuer evidence needs review."
+    result = evaluate(data, store, _all_notify, now=NOW)
+    assert result["model_called"] and [item["symbol"] for item in result["approved"]] == ["MU"]
+
+
+def test_candidate_batch_limit_retains_an_explicit_withheld_reason():
+    data = _multi_report("MU", "NVDA", "ASML", "AMAT", "TSM", "AVGO", "APP")
+    candidates, withheld = prepare_candidates(data, now=NOW)
+    assert len(candidates) == 6 and "APP" not in {idea["symbol"] for idea in candidates}
+    assert withheld == {"APP": "candidate_batch_limit"}

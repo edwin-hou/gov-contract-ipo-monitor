@@ -111,10 +111,21 @@ def test_return_comparison_requires_matching_twenty_session_start_dates():
     assert assess(benchmark=replace(benchmark, bars=changed))["action"] == "wait"
 
 
-def test_missing_world_coverage_and_negative_commentary_block_new_buys():
+def test_missing_world_coverage_blocks_new_buys():
     assert assess(world_coverage_ok=False)["action"] == "wait"
-    assert assess(sentiment={"label":"negative","scored_count":4})["action"] == "wait"
-    assert assess(sentiment={"label":"unknown","scored_count":0})["action"] == "conditional_buy"
+
+
+@pytest.mark.parametrize("label,score,count", [("negative",-.5,4), ("positive",.5,4), ("neutral",0.,4), ("unknown",None,0)])
+def test_lexical_tone_cannot_decide_trade_direction_or_change_price_levels(label, score, count):
+    unknown = assess(sentiment=None)
+    idea = assess(sentiment={"label":label, "score":score, "scored_count":count, "independent_origins":3})
+    assert idea["action"] == unknown["action"] == "conditional_buy"
+    for field in ("entry", "invalidation", "target", "risk_reward"):
+        assert idea[field] == unknown[field]
+    assert "Context only" in idea["sentiment"]["role"]
+    if label == "negative":
+        assert any("negative" in risk and "counterevidence" in risk and "investment outlook" in risk for risk in idea["risks"])
+    assert assess(fact=None, sentiment={"label":label, "score":score, "scored_count":count})["action"] == "wait"
 
 
 def test_downtrend_reduces_only_if_owned_even_with_negative_commentary():

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 POLICY_VERSION = "evidence-analyst-v3"
-DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_MODEL = "gpt-6.1-sol"
 FINANCIAL_TYPES = {"financial", "fundamentals", "primary_financial"}
 PRICE_TYPES = {"price", "price_trend", "market_price", "completed_price_history"}
 SYSTEM = """You assess conditional long-stock research setups over 5–15 trading sessions.
@@ -106,6 +106,8 @@ def prepare_candidates(report: dict, *, now: datetime) -> tuple[list[dict], dict
             continue
         candidate = {**idea, "evidence_briefs": valid, "current_quote": {**idea["current_quote"], "freshness": freshness}}
         candidates.append(candidate)
+    for candidate in candidates[6:]:
+        withheld[candidate["symbol"]] = "candidate_batch_limit"
     return candidates[:6], withheld
 
 
@@ -152,6 +154,10 @@ def semantic_key(candidates: list[dict], model: str) -> str:
                        "world_context": idea.get("world_context"), "sentiment": idea.get("sentiment"),
                        "risks": idea.get("risks"), "limitations": idea.get("limitations"), "conditions": idea.get("conditions"),
                        "facts": idea.get("fundamentals"), "briefs": idea["evidence_briefs"]})
+    # A report's row order is presentation, not new evidence. Cached verdicts
+    # are bound to each symbol and validated against the whole current batch.
+    values.sort(key=lambda value: (str(value["symbol"]), str(value["exchange"]),
+                                   str(value["currency"]), fingerprint(value)))
     return fingerprint({"policy": POLICY_VERSION, "model": model, "candidates": values})
 
 
@@ -274,6 +280,13 @@ def evaluate(report: dict, store: AnalystStore, infer: Callable, *, now: datetim
     candidates, withheld = prepare_candidates(report, now=now)
     if not candidates:
         return {"status": "no_candidates", "approved": [], "withheld": withheld, "model_called": False}
+    if all(not notice_changed(store.last_notice(idea["symbol"]), idea) for idea in candidates):
+        # No verdict could authorize another notice, so do not spend a claim.
+        # Keep mixed batches intact: removing just their delivered members would
+        # invalidate the cached authority of still-pending members.
+        withheld.update({idea["symbol"]: "already_notified_unchanged" for idea in candidates})
+        return {"status": "no_material_notice_change", "approved": [], "withheld": withheld,
+                "model_called": False}
     payload = packet(candidates)
     if len(json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()) > 48_000:
         return {"status": "packet_oversized", "approved": [], "withheld": withheld, "model_called": False}

@@ -61,20 +61,36 @@ def test_brief_figures_use_actual_comparable_primary_amounts_and_price_dates():
 
 
 @pytest.mark.parametrize("future_field", ["published_at", "retrieved_at"])
-def test_future_negative_commentary_cannot_block_a_current_trade_setup(future_field):
+def test_future_negative_commentary_cannot_supply_current_counterevidence(future_field):
     records = tuple(article(title=f"Test issuer discussion {index}",
         text=f"Test issuer appears bearish, weak and risky to this skeptical reviewer number {index}.",
         evidence_id=f"opinion-{index}", source_kind="hackernews", text_kind="comment",
         source_url=f"https://news.ycombinator.com/item?id={index}", origin_key=f"author:{index}")
         for index in range(3))
     current = summarize_sentiment("Test issuer", records, now=NOW)
-    assert current.label == "negative" and assess(sentiment=asdict(current), company_evidence=records)["action"] == "wait"
+    current_idea = assess(sentiment=asdict(current), company_evidence=records)
+    assert current.label == "negative" and current_idea["action"] == "conditional_buy"
+    assert any("negative" in risk and "counterevidence" in risk for risk in current_idea["risks"])
     future = tuple(replace(record, **{future_field: NOW+timedelta(seconds=1)}) for record in records)
     summary = summarize_sentiment("Test issuer", future, now=NOW)
     idea = assess(sentiment=asdict(summary), company_evidence=future)
     assert summary.scored_count == 0 and summary.label == "unknown"
     assert idea["action"] == "conditional_buy" and idea["sentiment"]["label"] == "unknown"
+    assert not any("negative" in risk and "counterevidence" in risk for risk in idea["risks"])
     assert not by_id(idea)["commentary"]["source_urls"]
+
+
+def test_security_product_risk_words_remain_linked_context_not_an_issuer_trade_veto():
+    records = tuple(article(title=f"Test issuer security guidance {index}",
+        text=f"Test issuer discusses how customers can manage vulnerability risks for their software systems. Guidance number {index}.",
+        evidence_id=f"security-{index}", source_url=f"https://example.org/security/{index}", origin_key=f"publisher:{index}")
+        for index in range(3))
+    summary = summarize_sentiment("Test issuer", records, now=NOW)
+    assert summary.label == "negative"  # 'risks' describes security, not the issuer outlook.
+    idea = assess(sentiment=asdict(summary), company_evidence=records)
+    assert idea["action"] == "conditional_buy"
+    assert by_id(idea)["commentary"]["source_urls"]
+    assert "does not establish issuer downside" in by_id(idea)["commentary"]["meaning"]
 
 
 @pytest.mark.parametrize("margin, action, explanation", [

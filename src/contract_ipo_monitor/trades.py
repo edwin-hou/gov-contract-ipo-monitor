@@ -571,7 +571,7 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
         result["risks"].append("No supported company, sector or relevant monetary connection was found in sampled world headlines; macro risk may still be present")
     negative_commentary = result["sentiment"]["label"] == "negative" and result["sentiment"]["scored_count"] >= 3
     if negative_commentary:
-        result["risks"].append("Accessible commentary is negative; a new long entry requires contradictory evidence or a better setup")
+        result["risks"].append("Sampled lexical tone is negative; retain it as counterevidence for AI review, with attribution and selection bias. It does not establish a negative issuer investment outlook or decide trade direction.")
     elif result["sentiment"]["label"] == "unknown":
         result["risks"].append("Forum/commentary sentiment is unknown; it provides no positive confirmation")
     else:
@@ -639,9 +639,10 @@ def assess_trade(instrument, fact, history, benchmark, sentiment: dict[str,Any] 
     elif (values["last_close"] > values["sma20"] > values["sma50"] and values["return20"] > 0 and relative >= 0
           and values["average_volume20"] >= 100_000 and 0 < values["atr14"]/values["last_close"] <= result["macro_adjustment"]["max_atr_fraction"]):
         extension = result["macro_adjustment"]["max_extension_fraction"]
-        if negative_commentary:
-            result["conditions"] = ["Accessible commentary is negative; wait for contradictory evidence or a better setup"]
-        elif values["last_close"]/values["sma20"]-1 > extension:
+        # A word such as 'risks' can describe a security product or quote another
+        # person. Unvalidated lexical tone remains linked counterevidence for
+        # the analyst; it cannot veto or establish a numerical research setup.
+        if values["last_close"]/values["sma20"]-1 > extension:
             result["conditions"] = [f"Price is more than {extension*100:.0f}% above its 20-session average; wait for consolidation rather than chasing"]
         else:
             levels = _long_levels(values)

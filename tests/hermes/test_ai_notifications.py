@@ -170,6 +170,25 @@ def test_model_wait_and_no_candidates_never_queue(tmp_path):
     assert box.states() == {}
 
 
+@pytest.mark.parametrize("tone", [{"label":"negative", "score":-.5, "scored_count":4, "independent_origins":3}, None])
+def test_negative_or_unknown_tone_watch_still_needs_price_proximity_before_model_or_mail(tmp_path, tone):
+    from test_trade_engine import assess, history
+    config, box, work = configured(tmp_path)
+    watch = assess(now=NOW, history=history(spread=2.), sentiment=tone)
+    assert watch["action"] == "conditional_buy"
+    current = idea("TEST")["current_quote"]
+    # The live MSFT review had this same 4.11% distance below its trigger.
+    # A numerical watch is not an actionable entry or model-call authorization.
+    current["price"] = round(watch["entry"]*.9589, 2)
+    assert watch["invalidation"] < current["price"] < watch["entry"]*.97
+    watch["current_quote"] = current
+    queued, result = stage(config, box, work, report(watch),
+        model=lambda request: pytest.fail("Distant watch called the analyst"))
+    assert queued == [] and box.states() == {}
+    assert result["status"] == "no_candidates" and not result["model_called"]
+    assert result["withheld"]["TEST"] == "price_more_than_3_percent_below_trigger"
+
+
 @pytest.mark.parametrize("event", ["initial-report", "discovery:new", "reference:target", "local-notice:change", "maintenance:failure"])
 def test_initial_discovery_reference_and_maintenance_pending_mail_loses_ai_policy_authorization(tmp_path, event):
     config, box, work = configured(tmp_path)

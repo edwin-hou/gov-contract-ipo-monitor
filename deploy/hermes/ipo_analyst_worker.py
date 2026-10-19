@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 
-MODEL = "gpt-5.6-sol"
+MODEL = "gpt-6.1-sol"
 PROVIDER = "openai-codex"
 BASE_URL = "https://chatgpt.com/backend-api/codex"
 MAX_INPUT_BYTES = 65_536

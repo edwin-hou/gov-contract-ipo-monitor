@@ -32,7 +32,7 @@ Replace both placeholders. Configure the private `work/market-delivery.json` for
 ```json
 {
   "enabled": true,
-  "model": "gpt-5.6-sol",
+  "model": "gpt-6.1-sol",
   "reasoning_effort": "medium",
   "daily_limit": 4
 }
@@ -44,7 +44,7 @@ This object belongs under the delivery configuration's `analyst` key; it is not 
 
 The artifact helper requires authorized GitHub access through the existing Git credential setup. Never put a GitHub token in a report or committed configuration.
 
-The analyst uses the existing authenticated Hermes `openai-codex` route. Verify that its account catalogue contains `gpt-5.6-sol` with medium reasoning before enabling delivery. A saved provider name alone does not establish usable credentials. The isolated worker reads that route and refreshes its existing token when necessary; there is no API-key/provider fallback and no global model change. Reauthenticate through Hermes' normal private login flow if necessary, rather than pasting tokens into chat or templates.
+The analyst uses the existing authenticated Hermes `openai-codex` route. Verify that its account catalogue contains `gpt-6.1-sol` with medium reasoning before enabling delivery. Use the actual installed Codex client version when checking its account catalogue; a hardcoded compatibility version or a synthesized fallback model list is not entitlement evidence. A saved provider name alone does not establish usable credentials. The isolated worker reads that route and refreshes its existing token when necessary; there is no API-key/provider fallback and no global model change. Reauthenticate through Hermes' normal private login flow if necessary, rather than pasting tokens into chat or templates.
 
 Gmail delivery requires the owning profile's already configured native Google OAuth credentials and `scripts/gmail_sync.py` token-refresh helper. The authenticated sender and confirmed recipient must match the private delivery configuration. Reuse that locked helper; do not copy tokens into the repository, replace another job's credentials or configure SMTP.
 
@@ -55,7 +55,7 @@ Report preparation runs in the monitor’s Python 3.12+ environment. The owning 
 
 The script job checks actual hosted report artifacts and refreshes candidate quotes. Report age, listing/currency identity, provider timestamp/delay and a quote observation no more than five minutes old gate analyst review. A freshly checked latest-session close is labelled a closed-market research reference and still requires a live broker check before entry.
 
-Only eligible candidates cause a model request. Durable claims limit attempts to four per UTC day, including failures, and unchanged substantive evidence reuses cached decisions. The worker makes one tools-free Codex request with medium reasoning, bounded input/output text and stream size, and a 90-second watchdog. The Codex OAuth route does not support a strict provider-side output-token cap; these limits do not guarantee fixed allowance consumption.
+Only eligible candidates cause a model request. Durable claims limit attempts to four per UTC day across models, including failures. Unchanged substantive evidence reuses cached decisions even if report row order changes; already delivered setups without a material notice change spend no further claim. Mixed delivered/pending batches preserve their original cached authority. Requests cover at most six candidates; excess candidates retain an explicit withheld reason. The worker makes one tools-free Codex request with medium reasoning, bounded input/output text and stream size, and a 90-second watchdog. The Codex OAuth route does not support a strict provider-side output-token cap; these limits do not guarantee fixed allowance consumption. This model choice balances capability and usage; API pricing is not a measure of Codex allowance savings.
 
 Only new or materially changed AI-approved conditional opportunities can be emailed. Brief evidence, the model's rationale and counterargument, source/quote dates, currency, entry/invalidation/target and approximate strategy accompany the report. Model opinions can be wrong and are not calibrated return probabilities or guarantees. Unknown evidence and waits remain visible in saved reports without routine email.
 

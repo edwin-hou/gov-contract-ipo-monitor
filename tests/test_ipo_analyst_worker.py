@@ -90,7 +90,7 @@ def test_one_request_is_tools_free_medium_and_does_not_expose_credentials():
     assert "SECRET" not in json.dumps(answer) and "DO_NOT_RETURN" not in json.dumps(answer)
 
 
-@pytest.mark.parametrize("changes", [{"model": "gpt-6-astra"}, {"model": "gpt-6.1-sol"},
+@pytest.mark.parametrize("changes", [{"model": "gpt-6-astra"}, {"model": "gpt-5.6-sol"},
                                      {"reasoning_effort": "xhigh"}, {"max_output_tokens": True},
                                      {"max_output_tokens": 4097}, {"payload": []}, {"system": ""},
                                      {"unexpected": "field"}])
@@ -99,6 +99,11 @@ def test_invalid_requests_do_not_resolve_credentials_or_make_a_call(changes):
         pytest.fail("invalid requests must not resolve auth")
     answer = worker.run(json.dumps(request(**changes)).encode(), runtime=forbidden)
     assert answer["status"] == "unavailable" and answer["text"] == ""
+
+
+def test_worker_and_analyst_pin_the_same_current_task_model():
+    from contract_ipo_monitor.analyst import DEFAULT_MODEL
+    assert worker.MODEL == DEFAULT_MODEL == "gpt-6.1-sol"
 
 
 @pytest.mark.parametrize("raw", [b'{"model":"one","model":"two"}', b'{"x":NaN}', b'\xff', b'[' * 1500])
